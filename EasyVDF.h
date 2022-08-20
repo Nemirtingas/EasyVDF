@@ -203,10 +203,16 @@ public:
 
 class SerializeException : public std::exception
 {
+    const char* _Msg;
 public:
     SerializeException(const char* msg):
-        std::exception(msg)
+        _Msg(msg)
     {}
+
+    virtual char const* what() const noexcept
+    {
+        return _Msg;
+    }
 };
 
 template<typename T>
@@ -362,9 +368,9 @@ private:
 
     void _ResetValue();
 
-    static ValveDataObject _ParseTextObject(std::istream& is, std::string const& name, std::string& buffer, uint32_t& line_num);
+    static ValveDataObject _ParseTextObject(std::istream& is, std::string& name, std::string& buffer, uint32_t& line_num);
 
-    static ValveDataObject _ParseBinaryObject(std::istream& is, std::string const& name, BinaryNodeType object_end, std::string& buffer, const char*& buffer_start, const char*& buffer_end);
+    static ValveDataObject _ParseBinaryObject(std::istream& is, std::string& name, BinaryNodeType object_end, std::string& buffer, const char*& buffer_start, const char*& buffer_end);
 
     void _SerializeAsText(std::ostream& os, size_t depth) const;
 
@@ -1187,7 +1193,7 @@ inline void ValveDataObject::_ResetValue()
     _Obj->_Type = ObjectType::None;
 }
 
-inline ValveDataObject ValveDataObject::_ParseTextObject(std::istream& is, std::string const& name, std::string& buffer, uint32_t& line_num)
+inline ValveDataObject ValveDataObject::_ParseTextObject(std::istream& is, std::string& name, std::string& buffer, uint32_t& line_num)
 {
     const char* line_start;
     const char* line_end;
@@ -1198,8 +1204,8 @@ inline ValveDataObject ValveDataObject::_ParseTextObject(std::istream& is, std::
     int error;
     bool is_object = false;
 
-    o._Obj->_Name = name;
     o._Obj->_NameHash = std::hash<std::string>()(name);
+    o._Obj->_Name = std::move(name);
     o._Obj->_Collection = new ValveCollection();
     o._Obj->_Type = ObjectType::Object;
 
@@ -1285,7 +1291,7 @@ inline ValveDataObject ValveDataObject::_ParseTextObject(std::istream& is, std::
     return o;
 }
 
-inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std::string const& name, BinaryNodeType object_end, std::string& buffer, const char*& buffer_start, const char*& buffer_end)
+inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& name, BinaryNodeType object_end, std::string& buffer, const char*& buffer_start, const char*& buffer_end)
 {
     ValveDataObject o;
     int error;
@@ -1295,8 +1301,8 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
     bool parsed_item_key = false;
     bool type_read = false;
 
-    o._Obj->_Name = name;
     o._Obj->_NameHash = std::hash<std::string>()(name);
+    o._Obj->_Name = std::move(name);
     o._Obj->_Collection = new ValveCollection();
     o._Obj->_Type = ObjectType::Object;
 
