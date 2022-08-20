@@ -897,15 +897,12 @@ inline std::string const& ValveDataObject::Name() const
 
 inline ObjectType ValveDataObject::Type() const
 {
-    if (_Obj == nullptr)
-        return ObjectType::None;
-
     return _Obj->_Type;
 }
 
 inline bool ValveDataObject::Empty() const
 {
-    return _Obj == nullptr || _Obj->_Type == ObjectType::None;
+    return _Obj->_Type == ObjectType::None;
 }
 
 inline std::string& ValveDataObject::String()
@@ -955,7 +952,7 @@ inline bool ValveDataObject::operator==(std::nullptr_t)
 
 inline ValveDataObject& ValveDataObject::operator=(ValveDataObject const& value)
 {
-    ValveDataObject tmp(std::move(value));
+    ValveDataObject tmp(value);
     _ResetValue();
 
     return (*this = std::move(tmp));
