@@ -317,17 +317,17 @@ private:
 
     enum class BinaryNodeType : int8_t
     {
-        Object           = 0,
-        String           = 1,
-        Int32            = 2,
-        Float            = 3,
-        Pointer          = 4,
-        WideString       = 5,
-        Color            = 6,
-        UInt64           = 7,
-        ObjectEnd        = 8,
-        Binary           = 9,
-        Int64            = 10,
+        Object         = 0,
+        String         = 1,
+        Int32          = 2,
+        Float          = 3,
+        Pointer        = 4,
+        WideString     = 5,
+        Color          = 6,
+        UInt64         = 7,
+        ObjectEnd      = 8,
+        Binary         = 9,
+        Int64          = 10,
         AlternativeEnd = 11,
     };
 
@@ -376,6 +376,10 @@ public:
     ValveDataObject(ValveDataObject const& other);
 
     ValveDataObject(ValveDataObject&& other) noexcept;
+    
+    ValveDataObject(std::string const& key, ValveDataObject const& other);
+
+    ValveDataObject(std::string const& key, ValveDataObject&& other) noexcept;
 
     ValveDataObject(std::string const& key, std::string const& value);
 
@@ -742,6 +746,26 @@ inline ValveDataObject::ValveDataObject(ValveDataObject && other) noexcept :
     _Obj->_NameHash = other._Obj->_NameHash;
     // But move content
     (*this) = std::move(other);
+}
+
+inline ValveDataObject::ValveDataObject(std::string const& key, ValveDataObject const& other) :
+    _Obj(new Data_t())
+{
+    _Obj->_Name = key;
+    _Obj->_NameHash = std::hash<std::string>()(key);
+    _Obj->_Type = ObjectType::Object;
+    _Obj->_U._Collection = new ValveCollection();
+    _Obj->_U._Collection->emplace_back(other);
+}
+
+inline ValveDataObject::ValveDataObject(std::string const& key, ValveDataObject&& other) noexcept :
+    _Obj(new Data_t())
+{
+    _Obj->_Name = key;
+    _Obj->_NameHash = std::hash<std::string>()(key);
+    _Obj->_Type = ObjectType::Object;
+    _Obj->_U._Collection = new ValveCollection();
+    _Obj->_U._Collection->emplace_back(std::move(other));
 }
 
 inline ValveDataObject::ValveDataObject(std::string const& key, std::string const& value) :
