@@ -76,7 +76,7 @@ inline void ReadBinaryBytes(const char*& b, const char* e, std::string& buffer, 
 }
 
 /// <summary>
-/// Returns 0 when string is read to end (null char)
+/// Returns  0 when string is read to end (null char)
 /// Returns -1 when string was partially read
 /// Returns -2 when invalid utf8 codepoint was found
 /// </summary>
@@ -289,22 +289,6 @@ public:
 
     inline uint64_t UInt64() const;
 
-    inline operator std::string() const;
-
-    inline operator ValveCollection() const;
-
-    inline operator int32_t() const;
-
-    inline operator float() const;
-
-    inline operator pointer_t() const;
-
-    inline operator color_t() const;
-
-    inline operator int64_t() const;
-
-    inline operator uint64_t() const;
-
     inline ValveCollectionRef operator[](const char* key);
 
     inline ValveCollectionRef operator[](std::string const& key);
@@ -344,7 +328,7 @@ private:
         ObjectEnd        = 8,
         Binary           = 9,
         Int64            = 10,
-        AlternatativeEnd = 11,
+        AlternativeEnd = 11,
     };
 
     class Data_t
@@ -363,7 +347,7 @@ private:
             color_t _Color;
             int64_t _Int64;
             uint64_t _UInt64;
-        };
+        } _U;
         ObjectType _Type;
 
     public:
@@ -374,13 +358,13 @@ private:
         {}
     };
 
-    Data_t* _Obj;
+    Data_t *_Obj;
 
     void _ResetValue();
 
-    static ValveDataObject _ParseTextObject(std::istream& is, std::string& name, std::string& buffer, uint32_t& line_num);
+    static void _ParseTextObject(std::istream& is, std::string& name, std::string& buffer, uint32_t& line_num, ValveDataObject& o);
 
-    static ValveDataObject _ParseBinaryObject(std::istream& is, std::string& name, BinaryNodeType object_end, std::string& buffer, const char*& buffer_start, const char*& buffer_end);
+    static void _ParseBinaryObject(std::istream& is, std::string& name, BinaryNodeType object_end, std::string& buffer, const char*& buffer_start, const char*& buffer_end, ValveDataObject& o);
 
     void _SerializeAsText(std::ostream& os, size_t depth) const;
 
@@ -443,6 +427,10 @@ public:
 
     ValveDataObject& operator=(int32_t value);
 
+    ValveDataObject& operator=(pointer_t value);
+
+    ValveDataObject& operator=(color_t value);
+
     ValveDataObject& operator=(float value);
 
     ValveDataObject& operator=(int64_t value);
@@ -460,20 +448,6 @@ public:
     int64_t Int64() const;
 
     uint64_t UInt64() const;
-
-    inline operator std::string() const;
-
-    inline operator ValveCollection() const;
-
-    inline operator int32_t() const;
-
-    inline operator float() const;
-
-    inline operator pointer_t() const;
-
-    inline operator int64_t() const;
-
-    inline operator uint64_t() const;
 
     ValveCollectionRef operator[](const char* key);
     
@@ -687,54 +661,6 @@ inline uint64_t ValveDataObjectRefWrapper<T>::UInt64() const
 }
 
 template<typename T>
-inline ValveDataObjectRefWrapper<T>::operator std::string() const
-{
-    return static_cast<std::string>(*_Obj);
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>::operator ValveCollection() const
-{
-    return static_cast<ValveCollection>(*_Obj);
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>::operator int32_t() const
-{
-    return static_cast<int32_t>(*_Obj);
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>::operator float() const
-{
-    return static_cast<float>(*_Obj);
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>::operator pointer_t() const
-{
-    return static_cast<pointer_t>(*_Obj);
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>::operator color_t() const
-{
-    return static_cast<color_t>(*_Obj);
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>::operator int64_t() const
-{
-    return static_cast<int64_t>(*_Obj);
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>::operator uint64_t() const
-{
-    return static_cast<uint64_t>(*_Obj);
-}
-
-template<typename T>
 inline ValveCollectionRef ValveDataObjectRefWrapper<T>::operator[](const char* key)
 {
     return (*_Obj)[key];
@@ -801,18 +727,20 @@ inline ValveDataObject::ValveDataObject(ValveDataObject const& other):
     _Obj->_Type = other._Obj->_Type;
     switch (_Obj->_Type)
     {   // Copy pointers content
-        case ObjectType::String: _Obj->_String = new std::string(*other._Obj->_String); break;
-        case ObjectType::Object: _Obj->_Collection = new ValveCollection(*other._Obj->_Collection); break;
+        case ObjectType::String: _Obj->_U._String = new std::string(*other._Obj->_U._String); break;
+        case ObjectType::Object: _Obj->_U._Collection = new ValveCollection(*other._Obj->_U._Collection); break;
         // Copy biggest possible value
-        default: _Obj->_UInt64 = other._Obj->_UInt64;
+        default: _Obj->_U = other._Obj->_U;
     }
 }
 
 inline ValveDataObject::ValveDataObject(ValveDataObject && other) noexcept :
     _Obj(new Data_t())
 {
+    // Copy object name on creation
     _Obj->_Name = other._Obj->_Name;
     _Obj->_NameHash = other._Obj->_NameHash;
+    // But move content
     (*this) = std::move(other);
 }
 
@@ -821,7 +749,7 @@ inline ValveDataObject::ValveDataObject(std::string const& key, std::string cons
 {
     _Obj->_Name = key;
     _Obj->_NameHash = std::hash<std::string>()(key);
-    _Obj->_String = new std::string(value);
+    _Obj->_U._String = new std::string(value);
     _Obj->_Type = ObjectType::String;
 }
 
@@ -830,7 +758,7 @@ inline ValveDataObject::ValveDataObject(std::string const& key, std::string && v
 {
     _Obj->_Name = key;
     _Obj->_NameHash = std::hash<std::string>()(key);
-    _Obj->_String = new std::string(std::move(value));
+    _Obj->_U._String = new std::string(std::move(value));
     _Obj->_Type = ObjectType::String;
 }
 
@@ -839,7 +767,7 @@ inline ValveDataObject::ValveDataObject(std::string const& key, int32_t value) :
 {
     _Obj->_Name = key;
     _Obj->_NameHash = std::hash<std::string>()(key);
-    _Obj->_Int32 = value;
+    _Obj->_U._Int32 = value;
     _Obj->_Type = ObjectType::Int32;
 }
 
@@ -848,7 +776,7 @@ inline ValveDataObject::ValveDataObject(std::string const& key, float value) :
 {
     _Obj->_Name = key;
     _Obj->_NameHash = std::hash<std::string>()(key);
-    _Obj->_Float = value;
+    _Obj->_U._Float = value;
     _Obj->_Type = ObjectType::Float;
 }
 
@@ -857,7 +785,7 @@ inline ValveDataObject::ValveDataObject(std::string const& key, pointer_t value)
 {
     _Obj->_Name = key;
     _Obj->_NameHash = std::hash<std::string>()(key);
-    _Obj->_Pointer = value;
+    _Obj->_U._Pointer = value;
     _Obj->_Type = ObjectType::Pointer;
 }
 
@@ -866,7 +794,7 @@ inline ValveDataObject::ValveDataObject(std::string const& key, color_t value) :
 {
     _Obj->_Name = key;
     _Obj->_NameHash = std::hash<std::string>()(key);
-    _Obj->_Color = value;
+    _Obj->_U._Color = value;
     _Obj->_Type = ObjectType::Color;
 }
 
@@ -875,7 +803,7 @@ inline ValveDataObject::ValveDataObject(std::string const& key, int64_t value) :
 {
     _Obj->_Name = key;
     _Obj->_NameHash = std::hash<std::string>()(key);
-    _Obj->_Int64 = value;
+    _Obj->_U._Int64 = value;
     _Obj->_Type = ObjectType::Int64;
 }
 
@@ -884,7 +812,7 @@ inline ValveDataObject::ValveDataObject(std::string const& key, uint64_t value) 
 {
     _Obj->_Name = key;
     _Obj->_NameHash = std::hash<std::string>()(key);
-    _Obj->_UInt64 = value;
+    _Obj->_U._UInt64 = value;
     _Obj->_Type = ObjectType::UInt64;
 }
 
@@ -928,7 +856,7 @@ inline std::string& ValveDataObject::String()
         throw std::invalid_argument("Attempted to read a String from a non String type.");
     }
 
-    return *_Obj->_String;
+    return *_Obj->_U._String;
 }
 
 inline std::string const& ValveDataObject::String() const
@@ -938,7 +866,7 @@ inline std::string const& ValveDataObject::String() const
         throw std::invalid_argument("Attempted to read a String from a non String type.");
     }
     
-    return *_Obj->_String;
+    return *_Obj->_U._String;
 }
 
 inline ValveCollection& ValveDataObject::Collection()
@@ -948,7 +876,7 @@ inline ValveCollection& ValveDataObject::Collection()
         throw std::invalid_argument("Attempted to get a Collection from non Collection type.");
     }
 
-    return *_Obj->_Collection;
+    return *_Obj->_U._Collection;
 }
 
 inline ValveCollection const& ValveDataObject::Collection() const
@@ -958,7 +886,7 @@ inline ValveCollection const& ValveDataObject::Collection() const
         throw std::invalid_argument("Attempted to get a Collection from non Collection type.");
     }
 
-    return *_Obj->_Collection;
+    return *_Obj->_U._Collection;
 }
 
 inline bool ValveDataObject::operator==(std::nullptr_t)
@@ -968,25 +896,20 @@ inline bool ValveDataObject::operator==(std::nullptr_t)
 
 inline ValveDataObject& ValveDataObject::operator=(ValveDataObject const& value)
 {
-    ValveDataObject tmp(value);
-    _ResetValue();
-
-    return (*this = std::move(tmp));
+    std::cout << "Copy" << std::endl;
+    return (*this = ValveDataObject(value));
 }
 
 inline ValveDataObject& ValveDataObject::operator=(ValveDataObject&& value) noexcept
 {
     auto type = value._Obj->_Type;
-    value._Obj->_Type = ObjectType::None;
+    auto v = value._Obj->_U;
+    
+    value._Obj->_Type = _Obj->_Type;
+    value._Obj->_U = _Obj->_U;
 
     _Obj->_Type = type;
-    switch (_Obj->_Type)
-    {   // Copy pointers content
-        case ObjectType::String: _Obj->_String = value._Obj->_String; break;
-        case ObjectType::Object: _Obj->_Collection = value._Obj->_Collection; break;
-        // Copy biggest possible value
-        default: _Obj->_UInt64 = value._Obj->_UInt64;
-    }
+    _Obj->_U = v;
 
     return *this;
 }
@@ -1001,7 +924,7 @@ inline ValveDataObject& ValveDataObject::operator=(std::string const& value)
 {
     std::string* v = new std::string(value);
     _ResetValue();
-    _Obj->_String = v;
+    _Obj->_U._String = v;
     _Obj->_Type = ObjectType::String;
 
     return *this;
@@ -1011,7 +934,7 @@ inline ValveDataObject& ValveDataObject::operator=(std::string&& value)
 {
     std::string* v = new std::string(std::move(value));
     _ResetValue();
-    _Obj->_String = v;
+    _Obj->_U._String = v;
     _Obj->_Type = ObjectType::String;
 
     return *this;
@@ -1020,7 +943,25 @@ inline ValveDataObject& ValveDataObject::operator=(std::string&& value)
 inline ValveDataObject& ValveDataObject::operator=(int32_t value)
 {
     _ResetValue();
-    _Obj->_Int32 = value;
+    _Obj->_U._Int32 = value;
+    _Obj->_Type = ObjectType::Int32;
+
+    return *this;
+}
+
+inline ValveDataObject& ValveDataObject::operator=(pointer_t value)
+{
+    _ResetValue();
+    _Obj->_U._Pointer = value;
+    _Obj->_Type = ObjectType::Int32;
+
+    return *this;
+}
+
+inline ValveDataObject& ValveDataObject::operator=(color_t value)
+{
+    _ResetValue();
+    _Obj->_U._Color = value;
     _Obj->_Type = ObjectType::Int32;
 
     return *this;
@@ -1029,7 +970,7 @@ inline ValveDataObject& ValveDataObject::operator=(int32_t value)
 inline ValveDataObject& ValveDataObject::operator=(float value)
 {
     _ResetValue();
-    _Obj->_Float = value;
+    _Obj->_U._Float = value;
     _Obj->_Type = ObjectType::Float;
 
     return *this;
@@ -1038,7 +979,7 @@ inline ValveDataObject& ValveDataObject::operator=(float value)
 inline ValveDataObject& ValveDataObject::operator=(int64_t value)
 {
     _ResetValue();
-    _Obj->_Int64 = value;
+    _Obj->_U._Int64 = value;
     _Obj->_Type = ObjectType::Int64;
 
     return *this;
@@ -1047,7 +988,7 @@ inline ValveDataObject& ValveDataObject::operator=(int64_t value)
 inline ValveDataObject& ValveDataObject::operator=(uint64_t value)
 {
     _ResetValue();
-    _Obj->_UInt64 = value;
+    _Obj->_U._UInt64 = value;
     _Obj->_Type = ObjectType::UInt64;
 
     return *this;
@@ -1060,7 +1001,7 @@ inline int32_t ValveDataObject::Int32() const
         throw std::invalid_argument("Attempted to get an Int32 from non Int32 type.");
     }
 
-    return _Obj->_Int32;
+    return _Obj->_U._Int32;
 }
 
 inline float ValveDataObject::Float() const
@@ -1070,7 +1011,7 @@ inline float ValveDataObject::Float() const
         throw std::invalid_argument("Attempted to get a Float from non Float type.");
     }
 
-    return _Obj->_Float;
+    return _Obj->_U._Float;
 }
 
 inline pointer_t ValveDataObject::Pointer() const
@@ -1080,7 +1021,7 @@ inline pointer_t ValveDataObject::Pointer() const
         throw std::invalid_argument("Attempted to get a Pointer from non Pointer type.");
     }
 
-    return _Obj->_Pointer;
+    return _Obj->_U._Pointer;
 }
 
 inline color_t ValveDataObject::Color() const
@@ -1090,7 +1031,7 @@ inline color_t ValveDataObject::Color() const
         throw std::invalid_argument("Attempted to get a Pointer from non Pointer type.");
     }
 
-    return _Obj->_Color;
+    return _Obj->_U._Color;
 }
 
 inline int64_t ValveDataObject::Int64() const
@@ -1100,7 +1041,7 @@ inline int64_t ValveDataObject::Int64() const
         throw std::invalid_argument("Attempted to get an Int64 from non Int64 type.");
     }
 
-    return _Obj->_Int64;
+    return _Obj->_U._Int64;
 }
 
 inline uint64_t ValveDataObject::UInt64() const
@@ -1110,42 +1051,7 @@ inline uint64_t ValveDataObject::UInt64() const
         throw std::invalid_argument("Attempted to get an UInt64 from non UInt64 type.");
     }
 
-    return _Obj->_UInt64;
-}
-
-inline ValveDataObject::operator std::string() const
-{
-    return String();
-}
-
-inline ValveDataObject::operator ValveCollection() const
-{
-    return Collection();
-}
-
-inline ValveDataObject::operator int32_t() const
-{
-    return Int32();
-}
-
-inline ValveDataObject::operator float() const
-{
-    return Float();
-}
-
-inline ValveDataObject::operator pointer_t() const
-{
-    return Pointer();
-}
-
-inline ValveDataObject::operator int64_t() const
-{
-    return Int64();
-}
-
-inline ValveDataObject::operator uint64_t() const
-{
-    return UInt64();
+    return _Obj->_U._UInt64;
 }
 
 inline ValveCollectionRef ValveDataObject::operator[](const char* key)
@@ -1197,29 +1103,29 @@ inline void ValveDataObject::_ResetValue()
 
     switch (_Obj->_Type)
     {
-        case ObjectType::String: delete _Obj->_String; break;
-        case ObjectType::Object: delete _Obj->_Collection; break;
+        case ObjectType::String: delete _Obj->_U._String; break;
+        case ObjectType::Object: delete _Obj->_U._Collection; break;
+        default: break; // Warning fix.
     }
     _Obj->_Type = ObjectType::None;
 }
 
-inline ValveDataObject ValveDataObject::_ParseTextObject(std::istream& is, std::string& name, std::string& buffer, uint32_t& line_num)
+inline void ValveDataObject::_ParseTextObject(std::istream& is, std::string& name, std::string& buffer, uint32_t& line_num, ValveDataObject& o)
 {
     const char* line_start;
     const char* line_end;
 
     std::string object_name;
     std::string tmp;
-    ValveDataObject o;
     int error;
     bool is_object = false;
 
     o._Obj->_NameHash = std::hash<std::string>()(name);
     o._Obj->_Name = std::move(name);
-    o._Obj->_Collection = new ValveCollection();
+    o._Obj->_U._Collection = new ValveCollection();
     o._Obj->_Type = ObjectType::Object;
 
-    for ( ; std::getline(is, buffer);)
+    while (std::getline(is, buffer))
     {
         ++line_num;
         line_start = &buffer[0];
@@ -1271,7 +1177,7 @@ inline ValveDataObject ValveDataObject::_ParseTextObject(std::istream& is, std::
                     throw ParserException("Got datas after item value at line " + std::to_string(line_num));
                 }
 
-                o._Obj->_Collection->emplace_back(ValveDataObject(object_name, tmp));
+                o._Obj->_U._Collection->emplace_back(object_name, tmp);
             }
             else if (line_start != line_end)
             {
@@ -1294,17 +1200,16 @@ inline ValveDataObject ValveDataObject::_ParseTextObject(std::istream& is, std::
                 throw ParserException("Got datas after object start at line " + std::to_string(line_num));
             }
 
-            o._Obj->_Collection->emplace_back(_ParseTextObject(is, object_name, buffer, line_num));
+            o._Obj->_U._Collection->emplace_back();
+            _ParseTextObject(is, object_name, buffer, line_num, *o._Obj->_U._Collection->rbegin());
             is_object = false;
         }
     }
-
-    return o;
 }
+    
 
-inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& name, BinaryNodeType object_end, std::string& buffer, const char*& buffer_start, const char*& buffer_end)
+inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& name, BinaryNodeType object_end, std::string& buffer, const char*& buffer_start, const char*& buffer_end, ValveDataObject& o)
 {
-    ValveDataObject o;
     int error;
     std::string tmp1, item_key;
 
@@ -1314,7 +1219,7 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
 
     o._Obj->_NameHash = std::hash<std::string>()(name);
     o._Obj->_Name = std::move(name);
-    o._Obj->_Collection = new ValveCollection();
+    o._Obj->_U._Collection = new ValveCollection();
     o._Obj->_Type = ObjectType::Object;
 
     while (is || buffer_start != buffer_end)
@@ -1330,7 +1235,7 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
             }
             else
             {
-                if (state == BinaryNodeType::ObjectEnd || state == BinaryNodeType::AlternatativeEnd)
+                if (state == BinaryNodeType::ObjectEnd || state == BinaryNodeType::AlternativeEnd)
                 {
                     if (state != object_end)
                     {
@@ -1338,7 +1243,7 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
                         //SPDLOG_DEBUG("Got object end {:02x} but expected {:02x}", (uint32_t)state, (uint32_t)object_end);
                     }
                     
-                    return o;
+                    return;
                 }
 
                 if (!parsed_item_key)
@@ -1360,7 +1265,8 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
                     switch (state)
                     {
                         case BinaryNodeType::Object:
-                            o._Obj->_Collection->emplace_back(_ParseBinaryObject(is, item_key, object_end, buffer, buffer_start, buffer_end));
+                            o._Obj->_U._Collection->emplace_back();
+                            _ParseBinaryObject(is, item_key, object_end, buffer, buffer_start, buffer_end, *o._Obj->_U._Collection->rbegin());
                             clear = true;
                             break;
 
@@ -1372,7 +1278,7 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
                             }
                             if(error == 0)
                             {// String was fully read
-                                o._Obj->_Collection->emplace_back(ValveDataObject(item_key, std::move(tmp1)));
+                                o._Obj->_U._Collection->emplace_back(item_key, std::move(tmp1));
 
                                 clear = true;
                             }
@@ -1382,7 +1288,7 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
                             Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 4);
                             if (tmp1.length() == 4)
                             {
-                                o._Obj->_Collection->emplace_back(ValveDataObject(item_key, *reinterpret_cast<const int32_t*>(tmp1.data())));
+                                o._Obj->_U._Collection->emplace_back(item_key, *reinterpret_cast<const int32_t*>(tmp1.data()));
                                 clear = true;
                             }
                             break;
@@ -1391,7 +1297,7 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
                             Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 4);
                             if (tmp1.length() == 4)
                             {
-                                o._Obj->_Collection->emplace_back(ValveDataObject(item_key, *reinterpret_cast<const float*>(tmp1.data())));
+                                o._Obj->_U._Collection->emplace_back(item_key, *reinterpret_cast<const float*>(tmp1.data()));
                                 clear = true;
                             }
                             break;
@@ -1400,7 +1306,7 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
                             Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 4);
                             if (tmp1.length() == 4)
                             {
-                                o._Obj->_Collection->emplace_back(ValveDataObject(item_key, *reinterpret_cast<const pointer_t*>(tmp1.data())));
+                                o._Obj->_U._Collection->emplace_back(item_key, *reinterpret_cast<const pointer_t*>(tmp1.data()));
                                 clear = true;
                             }
                             break;
@@ -1409,7 +1315,7 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
                             Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 4);
                             if (tmp1.length() == 4)
                             {
-                                o._Obj->_Collection->emplace_back(ValveDataObject(item_key, *reinterpret_cast<const color_t*>(tmp1.data())));
+                                o._Obj->_U._Collection->emplace_back(item_key, *reinterpret_cast<const color_t*>(tmp1.data()));
                                 clear = true;
                             }
                             break;
@@ -1418,7 +1324,7 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
                             Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 8);
                             if (tmp1.length() == 8)
                             {
-                                o._Obj->_Collection->emplace_back(ValveDataObject(item_key, *reinterpret_cast<const int64_t*>(tmp1.data())));
+                                o._Obj->_U._Collection->emplace_back(item_key, *reinterpret_cast<const int64_t*>(tmp1.data()));
                                 clear = true;
                             }
                             break;
@@ -1427,7 +1333,7 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
                             Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 8);
                             if (tmp1.length() == 8)
                             {
-                                o._Obj->_Collection->emplace_back(ValveDataObject(item_key, *reinterpret_cast<const uint64_t*>(tmp1.data())));
+                                o._Obj->_U._Collection->emplace_back(item_key, *reinterpret_cast<const uint64_t*>(tmp1.data()));
                                 clear = true;
                             }
                             break;
@@ -1452,8 +1358,6 @@ inline ValveDataObject ValveDataObject::_ParseBinaryObject(std::istream& is, std
         buffer_start = &buffer[0];
         buffer_end = buffer_start + is.gcount();
     }
-
-    return {};
 }
 
 inline void ValveDataObject::_SerializeAsText(std::ostream& os, size_t depth) const
@@ -1465,20 +1369,25 @@ inline void ValveDataObject::_SerializeAsText(std::ostream& os, size_t depth) co
     {
         case ObjectType::Object:
             os << '\n' << indent << "{\n";
-            for (auto const& item : *_Obj->_Collection)
+            for (auto const& item : *_Obj->_U._Collection)
             {
                 item._SerializeAsText(os, depth + 1);
             }
             os << indent << "}\n";
             break;
 
-        case ObjectType::Pointer: os << "\t\t\"" << _Obj->_Pointer.value << "\"\n"; break;
-        case ObjectType::Color  : os << "\t\t\"" << _Obj->_Color.value   << "\"\n"; break;
-        case ObjectType::Float  : os << "\t\t\"" << _Obj->_Float         << "\"\n"; break;
-        case ObjectType::Int32  : os << "\t\t\"" << _Obj->_Int32         << "\"\n"; break;
-        case ObjectType::Int64  : os << "\t\t\"" << _Obj->_Int64         << "\"\n"; break;
-        case ObjectType::UInt64 : os << "\t\t\"" << _Obj->_UInt64        << "\"\n"; break;
-        case ObjectType::String : os << "\t\t\"" << *_Obj->_String       << "\"\n"; break;
+        case ObjectType::Pointer: os << "\t\t\"" << _Obj->_U._Pointer.value << "\"\n"; break;
+        case ObjectType::Color  : os << "\t\t\"" << _Obj->_U._Color.value   << "\"\n"; break;
+        case ObjectType::Float  : os << "\t\t\"" << _Obj->_U._Float         << "\"\n"; break;
+        case ObjectType::Int32  : os << "\t\t\"" << _Obj->_U._Int32         << "\"\n"; break;
+        case ObjectType::Int64  : os << "\t\t\"" << _Obj->_U._Int64         << "\"\n"; break;
+        case ObjectType::UInt64 : os << "\t\t\"" << _Obj->_U._UInt64        << "\"\n"; break;
+        case ObjectType::String : os << "\t\t\"" << *_Obj->_U._String       << "\"\n"; break;
+        
+        //case ObjectType::WideString: TODO;
+        //case ObjectType::Binary    : TODO;
+        
+        case ObjectType::None: break; // Warning fix.
     }
 }
 
@@ -1491,20 +1400,25 @@ inline void ValveDataObject::_SerializeAsBinary(std::ostream& os, BinaryNodeType
     {
         case ObjectType::Object:
             
-            for (auto const& item : *_Obj->_Collection)
+            for (auto const& item : *_Obj->_U._Collection)
             {
                 item._SerializeAsBinary(os, object_end, crc);
             }
             os.write((const char*)&object_end, 1);
             break;
     
-        case ObjectType::Pointer: os.write((const char*)&_Obj->_Pointer, 4); break;
-        case ObjectType::Color  : os.write((const char*)&_Obj->_Color, 4); break;
-        case ObjectType::Float  : os.write((const char*)&_Obj->_Float, 4); break;
-        case ObjectType::Int32  : os.write((const char*)&_Obj->_Int32, 4); break;
-        case ObjectType::Int64  : os.write((const char*)&_Obj->_Int64, 8); break;
-        case ObjectType::UInt64 : os.write((const char*)&_Obj->_UInt64, 8); break;
-        case ObjectType::String : os.write(_Obj->_String->c_str(), _Obj->_String->length() + 1); break;
+        case ObjectType::Pointer: os.write((const char*)&_Obj->_U._Pointer, 4); break;
+        case ObjectType::Color  : os.write((const char*)&_Obj->_U._Color, 4); break;
+        case ObjectType::Float  : os.write((const char*)&_Obj->_U._Float, 4); break;
+        case ObjectType::Int32  : os.write((const char*)&_Obj->_U._Int32, 4); break;
+        case ObjectType::Int64  : os.write((const char*)&_Obj->_U._Int64, 8); break;
+        case ObjectType::UInt64 : os.write((const char*)&_Obj->_U._UInt64, 8); break;
+        case ObjectType::String : os.write(_Obj->_U._String->c_str(), _Obj->_U._String->length() + 1); break;
+        
+        //case ObjectType::WideString: TODO;
+        //case ObjectType::Binary    : TODO;
+        
+        case ObjectType::None: break; // Warning fix.
     }
 }
 
@@ -1523,7 +1437,7 @@ inline void ValveDataObject::SerializeAsBinary(std::ostream& os, int version) co
     uint32_t crc = 0x00000000;
     //size_t spos = os.tellp();
 
-    BinaryNodeType object_end = version <= 1 ? BinaryNodeType::ObjectEnd : BinaryNodeType::AlternatativeEnd;
+    BinaryNodeType object_end = version <= 1 ? BinaryNodeType::ObjectEnd : BinaryNodeType::AlternativeEnd;
     if (version > 1)
     {
         os.write((const char*)&BinaryVDFMagic, 4);
@@ -1562,6 +1476,8 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
     bool as_binary = false;
     const char* buffer_start, *buffer_end;
 
+    ValveDataObject parsed_object;
+
     std::string buffer(chunk_size, '\0');
     std::string object_name;
     int error;
@@ -1574,7 +1490,7 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
     if (*reinterpret_cast<const uint32_t*>(buffer.data()) == BinaryVDFMagic)
     {
         as_binary = true;
-        binary_root_end = BinaryNodeType::AlternatativeEnd;
+        binary_root_end = BinaryNodeType::AlternativeEnd;
         // Skip crc
         is.seekg(4, std::ios::cur);
     }
@@ -1590,7 +1506,7 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
 
     if (!as_binary)
     {// Parse as text VDF
-        for (; std::getline(is, buffer);)
+        while (std::getline(is, buffer))
         {
             ++line_num;
             buffer_start = &buffer[0];
@@ -1634,7 +1550,7 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
                     throw ParserException("Got datas after object start at line " + std::to_string(line_num));
                 }
 
-                return _ParseTextObject(is, object_name, buffer, line_num);
+                _ParseTextObject(is, object_name, buffer, line_num, parsed_object);
             }
         }
     }
@@ -1661,12 +1577,12 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
             }
             if (error == 0)
             {
-                return _ParseBinaryObject(is, object_name, binary_root_end, buffer, buffer_start, buffer_end);
+                _ParseBinaryObject(is, object_name, binary_root_end, buffer, buffer_start, buffer_end, parsed_object);
             }
         }
     }
 
-    return {};
+    return parsed_object;
 }
 
 }
