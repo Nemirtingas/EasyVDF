@@ -151,6 +151,16 @@ inline int ParseString(const char*& b, const char* e, std::string& str)
         unsigned char c = *b++;
         if (c < 0x80u)
         {
+            if (c == '\\')
+            {
+                has_escape = true;
+                continue;
+            }
+            if (has_escape)
+            {
+                has_escape = false;
+                continue;
+            }
             if (c == '"')
             {
                 str.assign(string_start, b - 1);
@@ -1209,8 +1219,9 @@ inline ValveDataObject ValveDataObject::_ParseTextObject(std::istream& is, std::
     o._Obj->_Collection = new ValveCollection();
     o._Obj->_Type = ObjectType::Object;
 
-    for ( ; std::getline(is, buffer); ++line_num)
+    for ( ; std::getline(is, buffer);)
     {
+        ++line_num;
         line_start = &buffer[0];
         line_end = line_start + buffer.length();
         Details::SkipSpaces(line_start, line_end);
@@ -1579,8 +1590,9 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
 
     if (!as_binary)
     {// Parse as text VDF
-        for (; std::getline(is, buffer); ++line_num)
+        for (; std::getline(is, buffer);)
         {
+            ++line_num;
             buffer_start = &buffer[0];
             buffer_end = buffer_start + buffer.length();
             Details::SkipSpaces(buffer_start, buffer_end);
