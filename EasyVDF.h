@@ -1666,52 +1666,42 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
 
 }
 
-struct pointer_t
-{
-    uint32_t value;
-};
-
-struct color_t
-{
-    uint32_t value;
-};
-
-inline bool operator==(EasyVDF::pointer_t v1, EasyVDF::pointer_t v2)
+inline bool operator==(const EasyVDF::pointer_t v1, const EasyVDF::pointer_t v2)
 {
     return v1.value == v2.value;
 }
 
-inline bool operator!=(EasyVDF::pointer_t v1, EasyVDF::pointer_t v2)
+inline bool operator!=(const EasyVDF::pointer_t v1, const EasyVDF::pointer_t v2)
 {
     return v1.value != v2.value;
 }
 
-inline bool operator==(EasyVDF::color_t v1, EasyVDF::color_t v2)
+inline bool operator==(const EasyVDF::color_t v1, const EasyVDF::color_t v2)
 {
     return v1.value == v2.value;
 }
 
-inline bool operator!=(EasyVDF::color_t v1, EasyVDF::color_t v2)
+inline bool operator!=(const EasyVDF::color_t v1, const EasyVDF::color_t v2)
 {
     return v1.value != v2.value;
 }
 
-inline bool operator<(EasyVDF::color_t v1, EasyVDF::color_t v2)
+inline bool operator<(const EasyVDF::color_t v1, const EasyVDF::color_t v2)
 {
     return v1.value < v2.value;
 }
 
-inline bool operator<=(EasyVDF::color_t v1, EasyVDF::color_t v2)
+inline bool operator<=(const EasyVDF::color_t v1, const EasyVDF::color_t v2)
 {
     return v1.value <= v2.value;
 }
 
-inline bool operator>(EasyVDF::color_t v1, EasyVDF::color_t v2)
+inline bool operator>(const EasyVDF::color_t v1, const EasyVDF::color_t v2)
 {
     return v1.value > v2.value;
 }
 
-inline bool operator>=(EasyVDF::color_t v1, EasyVDF::color_t v2)
+inline bool operator>=(const EasyVDF::color_t v1, const EasyVDF::color_t v2)
 {
     return v1.value >= v2.value;
 }
