@@ -9,6 +9,9 @@
 
 namespace EasyVDF {
 
+// VBKV
+static constexpr uint32_t BinaryVDFMagic = 0x564B4256;
+
 enum class ObjectType : int8_t
 {
     None       = -1,
@@ -83,7 +86,7 @@ static std::basic_istream<CharT, Traits>& getline(std::basic_istream<CharT, Trai
             // Nope, Windows EOL.
             c = is.peek();
             if (is_lf(c))
-                buffer.push_back(c);
+                buffer.push_back(is.get());
             
             break;
         }
@@ -357,12 +360,6 @@ public:
 class ValveDataObject
 {
 private:
-    // VBKV
-    static constexpr uint32_t BinaryVDFMagic = 0x564B4256;
-
-    //static constexpr size_t _ChunkSize = 4;
-    //static constexpr size_t _ChunkSize = 10 * 1024;
-
     enum class BinaryNodeType : int8_t
     {
         Object         = 0,
@@ -424,6 +421,8 @@ public:
     ValveDataObject(ValveDataObject const& other);
 
     ValveDataObject(ValveDataObject&& other) noexcept;
+    
+    ValveDataObject(std::string const& key);
     
     ValveDataObject(std::string const& key, ValveDataObject const& other);
 
@@ -794,6 +793,15 @@ inline ValveDataObject::ValveDataObject(ValveDataObject && other) noexcept :
     _Obj->_NameHash = other._Obj->_NameHash;
     // But move content
     (*this) = std::move(other);
+}
+
+inline ValveDataObject::ValveDataObject(std::string const& key) :
+    _Obj(new Data_t())
+{
+    _Obj->_Name = key;
+    _Obj->_NameHash = std::hash<std::string>()(key);
+    _Obj->_Type = ObjectType::Object;
+    _Obj->_U._Collection = new ValveCollection();
 }
 
 inline ValveDataObject::ValveDataObject(std::string const& key, ValveDataObject const& other) :
@@ -1656,4 +1664,54 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
     return parsed_object;
 }
 
+}
+
+struct pointer_t
+{
+    uint32_t value;
+};
+
+struct color_t
+{
+    uint32_t value;
+};
+
+inline bool operator==(EasyVDF::pointer_t v1, EasyVDF::pointer_t v2)
+{
+    return v1.value == v2.value;
+}
+
+inline bool operator!=(EasyVDF::pointer_t v1, EasyVDF::pointer_t v2)
+{
+    return v1.value != v2.value;
+}
+
+inline bool operator==(EasyVDF::color_t v1, EasyVDF::color_t v2)
+{
+    return v1.value == v2.value;
+}
+
+inline bool operator!=(EasyVDF::color_t v1, EasyVDF::color_t v2)
+{
+    return v1.value != v2.value;
+}
+
+inline bool operator<(EasyVDF::color_t v1, EasyVDF::color_t v2)
+{
+    return v1.value < v2.value;
+}
+
+inline bool operator<=(EasyVDF::color_t v1, EasyVDF::color_t v2)
+{
+    return v1.value <= v2.value;
+}
+
+inline bool operator>(EasyVDF::color_t v1, EasyVDF::color_t v2)
+{
+    return v1.value > v2.value;
+}
+
+inline bool operator>=(EasyVDF::color_t v1, EasyVDF::color_t v2)
+{
+    return v1.value >= v2.value;
 }
