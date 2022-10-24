@@ -137,8 +137,8 @@ TEST_CASE("Parse binary VDF", "[parse_binary_vdf]")
     CHECK(o["StringKey"][0].String() == "StringValue");
     CHECK(o["Int32Key"][0].Int32() == -1337);
     CHECK(o["FloatKey"][0].Float() == 3.1415f);
-    CHECK(o["PointerKey"][0].Pointer() == EasyVDF::pointer_t{0x90807060});
-    CHECK(o["ColorKey"][0].Color() == EasyVDF::color_t{0x99887766});
+    CHECK(o["PointerKey"][0].Pointer().value == EasyVDF::pointer_t{0x90807060}.value);
+    CHECK(o["ColorKey"][0].Color().value == EasyVDF::color_t{0x99887766}.value);
     CHECK(o["UInt64Key"][0].UInt64() == 0xfedcba9876543210ull);
     CHECK(o["Int64Key"][0].Int64() == -99999999999991337);
 }
