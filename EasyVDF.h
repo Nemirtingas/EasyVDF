@@ -48,6 +48,54 @@ struct color_t
 
 namespace Details {
 
+static inline bool is_cr(char c)
+{
+    return c == '\r';
+}
+
+static inline bool is_cr(wchar_t c)
+{
+    return c == L'\r';
+}
+
+static inline bool is_lf(char c)
+{
+    return c == '\n';
+}
+
+static inline bool is_lf(wchar_t c)
+{
+    return c == L'\n';
+}
+
+template<typename CharT, typename Traits, typename Allocator>
+static std::basic_istream<CharT, Traits>& getline(std::basic_istream<CharT, Traits>& is, std::basic_string<CharT, Traits, Allocator>& buffer)
+{
+    CharT c;
+
+    buffer.clear();
+    while(is.get(c))
+    {
+        buffer.push_back(c);
+        
+        if (is_cr(c))
+        {// MacOS EOL.
+            // Nope, Windows EOL.
+            c = is.peek();
+            if (is_lf(c))
+                buffer.push_back(c);
+            
+            break;
+        }
+        else if(is_lf(c))
+        {// Linux EOL.
+            break;
+        }
+    }
+    
+    return is;
+}
+
 inline void SkipSpaces(const char*& s, const char*& e)
 {
     while (s != e)
@@ -1149,7 +1197,7 @@ inline void ValveDataObject::_ParseTextObject(std::istream& is, std::string& nam
     o._Obj->_U._Collection = new ValveCollection();
     o._Obj->_Type = ObjectType::Object;
 
-    while (std::getline(is, buffer))
+    while (EasyVDF::Details::getline(is, buffer))
     {
         ++line_num;
         line_start = &buffer[0];
@@ -1201,7 +1249,7 @@ inline void ValveDataObject::_ParseTextObject(std::istream& is, std::string& nam
                     throw ParserException("Got datas after item value at line " + std::to_string(line_num));
                 }
 
-                o._Obj->_U._Collection->emplace_back(object_name, tmp);
+                o._Obj->_U._Collection->emplace_back(std::move(object_name), tmp);
             }
             else if (line_start != line_end)
             {
@@ -1302,7 +1350,7 @@ inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& n
                             }
                             if(error == 0)
                             {// String was fully read
-                                o._Obj->_U._Collection->emplace_back(item_key, std::move(tmp1));
+                                o._Obj->_U._Collection->emplace_back(std::move(item_key), std::move(tmp1));
 
                                 clear = true;
                             }
@@ -1312,7 +1360,7 @@ inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& n
                             Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 4);
                             if (tmp1.length() == 4)
                             {
-                                o._Obj->_U._Collection->emplace_back(item_key, *reinterpret_cast<const int32_t*>(tmp1.data()));
+                                o._Obj->_U._Collection->emplace_back(std::move(item_key), *reinterpret_cast<const int32_t*>(tmp1.data()));
                                 clear = true;
                             }
                             break;
@@ -1321,7 +1369,7 @@ inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& n
                             Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 4);
                             if (tmp1.length() == 4)
                             {
-                                o._Obj->_U._Collection->emplace_back(item_key, *reinterpret_cast<const float*>(tmp1.data()));
+                                o._Obj->_U._Collection->emplace_back(std::move(item_key), *reinterpret_cast<const float*>(tmp1.data()));
                                 clear = true;
                             }
                             break;
@@ -1330,7 +1378,7 @@ inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& n
                             Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 4);
                             if (tmp1.length() == 4)
                             {
-                                o._Obj->_U._Collection->emplace_back(item_key, *reinterpret_cast<const pointer_t*>(tmp1.data()));
+                                o._Obj->_U._Collection->emplace_back(std::move(item_key), *reinterpret_cast<const pointer_t*>(tmp1.data()));
                                 clear = true;
                             }
                             break;
@@ -1339,7 +1387,7 @@ inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& n
                             Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 4);
                             if (tmp1.length() == 4)
                             {
-                                o._Obj->_U._Collection->emplace_back(item_key, *reinterpret_cast<const color_t*>(tmp1.data()));
+                                o._Obj->_U._Collection->emplace_back(std::move(item_key), *reinterpret_cast<const color_t*>(tmp1.data()));
                                 clear = true;
                             }
                             break;
@@ -1348,7 +1396,7 @@ inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& n
                             Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 8);
                             if (tmp1.length() == 8)
                             {
-                                o._Obj->_U._Collection->emplace_back(item_key, *reinterpret_cast<const int64_t*>(tmp1.data()));
+                                o._Obj->_U._Collection->emplace_back(std::move(item_key), *reinterpret_cast<const int64_t*>(tmp1.data()));
                                 clear = true;
                             }
                             break;
@@ -1357,7 +1405,7 @@ inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& n
                             Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 8);
                             if (tmp1.length() == 8)
                             {
-                                o._Obj->_U._Collection->emplace_back(item_key, *reinterpret_cast<const uint64_t*>(tmp1.data()));
+                                o._Obj->_U._Collection->emplace_back(std::move(item_key), *reinterpret_cast<const uint64_t*>(tmp1.data()));
                                 clear = true;
                             }
                             break;
@@ -1423,7 +1471,6 @@ inline void ValveDataObject::_SerializeAsBinary(std::ostream& os, BinaryNodeType
     switch (_Obj->_Type)
     {
         case ObjectType::Object:
-            
             for (auto const& item : *_Obj->_U._Collection)
             {
                 item._SerializeAsBinary(os, object_end, crc);
@@ -1530,7 +1577,7 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
 
     if (!as_binary)
     {// Parse as text VDF
-        while (std::getline(is, buffer))
+        while (EasyVDF::Details::getline(is, buffer))
         {
             ++line_num;
             buffer_start = &buffer[0];
