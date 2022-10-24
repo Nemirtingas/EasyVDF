@@ -119,7 +119,7 @@ TEST_CASE("Parse binary VDF", "[parse_binary_vdf]")
     EasyVDF::ValveDataObject o = EasyVDF::ValveDataObject::ParseObject(f);
     auto elapsed = std::chrono::steady_clock::now() - start;
     
-    std::cout << "==================== Binary EOL ====================" << std::endl;
+    std::cout << "==================== Binary VDF ====================" << std::endl;
     std::cout << o << std::endl;
     std::cout << "Sizeof(EasyVDF::ValveDataObject): " << sizeof(EasyVDF::ValveDataObject) << ", Parsing took: " << std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() << "µs" << std::endl << std::endl;
     
