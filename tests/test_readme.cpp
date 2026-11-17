@@ -1,14 +1,16 @@
 // The examples of README.md, compiled and checked: keep both in sync.
 #include "../EasyVDF.h"
 
+#include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
 
-#include "catch.hpp"
+#include "helpers.h"
 
 namespace {
 
@@ -78,32 +80,49 @@ struct TempFile
 TEST_CASE("README: quick start", "[readme]")
 {
     TempFile file("readme_appmanifest_440.acf");
-    EasyVDF::parse(AppManifest).save(file.path);
+    EasyVDF::parse(AppManifest).value().save(file.path).value();
 
-    auto manifest = EasyVDF::load(file.path);
+    std::string name, lang;
+    int id = 0;
+    std::ostringstream err;
+    auto quick_start = [&](std::string const& path) {
+        EasyVDF::Result<EasyVDF::KeyValue> loaded = EasyVDF::load(path);
+        if (!loaded)
+        {
+            err << loaded.error() << '\n';
+            return 1;
+        }
+        EasyVDF::KeyValue& manifest = *loaded;
 
-    std::string name = manifest["name"].as<std::string>();
-    int         id   = manifest["appid"].as<int>();
-    std::string lang = manifest["UserConfig"]["language"].value_or("english");
+        name = manifest["name"].value_or("?");
+        id   = manifest["appid"].value_or(0);
+        lang = manifest["UserConfig"]["language"].value_or("english");
 
+        manifest["UserConfig"]["language"] = "french";
+        if (auto saved = manifest.save(path); !saved)
+            err << saved.error() << '\n';
+        return 0;
+    };
+
+    CHECK(quick_start(file.path) == 0);
     CHECK(name == "Team Fortress 2");
     CHECK(id == 440);
     CHECK(lang == "english");
+    CHECK(err.str().empty());
+    CHECK(EasyVDF::load(file.path).value()["UserConfig"]["language"].as<std::string>() == "french");
 
-    manifest["UserConfig"]["language"] = "french";
-    manifest.save(file.path);
-
-    CHECK(EasyVDF::load(file.path)["UserConfig"]["language"].as<std::string>() == "french");
+    CHECK(quick_start("does_not_exist.acf") == 1);
+    CHECK(err.str() == "Io: EasyVDF: can't open \"does_not_exist.acf\" for reading\n");
 }
 
 TEST_CASE("README: reading", "[readme]")
 {
-    EasyVDF::KeyValue a = EasyVDF::parse(R"("root" { "key" "value" })");
+    EasyVDF::KeyValue a = EasyVDF::parse(R"("root" { "key" "value" })").value();
     CHECK(a.key() == "root");
     CHECK(a["key"].as<std::string>() == "value");
 
     std::istringstream input(R"("root" { "key" "value" })");
-    EasyVDF::KeyValue b = EasyVDF::parse(input);
+    EasyVDF::KeyValue b = EasyVDF::parse(input).value();
     CHECK(a == b);
 
     TempFile file("readme_installscript.vdf");
@@ -111,10 +130,10 @@ TEST_CASE("README: reading", "[readme]")
         std::ofstream out(file.path, std::ios::binary);
         out << "\"InstallScript\"\n{\n\t\"Run Process\"\n\t{\n\t}\n}\n\"kvsignatures\"\n{\n\t\"InstallScript\"\t\t\"4284ab2e\"\n}\n";
     }
-    CHECK_THROWS_AS(EasyVDF::load(file.path), EasyVDF::ParseError);
+    CHECK(IsParseError(EasyVDF::load(file.path)));
 
     std::ostringstream out;
-    std::vector<EasyVDF::KeyValue> roots = EasyVDF::load_all(file.path);
+    std::vector<EasyVDF::KeyValue> roots = EasyVDF::load_all(file.path).value();
     for (auto& root : roots)
         out << root.key() << '\n';
     CHECK(out.str() == "InstallScript\nkvsignatures\n");
@@ -122,17 +141,10 @@ TEST_CASE("README: reading", "[readme]")
 
 TEST_CASE("README: getting values", "[readme]")
 {
-    auto manifest = EasyVDF::parse(AppManifest);
+    auto manifest = EasyVDF::parse(AppManifest).value();
     std::ostringstream out;
 
     CHECK(manifest.key() == "AppState");
-
-    auto appid = manifest["appid"].as<uint32_t>();
-    auto name  = manifest["name"].as<std::string>();
-    auto size  = manifest["SizeOnDisk"].as<uint64_t>();
-    CHECK(appid == 440u);
-    CHECK(name == "Team Fortress 2");
-    CHECK(size == 26843545600ull);
 
     bool        updating = manifest["AutoUpdateBehavior"].value_or(0) != 0;
     std::string language = manifest["UserConfig"]["language"].value_or("english");
@@ -141,29 +153,38 @@ TEST_CASE("README: getting values", "[readme]")
     CHECK(language == "english");
     CHECK(build == 12345678u);
 
+    EasyVDF::Result<uint32_t> appid = manifest["appid"].as<uint32_t>();    // "440" -> 440
+    if (!appid)
+        out << appid.error().message << '\n';
+    std::string name = manifest["name"].as<std::string>().value_or("?");
+    CHECK(appid == 440u);
+    CHECK(name == "Team Fortress 2");
+    CHECK(manifest["SizeOnDisk"].as<uint64_t>() == 26843545600ull);
+    CHECK(Message(manifest["name"].as<uint32_t>()) == "EasyVDF: can't convert a String value to an integer");
+
     if (auto owner = manifest["LastOwner"].try_as<uint64_t>())
         out << "owner: " << *owner << '\n';
 
     if (manifest["InstalledDepots"]["441"])
         out << "depot 441 is installed\n";
     if (auto* depot = manifest["InstalledDepots"].find("441"))
-        out << depot->key() << ": " << (*depot)["manifest"].as<std::string>() << '\n';
+        out << depot->key() << ": " << (*depot)["manifest"].as<std::string>().value() << '\n';
 
     CHECK(out.str() == "owner: 76561198000000000\ndepot 441 is installed\n441: 7707273133538421307\n");
 
-    CHECK_NOTHROW(manifest.at("appid"));
-    CHECK_THROWS_AS(manifest.at("nope"), EasyVDF::KeyError);
+    CHECK(Outcome(manifest.at("appid")) == "OK");
+    CHECK(Outcome(manifest.at("nope")) == "Key");
     CHECK(manifest.contains("appid"));
     CHECK_FALSE(manifest["InstalledDepots"]["999"]);
-    CHECK_THROWS_AS(manifest["name"].as<int>(), EasyVDF::TypeError);
+    CHECK(Outcome(manifest["name"].as<int>()) == "Type");
 
     // Reading never changed the document.
-    CHECK(manifest.to_text() == AppManifest);
+    CHECK(manifest.to_text().value() == AppManifest);
 }
 
 TEST_CASE("README: iterating", "[readme]")
 {
-    auto folders = EasyVDF::parse(LibraryFolders);
+    auto folders = EasyVDF::parse(LibraryFolders).value();
     std::ostringstream out;
 
     for (auto& [index, folder] : folders)
@@ -171,7 +192,7 @@ TEST_CASE("README: iterating", "[readme]")
         out << index << ": " << folder["path"].value_or("?") << '\n';
 
         for (auto& [appid, size] : folder["apps"])
-            out << "  app " << appid << " uses " << size.as<uint64_t>() << " bytes\n";
+            out << "  app " << appid << " uses " << size.as<uint64_t>().value() << " bytes\n";
     }
 
     for (const EasyVDF::KeyValue& folder : folders)
@@ -194,19 +215,19 @@ TEST_CASE("README: iterating", "[readme]")
         iterations += child.has_value() ? 1 : 1;
     CHECK(iterations == 0);
 
-    CHECK(folders.to_text() == LibraryFolders);
+    CHECK(folders.to_text().value() == LibraryFolders);
 }
 
 TEST_CASE("README: duplicate keys", "[readme]")
 {
-    auto doc = EasyVDF::parse(R"("root" { "dll" "a.dll"  "dll" "b.dll"  "other" "x" })");
+    auto doc = EasyVDF::parse(R"("root" { "dll" "a.dll"  "dll" "b.dll"  "other" "x" })").value();
 
     CHECK(doc["dll"].as<std::string>() == "a.dll");
     CHECK(doc.count("dll") == 2);
 
     std::string all;
     for (auto& dll : doc.all("dll"))
-        all += dll.as<std::string>() + ';';
+        all += dll.value_or("") + ';';
     CHECK(all == "a.dll;b.dll;");
 
     doc.add("dll", "c.dll");
@@ -218,7 +239,7 @@ TEST_CASE("README: duplicate keys", "[readme]")
 TEST_CASE("README: modifying and saving", "[readme]")
 {
     TempFile file("readme_modified_440.acf");
-    auto manifest = EasyVDF::parse(AppManifest);
+    auto manifest = EasyVDF::parse(AppManifest).value();
 
     manifest["StateFlags"] = 4;
     manifest["UserConfig"]["language"] = "french";
@@ -228,14 +249,15 @@ TEST_CASE("README: modifying and saving", "[readme]")
         {"size", 4096},
     });
 
-    manifest.save(file.path);
-    std::string text = manifest.to_text();
+    EasyVDF::Result<void> saved_file = manifest.save(file.path);
+    EasyVDF::Result<std::string> text = manifest.to_text();
     std::ostringstream streamed;
     streamed << manifest;
+    REQUIRE(saved_file);
     CHECK(streamed.str() == text);
 
-    auto saved = EasyVDF::load(file.path);
-    CHECK(saved.to_text() == text);
+    auto saved = EasyVDF::load(file.path).value();
+    CHECK(saved.to_text().value() == text);
     CHECK(saved["StateFlags"].as<int>() == 4);
     CHECK(saved["UserConfig"]["language"].as<std::string>() == "french");
     CHECK(saved["MountedDepots"].empty());
@@ -248,9 +270,9 @@ TEST_CASE("README: modifying and saving", "[readme]")
         EasyVDF::KeyValue doc("Settings");
         doc["a"]["b"].value_or(0);
         CHECK(doc.empty());
-        CHECK(doc.to_text() == "\"Settings\"\n{\n}\n");
+        CHECK(doc.to_text().value() == "\"Settings\"\n{\n}\n");
         doc["a"]["b"] = 1;
-        CHECK(doc.to_text() == "\"Settings\"\n{\n\t\"a\"\n\t{\n\t\t\"b\"\t\t\"1\"\n\t}\n}\n");
+        CHECK(doc.to_text().value() == "\"Settings\"\n{\n\t\"a\"\n\t{\n\t\t\"b\"\t\t\"1\"\n\t}\n}\n");
     }
 
     SECTION("references stay valid when the parent grows")
@@ -278,7 +300,7 @@ TEST_CASE("README: building a document", "[readme]")
     CHECK(doc["appid"].type() == EasyVDF::Type::Int32);
     CHECK(doc["SizeOnDisk"].type() == EasyVDF::Type::UInt64);
     CHECK(doc["UserConfig"].type() == EasyVDF::Type::Object);
-    CHECK(doc.to_text() ==
+    CHECK(doc.to_text().value() ==
         "\"AppState\"\n"
         "{\n"
         "\t\"appid\"\t\t\"440\"\n"
@@ -309,9 +331,9 @@ TEST_CASE("README: binary files", "[readme]")
             {"AppName", "My Game"},
             {"Exe", "\"C:\\Games\\game.exe\""},
         }},
-    }).save(binary_file.path, EasyVDF::Format::Binary);
+    }).save(binary_file.path, EasyVDF::Format::Binary).value();
 
-    auto shortcuts = EasyVDF::load(binary_file.path);
+    auto shortcuts = EasyVDF::load(binary_file.path).value();
     std::ostringstream out;
     for (auto& [index, shortcut] : shortcuts)
         out << index << ": " << shortcut["AppName"].value_or("") << " -> " << shortcut["Exe"].value_or("") << '\n';
@@ -321,17 +343,17 @@ TEST_CASE("README: binary files", "[readme]")
 
     shortcuts["0"]["IsHidden"] = 1;
     shortcuts["0"]["LastPlayTime"] = int32_t(1700000000);
-    shortcuts.save(binary_file.path, EasyVDF::Format::Binary);
-    shortcuts.save(vbkv_file.path, EasyVDF::Format::Vbkv);
+    shortcuts.save(binary_file.path, EasyVDF::Format::Binary).value();
+    shortcuts.save(vbkv_file.path, EasyVDF::Format::Vbkv).value();
 
-    std::string bytes = shortcuts.to_binary();
+    std::string bytes = shortcuts.to_binary().value();
     CHECK(bytes.front() == '\0');
     CHECK(bytes.back() == '\x08');
-    CHECK(shortcuts.to_binary(EasyVDF::Format::Vbkv).compare(0, 4, "VBKV") == 0);
+    CHECK(shortcuts.to_binary(EasyVDF::Format::Vbkv).value().compare(0, 4, "VBKV") == 0);
 
     CHECK(EasyVDF::load(binary_file.path) == shortcuts);
     CHECK(EasyVDF::load(vbkv_file.path) == shortcuts);
-    CHECK(EasyVDF::parse(bytes)["0"]["LastPlayTime"].as<int>() == 1700000000);
+    CHECK(EasyVDF::parse(bytes).value()["0"]["LastPlayTime"].as<int>() == 1700000000);
 }
 
 TEST_CASE("README: text format details", "[readme]")
@@ -353,7 +375,7 @@ TEST_CASE("README: text format details", "[readme]")
     std::vector<EasyVDF::Directive> directives;
     EasyVDF::ReadOptions options;
     options.directives = &directives;
-    auto doc = EasyVDF::parse(text, options);
+    auto doc = EasyVDF::parse(text, options).value();
 
     std::ostringstream out;
     for (auto& d : directives)
@@ -368,36 +390,146 @@ TEST_CASE("README: text format details", "[readme]")
     CHECK(doc.find("console")->condition() == "$X360");
 
     doc["path"] = R"(C:\Games)";
-    CHECK(doc.to_text().find("\"path\"\t\t\"C:\\\\Games\"\n") != std::string::npos);
-    CHECK(EasyVDF::parse(doc.to_text()) == doc);
+    CHECK(doc.to_text().value().find("\"path\"\t\t\"C:\\\\Games\"\n") != std::string::npos);
+    CHECK(EasyVDF::parse(doc.to_text().value()) == doc);
 }
 
 TEST_CASE("README: errors", "[readme]")
 {
-    std::ostringstream err;
-    const char* path = "does_not_exist.vdf";
-    try
+    for (std::string path : {std::string("does_not_exist.vdf"), std::string("readme_broken.vdf")})
     {
-        auto doc = EasyVDF::load(path);
-    }
-    catch (const EasyVDF::ParseError& e)
-    {
-        err << path << ':' << e.line() << ':' << e.column() << ": " << e.what() << '\n';
-    }
-    catch (const EasyVDF::Error& e)
-    {
-        err << e.what() << '\n';
-    }
-    CHECK(err.str() == "EasyVDF: can't open \"does_not_exist.vdf\" for reading\n");
+        TempFile broken("readme_broken.vdf");
+        {
+            std::ofstream out(broken.path, std::ios::binary);
+            out << "\"root\"\n{\n\t\"key\" }\n";
+        }
 
-    try
-    {
-        EasyVDF::parse("\"root\"\n{\n\t\"key\" }\n");
-        FAIL("no exception");
+        std::ostringstream out, err;
+        [&] {
+            EasyVDF::Result<EasyVDF::KeyValue> doc = EasyVDF::load(path);
+            if (!doc)
+            {
+                const EasyVDF::ErrorInfo& error = doc.error();   // code, message, line, column
+                err << path << ':' << error.line << ':' << error.column << ": " << error.message << '\n';
+                return;
+            }
+            out << (*doc)["name"].value_or("?") << '\n';   // *doc is the KeyValue, doc-> works too
+        }();
+
+        CHECK(out.str().empty());
+        if (path == "does_not_exist.vdf")
+            CHECK(err.str() == "does_not_exist.vdf:0:0: EasyVDF: can't open \"does_not_exist.vdf\" for reading\n");
+        else
+            CHECK(err.str() == "readme_broken.vdf:3:8: Expected a value or an object start ('{') after key \"key\" at line 3, column 8\n");
     }
-    catch (const EasyVDF::ParseError& e)
+
+    CHECK(EasyVDF::is_parse_error(EasyVDF::ErrorCode::DepthExceeded));
+    CHECK_FALSE(EasyVDF::is_parse_error(EasyVDF::ErrorCode::Io));
+    std::ostringstream os;
+    os << EasyVDF::parse("\"root\"\n{\n\t\"k\"\n}\n").error();
+    CHECK(os.str() == "Syntax: Expected a value or an object start ('{') after key \"k\" at line 4, column 1");
+    CHECK(std::string(EasyVDF::to_string(EasyVDF::ErrorCode::UnexpectedEof)) == "UnexpectedEof");
+}
+
+namespace {
+
+EasyVDF::Result<uint32_t> ReadAppId(const std::filesystem::path& path)
+{
+    EasyVDF::Result<EasyVDF::KeyValue> manifest = EasyVDF::load(path);
+    if (!manifest)
+        return manifest.error();                       // pass the error up
+    return (*manifest)["appid"].as<uint32_t>();
+}
+
+} // namespace
+
+TEST_CASE("README: Result", "[readme]")
+{
+    TempFile manifest_file("readme_result_appmanifest_440.acf");
+    REQUIRE(EasyVDF::parse(AppManifest)->save(manifest_file.path));
+
+    SECTION("API")
     {
-        CHECK(e.line() == 3);
-        CHECK(e.column() == 8);
+        EasyVDF::Result<EasyVDF::KeyValue> r = EasyVDF::parse(AppManifest);
+        CHECK(r.has_value());
+        CHECK(r->key() == "AppState");
+        CHECK((*r).key() == "AppState");
+        CHECK(r.value().key() == "AppState");
+        CHECK(r.map([](const EasyVDF::KeyValue& doc) { return doc.size(); }) == std::size_t(12));
+        CHECK(r->at("appid")->as<int>() == 440);
+    }
+
+    SECTION("propagation and chains")
+    {
+        CHECK(ReadAppId(manifest_file.path) == 440u);
+        CHECK(Outcome(ReadAppId("does_not_exist.vdf")) == "Io");
+
+        auto language_of = [](const std::string& path) {
+            EasyVDF::Result<EasyVDF::KeyValue> manifest = EasyVDF::load(path);
+            std::string language = manifest
+                .and_then([](const EasyVDF::KeyValue& doc) { return doc.at("UserConfig"); })
+                .and_then([](const EasyVDF::Node& config) { return config.at("language"); })
+                .and_then([](const EasyVDF::Node& node) { return node.as<std::string>(); })
+                .value_or("english");                              // missing file, key or value: "english"
+            return language;
+        };
+        EasyVDF::KeyValue french = EasyVDF::parse(AppManifest).value();
+        french["UserConfig"]["language"] = "french";
+        REQUIRE(french.save(manifest_file.path));
+        CHECK(language_of(manifest_file.path) == "french");
+        CHECK(language_of("does_not_exist.vdf") == "english");
+    }
+
+    SECTION("recover, add context")
+    {
+        TempFile config_file("config.vdf");
+        auto load_and_save = [] {
+            // Recover from some errors only, add context to the others.
+            EasyVDF::Result<EasyVDF::KeyValue> config = EasyVDF::load("config.vdf")
+                .or_else([](const EasyVDF::ErrorInfo& error) -> EasyVDF::Result<EasyVDF::KeyValue> {
+                    if (error.code == EasyVDF::ErrorCode::Io)
+                        return EasyVDF::KeyValue("Config");        // no file yet: start empty
+                    return error;
+                })
+                .map_error([](EasyVDF::ErrorInfo error) {
+                    error.message = "config.vdf: " + error.message;
+                    return error;
+                });
+
+            // and_then() also chains to a Result<void>: the error is the one of the load, or of the save.
+            EasyVDF::Result<void> saved = config.and_then([](const EasyVDF::KeyValue& doc) { return doc.save("config.vdf"); });
+            return saved;
+        };
+
+        // No file: an empty one is created.
+        CHECK(load_and_save().has_value());
+        CHECK(EasyVDF::load("config.vdf") == EasyVDF::KeyValue("Config"));
+
+        // A malformed file: the error, with context.
+        {
+            std::ofstream out("config.vdf", std::ios::binary);
+            out << "\"Config\"\n{\n\t\"k\"\n}\n";
+        }
+        EasyVDF::Result<void> saved = load_and_save();
+        REQUIRE_FALSE(saved);
+        std::ostringstream err;
+        err << saved.error() << '\n';
+        CHECK(err.str() == "Syntax: config.vdf: Expected a value or an object start ('{') after key \"k\" at line 4, column 1\n");
+    }
+
+    SECTION("bool values")
+    {
+        EasyVDF::KeyValue doc = EasyVDF::parse(R"("root" { "flag" "0" })").value();
+        CHECK(static_cast<bool>(doc["flag"].as<bool>()));   // a value...
+        CHECK(doc["flag"].as<bool>() == false);             // ...which is false
+        CHECK_FALSE(doc["flag"].value_or(false));
+    }
+
+    SECTION("mistakes abort")
+    {
+        // The part of the snippet that does not abort (the rest is a CTest test).
+        EasyVDF::KeyValue doc("Settings");
+        doc["window"]["width"] = 1280;
+        CHECK(doc["window"]["width"].value_or(0) == 1280);
     }
 }

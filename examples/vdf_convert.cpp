@@ -36,43 +36,45 @@ int main(int argc, char* argv[])
         return 2;
     }
 
-    try
+    const EasyVDF::Result<std::vector<EasyVDF::KeyValue>> roots = EasyVDF::load_all(argv[1]);
+    if (!roots)
     {
-        const std::vector<EasyVDF::KeyValue> roots = EasyVDF::load_all(argv[1]);
+        // line and column are 0 for binary input and I/O errors.
+        const EasyVDF::ErrorInfo& error = roots.error();
+        std::cerr << argv[1];
+        if (error.line != 0)
+            std::cerr << ':' << error.line << ':' << error.column;
+        std::cerr << ": " << error.message << '\n';
+        return 1;
+    }
 
-        if (roots.size() == 1)
+    if (roots->size() == 1)
+    {
+        const EasyVDF::Result<void> saved = roots->front().save(argv[2], format);
+        if (!saved)
         {
-            roots.front().save(argv[2], format);
-        }
-        else if (format == EasyVDF::Format::Text)
-        {
-            std::ofstream out(argv[2], std::ios::binary);
-            for (const auto& root : roots)
-                out << root;
-            if (!out)
-                throw EasyVDF::IoError(std::string("can't write ") + argv[2]);
-        }
-        else
-        {
-            std::cerr << argv[1] << " holds " << roots.size() << " root objects, only text can store several of them\n";
+            std::cerr << saved.error().message << '\n';
             return 1;
         }
+    }
+    else if (format == EasyVDF::Format::Text)
+    {
+        std::ofstream out(argv[2], std::ios::binary);
+        for (const auto& root : *roots)
+            out << root;
+        if (!out)
+        {
+            std::cerr << "can't write " << argv[2] << '\n';
+            return 1;
+        }
+    }
+    else
+    {
+        std::cerr << argv[1] << " holds " << roots->size() << " root objects, only text can store several of them\n";
+        return 1;
+    }
 
-        std::cout << argv[1] << " -> " << argv[2] << " (" << format_name << ", " << roots.size() << " root object"
-                  << (roots.size() > 1 ? "s" : "") << ")\n";
-        return 0;
-    }
-    catch (const EasyVDF::ParseError& e)
-    {
-        // line() and column() are 0 for binary input.
-        std::cerr << argv[1];
-        if (e.line() != 0)
-            std::cerr << ':' << e.line() << ':' << e.column();
-        std::cerr << ": " << e.what() << '\n';
-    }
-    catch (const EasyVDF::Error& e)
-    {
-        std::cerr << e.what() << '\n';
-    }
-    return 1;
+    std::cout << argv[1] << " -> " << argv[2] << " (" << format_name << ", " << roots->size() << " root object"
+              << (roots->size() > 1 ? "s" : "") << ")\n";
+    return 0;
 }

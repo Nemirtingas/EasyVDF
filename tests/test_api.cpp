@@ -14,14 +14,13 @@
 #include <type_traits>
 #include <vector>
 
-#include "catch.hpp"
+#include "helpers.h"
 
 using EasyVDF::Color;
 using EasyVDF::KeyValue;
 using EasyVDF::Node;
 using EasyVDF::Pointer;
 using EasyVDF::Type;
-using EasyVDF::TypeError;
 
 namespace {
 
@@ -93,7 +92,7 @@ TEST_CASE("Scalars are stored with a predictable type", "[api][types]")
     CHECK(Node(pointer).type() == Type::String);
     char array[] = "array";
     CHECK(Node(array).as<std::string>() == "array");
-    CHECK(Node(std::string_view("embedded\0null", 13)).as<std::string>().size() == 13);
+    CHECK(Node(std::string_view("embedded\0null", 13)).as<std::string>()->size() == 13);
 
     CHECK(Node(Color{1, 2, 3, 4}).type() == Type::Color);
     CHECK(Node(Pointer{5}).type() == Type::Pointer);
@@ -180,23 +179,23 @@ TEST_CASE("as<T>() converts between the stored types", "[api][conversions]")
         CHECK(n.as<long long>() == -1337LL);
         CHECK(n.as<float>() == -1337.f);
         CHECK(n.as<double>() == -1337.0);
-        CHECK(n.as<bool>());
+        CHECK(n.as<bool>() == true);
         CHECK(n.as<std::string>() == "-1337");
-        CHECK_THROWS_AS(n.as<int8_t>(), TypeError);
+        CHECK(Outcome(n.as<int8_t>()) == "Type");
         // Int32 is how the binary format stores 32 bits unsigned values: same bits.
         CHECK(n.as<uint32_t>() == 4294965959u);
-        CHECK_THROWS_AS(n.as<uint16_t>(), TypeError);
-        CHECK_THROWS_AS(n.as<uint64_t>(), TypeError);
-        CHECK_THROWS_AS(n.as<std::string_view>(), TypeError);
-        CHECK_THROWS_AS(n.as<Color>(), TypeError);
-        CHECK_THROWS_AS(n.as<Pointer>(), TypeError);
+        CHECK(Outcome(n.as<uint16_t>()) == "Type");
+        CHECK(Outcome(n.as<uint64_t>()) == "Type");
+        CHECK(Outcome(n.as<std::string_view>()) == "Type");
+        CHECK(Outcome(n.as<Color>()) == "Type");
+        CHECK(Outcome(n.as<Pointer>()) == "Type");
 
         CHECK(Node(255).as<uint8_t>() == 255);
-        CHECK_THROWS_AS(Node(256).as<uint8_t>(), TypeError);
+        CHECK(Outcome(Node(256).as<uint8_t>()) == "Type");
         CHECK(Node(-128).as<int8_t>() == -128);
-        CHECK_THROWS_AS(Node(-129).as<int8_t>(), TypeError);
+        CHECK(Outcome(Node(-129).as<int8_t>()) == "Type");
         CHECK(Node((std::numeric_limits<int32_t>::min)()).as<std::string>() == "-2147483648");
-        CHECK_FALSE(Node(0).as<bool>());
+        CHECK(Node(0).as<bool>() == false);
     }
 
     SECTION("Int64 and UInt64")
@@ -204,8 +203,8 @@ TEST_CASE("as<T>() converts between the stored types", "[api][conversions]")
         Node big(int64_t(-99999999999991337ll));
         CHECK(big.as<int64_t>() == -99999999999991337ll);
         CHECK(big.as<std::string>() == "-99999999999991337");
-        CHECK_THROWS_AS(big.as<int32_t>(), TypeError);
-        CHECK_THROWS_AS(big.as<uint64_t>(), TypeError);
+        CHECK(Outcome(big.as<int32_t>()) == "Type");
+        CHECK(Outcome(big.as<uint64_t>()) == "Type");
         CHECK(Node(int64_t(42)).as<uint8_t>() == 42);
         CHECK(Node((std::numeric_limits<int64_t>::min)()).as<int64_t>() == (std::numeric_limits<int64_t>::min)());
 
@@ -213,8 +212,8 @@ TEST_CASE("as<T>() converts between the stored types", "[api][conversions]")
         CHECK(huge.as<uint64_t>() == 0xfedcba9876543210ull);
         CHECK(huge.as<std::string>() == "18364758544493064720");
         CHECK(huge.as<double>() == 18364758544493064720.0);
-        CHECK_THROWS_AS(huge.as<int64_t>(), TypeError);
-        CHECK_THROWS_AS(huge.as<uint32_t>(), TypeError);
+        CHECK(Outcome(huge.as<int64_t>()) == "Type");
+        CHECK(Outcome(huge.as<uint32_t>()) == "Type");
         CHECK(Node(uint64_t(7)).as<int>() == 7);
         CHECK(Node((std::numeric_limits<uint64_t>::max)()).as<uint64_t>() == (std::numeric_limits<uint64_t>::max)());
     }
@@ -225,9 +224,9 @@ TEST_CASE("as<T>() converts between the stored types", "[api][conversions]")
         CHECK(f.as<float>() == 3.1415f);
         CHECK(f.as<double>() == static_cast<double>(3.1415f));
         CHECK(f.as<std::string>() == "3.1415");
-        CHECK(f.as<bool>());
-        CHECK_THROWS_AS(f.as<int>(), TypeError);
-        CHECK_THROWS_AS(f.as<Color>(), TypeError);
+        CHECK(f.as<bool>() == true);
+        CHECK(Outcome(f.as<int>()) == "Type");
+        CHECK(Outcome(f.as<Color>()) == "Type");
 
         // Whole numbers convert to integers, in range only.
         CHECK(Node(42.f).as<int>() == 42);
@@ -235,15 +234,15 @@ TEST_CASE("as<T>() converts between the stored types", "[api][conversions]")
         CHECK(Node(-0.f).as<unsigned>() == 0u);
         CHECK(Node(4294967296.f).as<uint64_t>() == 4294967296ull);
         CHECK(Node(4294967296.f).as<int64_t>() == 4294967296ll);
-        CHECK_THROWS_AS(Node(4294967296.f).as<uint32_t>(), TypeError);
-        CHECK_THROWS_AS(Node(300.f).as<uint8_t>(), TypeError);
-        CHECK_THROWS_AS(Node(-1.f).as<unsigned>(), TypeError);
-        CHECK_THROWS_AS(Node(1e30f).as<int64_t>(), TypeError);
-        CHECK_THROWS_AS(Node(1e30f).as<uint64_t>(), TypeError);
-        CHECK_THROWS_AS(Node(-1e30f).as<int64_t>(), TypeError);
-        CHECK_THROWS_AS(Node(std::numeric_limits<float>::infinity()).as<int64_t>(), TypeError);
-        CHECK_THROWS_AS(Node(std::numeric_limits<float>::quiet_NaN()).as<int>(), TypeError);
-        CHECK_FALSE(Node(0.f).as<bool>());
+        CHECK(Outcome(Node(4294967296.f).as<uint32_t>()) == "Type");
+        CHECK(Outcome(Node(300.f).as<uint8_t>()) == "Type");
+        CHECK(Outcome(Node(-1.f).as<unsigned>()) == "Type");
+        CHECK(Outcome(Node(1e30f).as<int64_t>()) == "Type");
+        CHECK(Outcome(Node(1e30f).as<uint64_t>()) == "Type");
+        CHECK(Outcome(Node(-1e30f).as<int64_t>()) == "Type");
+        CHECK(Outcome(Node(std::numeric_limits<float>::infinity()).as<int64_t>()) == "Type");
+        CHECK(Outcome(Node(std::numeric_limits<float>::quiet_NaN()).as<int>()) == "Type");
+        CHECK(Node(0.f).as<bool>() == false);
     }
 
     SECTION("String")
@@ -271,37 +270,37 @@ TEST_CASE("as<T>() converts between the stored types", "[api][conversions]")
         for (const char* bad : {"", " ", "abc", "12abc", "1 2", "--1", "+-1", "0x", "0xZ", "1.5", "1e3", "-", "+", "12-"})
         {
             INFO("'" << bad << "'");
-            CHECK_THROWS_AS(Node(bad).as<int>(), TypeError);
+            CHECK(Outcome(Node(bad).as<int>()) == "Type");
         }
         for (const char* bad : {"", " ", "abc", "1.5x", "1,5", "--1", "1 2", "."})
         {
             INFO("'" << bad << "'");
-            CHECK_THROWS_AS(Node(bad).as<double>(), TypeError);
+            CHECK(Outcome(Node(bad).as<double>()) == "Type");
         }
-        CHECK_THROWS_AS(Node("2147483648").as<int32_t>(), TypeError);
-        CHECK_THROWS_AS(Node("-2147483649").as<int32_t>(), TypeError);
-        CHECK_THROWS_AS(Node("18446744073709551616").as<uint64_t>(), TypeError);
-        CHECK_THROWS_AS(Node("-9223372036854775809").as<int64_t>(), TypeError);
-        CHECK_THROWS_AS(Node("-1").as<uint64_t>(), TypeError);
-        CHECK_THROWS_AS(Node("256").as<uint8_t>(), TypeError);
-        CHECK_THROWS_AS(Node("4294967296").as<Pointer>(), TypeError);
+        CHECK(Outcome(Node("2147483648").as<int32_t>()) == "Type");
+        CHECK(Outcome(Node("-2147483649").as<int32_t>()) == "Type");
+        CHECK(Outcome(Node("18446744073709551616").as<uint64_t>()) == "Type");
+        CHECK(Outcome(Node("-9223372036854775809").as<int64_t>()) == "Type");
+        CHECK(Outcome(Node("-1").as<uint64_t>()) == "Type");
+        CHECK(Outcome(Node("256").as<uint8_t>()) == "Type");
+        CHECK(Outcome(Node("4294967296").as<Pointer>()) == "Type");
 
-        CHECK(Node("1").as<bool>());
-        CHECK(Node("7").as<bool>());
-        CHECK(Node("true").as<bool>());
-        CHECK(Node("TRUE").as<bool>());
-        CHECK_FALSE(Node("0").as<bool>());
-        CHECK_FALSE(Node("false").as<bool>());
-        CHECK_FALSE(Node(" False ").as<bool>());
-        CHECK_THROWS_AS(Node("yes").as<bool>(), TypeError);
-        CHECK_THROWS_AS(Node("").as<bool>(), TypeError);
+        CHECK(Node("1").as<bool>() == true);
+        CHECK(Node("7").as<bool>() == true);
+        CHECK(Node("true").as<bool>() == true);
+        CHECK(Node("TRUE").as<bool>() == true);
+        CHECK(Node("0").as<bool>() == false);
+        CHECK(Node("false").as<bool>() == false);
+        CHECK(Node(" False ").as<bool>() == false);
+        CHECK(Outcome(Node("yes").as<bool>()) == "Type");
+        CHECK(Outcome(Node("").as<bool>()) == "Type");
 
         CHECK(Node("255 128 0").as<Color>() == Color{255, 128, 0, 255});
         CHECK(Node(" 1  2\t3 4 ").as<Color>() == Color{1, 2, 3, 4});
         for (const char* bad : {"", "1", "1 2", "1 2 3 4 5", "256 0 0", "-1 0 0", "a b c", "1,2,3"})
         {
             INFO("'" << bad << "'");
-            CHECK_THROWS_AS(Node(bad).as<Color>(), TypeError);
+            CHECK(Outcome(Node(bad).as<Color>()) == "Type");
         }
     }
 
@@ -310,31 +309,31 @@ TEST_CASE("as<T>() converts between the stored types", "[api][conversions]")
         Node c(Color{255, 128, 0, 64});
         CHECK(c.as<Color>() == Color{255, 128, 0, 64});
         CHECK(c.as<std::string>() == "255 128 0 64");
-        CHECK(Node(c.as<std::string>()).as<Color>() == c.as<Color>());
-        CHECK_THROWS_AS(c.as<int>(), TypeError);
-        CHECK_THROWS_AS(c.as<bool>(), TypeError);
+        CHECK(Node(c.as<std::string>().value()).as<Color>() == c.as<Color>());
+        CHECK(Outcome(c.as<int>()) == "Type");
+        CHECK(Outcome(c.as<bool>()) == "Type");
 
         Node p(Pointer{0x90807060});
         CHECK(p.as<Pointer>() == Pointer{0x90807060});
         CHECK(p.as<uint32_t>() == 0x90807060u);
         CHECK(p.as<int64_t>() == 0x90807060ll);
         CHECK(p.as<std::string>() == "2424336480");
-        CHECK(Node(p.as<std::string>()).as<Pointer>() == p.as<Pointer>());
-        CHECK_THROWS_AS(p.as<int32_t>(), TypeError);
-        CHECK_THROWS_AS(p.as<double>(), TypeError);
+        CHECK(Node(p.as<std::string>().value()).as<Pointer>() == p.as<Pointer>());
+        CHECK(Outcome(p.as<int32_t>()) == "Type");
+        CHECK(Outcome(p.as<double>()) == "Type");
     }
 
     SECTION("None and Object convert to nothing")
     {
         for (Node const& n : {Node(), Node::object(), Node({ {"k", "v"} })})
         {
-            CHECK_THROWS_AS(n.as<std::string>(), TypeError);
-            CHECK_THROWS_AS(n.as<std::string_view>(), TypeError);
-            CHECK_THROWS_AS(n.as<int>(), TypeError);
-            CHECK_THROWS_AS(n.as<double>(), TypeError);
-            CHECK_THROWS_AS(n.as<bool>(), TypeError);
-            CHECK_THROWS_AS(n.as<Color>(), TypeError);
-            CHECK_THROWS_AS(n.as<Pointer>(), TypeError);
+            CHECK(Outcome(n.as<std::string>()) == "Type");
+            CHECK(Outcome(n.as<std::string_view>()) == "Type");
+            CHECK(Outcome(n.as<int>()) == "Type");
+            CHECK(Outcome(n.as<double>()) == "Type");
+            CHECK(Outcome(n.as<bool>()) == "Type");
+            CHECK(Outcome(n.as<Color>()) == "Type");
+            CHECK(Outcome(n.as<Pointer>()) == "Type");
             CHECK_FALSE(n.try_as<std::string>().has_value());
             CHECK(n.value_or("default") == "default");
         }
@@ -385,8 +384,8 @@ TEST_CASE("try_as<T>() and value_or()", "[api][conversions]")
     CHECK(doc["missing"].value_or(Color{1, 2, 3, 4}) == Color{1, 2, 3, 4});
 
     // as<std::string_view>() does not copy.
-    std::string_view view = doc["name"].as<std::string_view>();
-    CHECK(view.data() == doc["name"].as<std::string_view>().data());
+    std::string_view view = doc["name"].as<std::string_view>().value();
+    CHECK(view.data() == doc["name"].as<std::string_view>()->data());
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -396,7 +395,7 @@ TEST_CASE("try_as<T>() and value_or()", "[api][conversions]")
 TEST_CASE("Const lookups never throw and never modify", "[api][lookup]")
 {
     const KeyValue doc = MakeDocument();
-    const std::string before = doc.to_text();
+    const std::string before = doc.to_text().value();
 
     CHECK(doc["appid"].as<int>() == 440);
     CHECK(doc["UserConfig"]["language"].as<std::string>() == "english");
@@ -425,11 +424,11 @@ TEST_CASE("Const lookups never throw and never modify", "[api][lookup]")
     CHECK(doc.find("missing") == nullptr);
     CHECK(doc["appid"].find("x") == nullptr);
 
-    CHECK(doc.at("appid").as<int>() == 440);
-    CHECK(doc.at("UserConfig").at("language").as<std::string>() == "english");
-    CHECK_THROWS_AS(doc.at("missing"), EasyVDF::KeyError);
-    CHECK_THROWS_WITH(doc.at("missing"), Catch::Contains("\"missing\""));
-    CHECK_THROWS_AS(doc.at("appid").at("x"), EasyVDF::KeyError);
+    CHECK(doc.at("appid")->as<int>() == 440);
+    CHECK(doc.at("UserConfig")->at("language")->as<std::string>() == "english");
+    CHECK(Outcome(doc.at("missing")) == "Key");
+    CHECK_THAT(Message(doc.at("missing")), Catch::Contains("\"missing\""));
+    CHECK(Outcome(doc.at("appid")->at("x")) == "Key");
 
     // Keys are std::string_view: no std::string needed.
     const std::string_view key = "appid";
@@ -437,14 +436,14 @@ TEST_CASE("Const lookups never throw and never modify", "[api][lookup]")
     CHECK(doc[std::string("appid")].as<int>() == 440);
     CHECK(doc[std::string_view("appid_suffix", 5)].as<int>() == 440);
 
-    CHECK(doc.to_text() == before);
+    CHECK(doc.to_text().value() == before);
     CHECK(doc.size() == 5);
 }
 
 TEST_CASE("Non-const operator[] creates keys lazily", "[api][lookup]")
 {
     KeyValue doc = MakeDocument();
-    const std::string before = doc.to_text();
+    const std::string before = doc.to_text().value();
 
     SECTION("reading does not add anything")
     {
@@ -455,7 +454,7 @@ TEST_CASE("Non-const operator[] creates keys lazily", "[api][lookup]")
         for (int i = 0; i < 3; ++i)
             CHECK(doc["missing"].value_or("x") == "x");
 
-        CHECK(doc.to_text() == before);
+        CHECK(doc.to_text().value() == before);
         CHECK(doc.size() == 5);
         CHECK(doc["UserConfig"].size() == 2);
         CHECK_FALSE(doc.contains("missing"));
@@ -463,11 +462,11 @@ TEST_CASE("Non-const operator[] creates keys lazily", "[api][lookup]")
         CHECK(doc.find("missing") == nullptr);
         CHECK(doc.count("missing") == 0);
         CHECK(doc.all("missing").empty());
-        CHECK_THROWS_AS(doc.at("missing"), EasyVDF::KeyError);
+        CHECK(Outcome(doc.at("missing")) == "Key");
         CHECK(Keys(doc) == "appid name UserConfig{} dll dll ");
         CHECK(doc == MakeDocument());
-        CHECK(EasyVDF::parse(doc.to_binary()) == doc);
-        CHECK(KeyValue(doc).to_text() == before);
+        CHECK(EasyVDF::parse(doc.to_binary().value()) == doc);
+        CHECK(KeyValue(doc).to_text().value() == before);
     }
 
     SECTION("assigning creates the key")
@@ -488,7 +487,7 @@ TEST_CASE("Non-const operator[] creates keys lazily", "[api][lookup]")
         CHECK(doc["a"].size() == 1);
         CHECK(std::as_const(doc)["a"]["b"]["c"].as<std::string>() == "deep");
         CHECK(Keys(doc) == "appid name UserConfig{} dll dll a{} ");
-        CHECK(EasyVDF::parse(doc.to_text())["a"]["b"]["c"].as<std::string>() == "deep");
+        CHECK(EasyVDF::parse(doc.to_text().value()).value()["a"]["b"]["c"].as<std::string>() == "deep");
 
         doc["UserConfig"]["new"]["x"] = 1;
         CHECK(Keys(doc["UserConfig"]) == "language beta new{} ");
@@ -503,7 +502,7 @@ TEST_CASE("Non-const operator[] creates keys lazily", "[api][lookup]")
         doc.add("fourth", 4);
         doc["first"] = 1;
         CHECK(Keys(doc) == "appid name UserConfig{} dll dll third second fourth first ");
-        CHECK(doc.to_text().find("\"third\"\t\t\"3\"\n\t\"second\"\t\t\"2\"\n\t\"fourth\"\t\t\"4\"\n\t\"first\"\t\t\"1\"\n}") != std::string::npos);
+        CHECK(doc.to_text().value().find("\"third\"\t\t\"3\"\n\t\"second\"\t\t\"2\"\n\t\"fourth\"\t\t\"4\"\n\t\"first\"\t\t\"1\"\n}") != std::string::npos);
     }
 
     SECTION("a reference to a missing key can be assigned later")
@@ -544,7 +543,7 @@ TEST_CASE("Non-const operator[] creates keys lazily", "[api][lookup]")
         doc["dll"] = "first.dll";
         std::vector<std::string> dlls;
         for (auto const& dll : doc.all("dll"))
-            dlls.push_back(dll.as<std::string>());
+            dlls.push_back(dll.as<std::string>().value());
         CHECK(dlls == std::vector<std::string>{"first.dll", "b.dll"});
         CHECK(doc.size() == 5);
     }
@@ -553,11 +552,9 @@ TEST_CASE("Non-const operator[] creates keys lazily", "[api][lookup]")
     {
         // Reading through a const node is always safe...
         CHECK(std::as_const(doc)["appid"]["x"].is_none());
-        // ...but a non-const scalar can't get children.
-        CHECK_THROWS_AS(doc["appid"]["x"], TypeError);
-        CHECK_THROWS_AS(doc["appid"]["x"] = 1, TypeError);
-        CHECK_THROWS_AS(doc["appid"].add("x", 1), TypeError);
-        CHECK(doc.to_text() == before);
+        // ...but a non-const scalar can't get children: doc["appid"]["x"] aborts
+        // (tested by the no_exceptions_scalar_aborts CTest test).
+        CHECK(doc.to_text().value() == before);
 
         // Replace the value to turn it into an object.
         doc["appid"] = Node::object();
@@ -576,7 +573,7 @@ TEST_CASE("Non-const operator[] creates keys lazily", "[api][lookup]")
         KeyValue root;
         root.set_key("root");
         root["k"] = "v";
-        CHECK(root.to_text() == "\"root\"\n{\n\t\"k\"\t\t\"v\"\n}\n");
+        CHECK(root.to_text().value() == "\"root\"\n{\n\t\"k\"\t\t\"v\"\n}\n");
     }
 }
 
@@ -586,7 +583,7 @@ TEST_CASE("References to nodes stay valid when their parent changes", "[api][loo
     Node& name = doc["name"];
     Node& language = doc["UserConfig"]["language"];
     KeyValue* config = doc.find("UserConfig");
-    const std::string_view name_view = name.as<std::string_view>();
+    const std::string_view name_view = name.as<std::string_view>().value();
 
     for (int i = 0; i < 1000; ++i)
     {
@@ -628,7 +625,7 @@ TEST_CASE("Duplicate keys", "[api][duplicates]")
 
     std::vector<std::string> seen;
     for (auto& dll : doc.all("dll"))
-        seen.push_back(dll.is_object() ? dll["path"].as<std::string>() : dll.as<std::string>());
+        seen.push_back(dll.is_object() ? dll["path"].as<std::string>().value() : dll.as<std::string>().value());
     CHECK(seen == std::vector<std::string>{"a.dll", "b.dll", "c.dll", "d.dll"});
 
     SECTION("all() gives modifiable entries")
@@ -686,7 +683,7 @@ TEST_CASE("Duplicate keys", "[api][duplicates]")
     SECTION("duplicates survive every format")
     {
         for (EasyVDF::Format format : {EasyVDF::Format::Text, EasyVDF::Format::Binary, EasyVDF::Format::Vbkv})
-            CHECK(EasyVDF::parse(doc.dump(format)) == doc);
+            CHECK(EasyVDF::parse(doc.dump(format).value()) == doc);
     }
 }
 
@@ -703,7 +700,7 @@ TEST_CASE("Iterating children", "[api][iteration]")
             static_assert(std::is_same<decltype(value), Node>::value, "the value is modifiable");
             keys += key + ' ';
             if (value.is_string())
-                value = value.as<std::string>() + "!";
+                value = value.as<std::string>().value() + "!";
         }
         CHECK(keys == "appid name UserConfig dll dll ");
         CHECK(doc["name"].as<std::string>() == "Team Fortress 2!");
@@ -828,7 +825,7 @@ TEST_CASE("Building and editing objects", "[api][editing]")
         doc.add(std::move(key), std::string("moved value"));
         doc.add("copy", static_cast<Node const&>(object));
 
-        CHECK(doc.to_text() ==
+        CHECK(doc.to_text().value() ==
             "\"root\"\n{\n"
             "\t\"k\"\t\t\"v\"\n"
             "\t\"sub\"\n\t{\n\t\t\"a\"\t\t\"1\"\n\t\t\"b\"\n\t\t{\n\t\t\t\"c\"\t\t\"2.5\"\n\t\t}\n\t}\n"
@@ -844,7 +841,7 @@ TEST_CASE("Building and editing objects", "[api][editing]")
         CHECK_FALSE(doc.contains("appid"));
         CHECK(doc["AppID"].as<int>() == 440);
         doc.set_key("Renamed");
-        CHECK(doc.to_text().rfind("\"Renamed\"\n{\n\t\"AppID\"", 0) == 0);
+        CHECK(doc.to_text().value().rfind("\"Renamed\"\n{\n\t\"AppID\"", 0) == 0);
     }
 
     SECTION("equality")
@@ -915,18 +912,18 @@ TEST_CASE("Floats are written with the shortest text that reads back identically
     for (float f : values)
         doc.add("f", f);
 
-    KeyValue parsed = EasyVDF::parse(doc.to_text());
+    KeyValue parsed = EasyVDF::parse(doc.to_text().value()).value();
     REQUIRE(parsed.size() == values.size());
 
     std::size_t i = 0, mismatches = 0;
     for (auto const& [key, value] : parsed)
     {
         const float expected = values[i++];
-        const float read = value.as<float>();
+        const float read = value.as<float>().value();
         if (std::memcmp(&read, &expected, sizeof(float)) != 0)
         {
             ++mismatches;
-            UNSCOPED_INFO(key << ": " << value.as<std::string>() << " does not read back as the same float");
+            UNSCOPED_INFO(key << ": " << value.as<std::string>().value() << " does not read back as the same float");
         }
     }
     CHECK(mismatches == 0);
@@ -936,10 +933,10 @@ TEST_CASE("Floats are written with the shortest text that reads back identically
     special.add("inf", std::numeric_limits<float>::infinity());
     special.add("ninf", -std::numeric_limits<float>::infinity());
     special.add("nan", std::numeric_limits<float>::quiet_NaN());
-    KeyValue special_parsed = EasyVDF::parse(special.to_binary());
+    KeyValue special_parsed = EasyVDF::parse(special.to_binary().value()).value();
     CHECK(special_parsed["inf"].as<float>() == std::numeric_limits<float>::infinity());
     CHECK(special_parsed["ninf"].as<float>() == -std::numeric_limits<float>::infinity());
-    CHECK(std::isnan(special_parsed["nan"].as<float>()));
+    CHECK(std::isnan(special_parsed["nan"].as<float>().value()));
 }
 
 TEST_CASE("Number conversions do not depend on the global locale", "[api][float]")
@@ -963,10 +960,10 @@ TEST_CASE("Number conversions do not depend on the global locale", "[api][float]
     CHECK(Node(1234567).as<std::string>() == "1234567");
     CHECK(Node("1234567.5").as<double>() == 1234567.5);
     CHECK(Node("1234567").as<int>() == 1234567);
-    CHECK_THROWS_AS(Node("1,5").as<double>(), TypeError);
+    CHECK(Outcome(Node("1,5").as<double>()) == "Type");
 
     KeyValue doc("root", { {"f", 0.5f}, {"i", 1000000}, {"u", uint64_t(18446744073709551615ull)} });
-    CHECK(doc.to_text() == "\"root\"\n{\n\t\"f\"\t\t\"0.5\"\n\t\"i\"\t\t\"1000000\"\n\t\"u\"\t\t\"18446744073709551615\"\n}\n");
+    CHECK(doc.to_text().value() == "\"root\"\n{\n\t\"f\"\t\t\"0.5\"\n\t\"i\"\t\t\"1000000\"\n\t\"u\"\t\t\"18446744073709551615\"\n}\n");
 }
 
 TEST_CASE("Stream output", "[api][stream]")
@@ -975,7 +972,7 @@ TEST_CASE("Stream output", "[api][stream]")
 
     std::ostringstream document;
     document << doc;
-    CHECK(document.str() == doc.to_text());
+    CHECK(document.str() == doc.to_text().value());
 
     std::ostringstream values;
     values << doc["name"] << '|' << doc["appid"] << '|' << doc["missing"] << '|' << Node(1.5f) << '|' << Node(Color{1, 2, 3, 4});
@@ -993,11 +990,11 @@ TEST_CASE("Stream output", "[api][stream]")
     for (EasyVDF::Format format : {EasyVDF::Format::Text, EasyVDF::Format::Binary, EasyVDF::Format::Vbkv})
     {
         std::ostringstream os;
-        doc.write(os, format);
-        CHECK(os.str() == doc.dump(format));
+        doc.write(os, format).value();
+        CHECK(os.str() == doc.dump(format).value());
     }
-    CHECK(doc.dump() == doc.to_text());
-    CHECK(doc.dump(EasyVDF::Format::Auto) == doc.to_text());
+    CHECK(doc.dump().value() == doc.to_text().value());
+    CHECK(doc.dump(EasyVDF::Format::Auto).value() == doc.to_text().value());
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -1029,7 +1026,7 @@ TEST_CASE("An object that got a value keeps existing once emptied", "[api][looku
         doc["a"]["b"] = 1;
         doc["a"].clear();
         CHECK(doc["a"].is_object());
-        CHECK(doc.to_text() == "\"root\"\n{\n\t\"a\"\n\t{\n\t}\n}\n");
+        CHECK(doc.to_text().value() == "\"root\"\n{\n\t\"a\"\n\t{\n\t}\n}\n");
     }
     SECTION("copies behave the same")
     {
@@ -1058,16 +1055,16 @@ TEST_CASE("Floating point text is plain decimal when reasonable", "[api][float]"
     CHECK(Node(16777216.f).as<std::string>() == "16777216");
     CHECK(Node(1234567.875f).as<std::string>() == "1234567.9");
     // Very large or very small numbers use the scientific notation.
-    CHECK(Node(1e20f).as<std::string>().find('e') != std::string::npos);
-    CHECK(Node(1.5e-30f).as<std::string>().find('e') != std::string::npos);
-    CHECK(Node(Node(1e20f).as<std::string>()).as<float>() == 1e20f);
-    CHECK(Node(Node(1.5e-30f).as<std::string>()).as<float>() == 1.5e-30f);
+    CHECK(Node(1e20f).as<std::string>()->find('e') != std::string::npos);
+    CHECK(Node(1.5e-30f).as<std::string>()->find('e') != std::string::npos);
+    CHECK(Node(Node(1e20f).as<std::string>().value()).as<float>() == 1e20f);
+    CHECK(Node(Node(1.5e-30f).as<std::string>().value()).as<float>() == 1.5e-30f);
 
     // Strings are parsed as the requested type, with its range.
-    CHECK_THROWS_AS(Node("1e39").as<float>(), TypeError);
-    CHECK_THROWS_AS(Node("-1e39").as<float>(), TypeError);
+    CHECK(Outcome(Node("1e39").as<float>()) == "Type");
+    CHECK(Outcome(Node("-1e39").as<float>()) == "Type");
     CHECK(Node("1e39").as<double>() == 1e39);
-    CHECK_THROWS_AS(Node("1e999").as<double>(), TypeError);
+    CHECK(Outcome(Node("1e999").as<double>()) == "Type");
     CHECK(Node("1e-60").as<float>() == 0.f);
     CHECK(Node("3.4028235e38").as<float>() == (std::numeric_limits<float>::max)());
 
@@ -1075,8 +1072,8 @@ TEST_CASE("Floating point text is plain decimal when reasonable", "[api][float]"
     for (const char* bad : {"+-5", "++5", "-+5", "+", "0x10.8", "0x1p3", "0X10"})
     {
         INFO("'" << bad << "'");
-        CHECK_THROWS_AS(Node(bad).as<double>(), TypeError);
-        CHECK_THROWS_AS(Node(bad).as<float>(), TypeError);
+        CHECK(Outcome(Node(bad).as<double>()) == "Type");
+        CHECK(Outcome(Node(bad).as<float>()) == "Type");
     }
     CHECK(Node("+5").as<double>() == 5.0);
     CHECK(Node("-5").as<float>() == -5.f);
@@ -1094,17 +1091,17 @@ TEST_CASE("Int32 values read as 32 bits unsigned", "[api][conversions]")
     KeyValue shortcuts("shortcuts");
     shortcuts.add("0").add("appid", static_cast<int32_t>(appid));
 
-    KeyValue parsed = EasyVDF::parse(shortcuts.to_binary());
+    KeyValue parsed = EasyVDF::parse(shortcuts.to_binary().value()).value();
     CHECK(parsed["0"]["appid"].type() == Type::Int32);
     CHECK(parsed["0"]["appid"].as<int32_t>() == -1294967296);
     CHECK(parsed["0"]["appid"].as<uint32_t>() == appid);
     CHECK(parsed["0"]["appid"].value_or<uint32_t>(0) == appid);
     CHECK(parsed["0"]["appid"].try_as<uint32_t>() == appid);
     // Only for the 32 bits unsigned types: everything else is range checked.
-    CHECK_THROWS_AS(parsed["0"]["appid"].as<uint64_t>(), TypeError);
-    CHECK_THROWS_AS(parsed["0"]["appid"].as<uint16_t>(), TypeError);
-    CHECK_THROWS_AS(Node("-1294967296").as<uint32_t>(), TypeError);
-    CHECK_THROWS_AS(Node(int64_t(-1294967296)).as<uint32_t>(), TypeError);
+    CHECK(Outcome(parsed["0"]["appid"].as<uint64_t>()) == "Type");
+    CHECK(Outcome(parsed["0"]["appid"].as<uint16_t>()) == "Type");
+    CHECK(Outcome(Node("-1294967296").as<uint32_t>()) == "Type");
+    CHECK(Outcome(Node(int64_t(-1294967296)).as<uint32_t>()) == "Type");
 }
 
 TEST_CASE("A stream read error is an IoError, not a truncated document", "[api][stream]")
@@ -1129,11 +1126,11 @@ TEST_CASE("A stream read error is an IoError, not a truncated document", "[api][
 
     FailingBuffer buffer;
     std::istream is(&buffer);
-    CHECK_THROWS_AS(EasyVDF::parse(is), EasyVDF::IoError);
+    CHECK(Outcome(EasyVDF::parse(is)) == "Io");
 
     // The end of a stream is not an error.
     std::istringstream complete("\"root\" { \"k\" \"v\" }");
-    CHECK(EasyVDF::parse(complete)["k"].as<std::string>() == "v");
+    CHECK(EasyVDF::parse(complete).value()["k"].as<std::string>() == "v");
     std::istringstream truncated("\"root\" { \"k\" \"v\"");
-    CHECK_THROWS_AS(EasyVDF::parse(truncated), EasyVDF::ParseError);
+    CHECK(IsParseError(EasyVDF::parse(truncated)));
 }
