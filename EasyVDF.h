@@ -305,7 +305,7 @@ public:
 
     inline ValveCollection const& Collection() const;
 
-    inline bool operator==(std::nullptr_t);
+    inline bool operator==(std::nullptr_t) const;
 
     // A ValveDataObjectRefWrapper is a reference to an element of a collection.
     // Assigning through it replaces the VALUE of the referenced element and keeps
@@ -515,7 +515,7 @@ public:
 
     ValveCollection const& Collection() const;
 
-    inline bool operator==(std::nullptr_t);
+    inline bool operator==(std::nullptr_t) const;
 
     // ValveDataObject is a regular value type: copy/move construction and
     // copy/move assignment transfer the name (key) together with the value, so
@@ -637,7 +637,7 @@ inline ValveCollection const& ValveDataObjectRefWrapper<T>::Collection() const
 }
 
 template<typename T>
-inline bool ValveDataObjectRefWrapper<T>::operator==(std::nullptr_t)
+inline bool ValveDataObjectRefWrapper<T>::operator==(std::nullptr_t) const
 {
     return (*_Obj) == nullptr;
 }
@@ -687,7 +687,7 @@ inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(std
 template<typename T>
 inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(std::string&& value)
 {
-    (*_Obj) = value;
+    (*_Obj) = std::move(value);
     return *this;
 }
 
@@ -1017,7 +1017,7 @@ inline ValveCollection const& ValveDataObject::Collection() const
     return *_Obj->_U._Collection;
 }
 
-inline bool ValveDataObject::operator==(std::nullptr_t)
+inline bool ValveDataObject::operator==(std::nullptr_t) const
 {
     return Empty();
 }
@@ -1165,7 +1165,7 @@ inline color_t ValveDataObject::Color() const
 {
     if (Type() != ObjectType::Color)
     {
-        throw std::invalid_argument("Attempted to get a Pointer from non Pointer type.");
+        throw std::invalid_argument("Attempted to get a Color from non Color type.");
     }
 
     return _Obj->_U._Color;
@@ -1797,42 +1797,68 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
 
 }
 
-static inline bool operator==(EasyVDF::pointer_t v1, EasyVDF::pointer_t v2)
+namespace EasyVDF {
+
+// Comparison operators, found by argument-dependent lookup.
+
+inline bool operator==(pointer_t v1, pointer_t v2)
 {
     return v1.value == v2.value;
 }
 
-static inline bool operator!=(EasyVDF::pointer_t v1, EasyVDF::pointer_t v2)
+inline bool operator!=(pointer_t v1, pointer_t v2)
 {
     return v1.value != v2.value;
 }
 
-static inline bool operator==(EasyVDF::color_t v1, EasyVDF::color_t v2)
-{
-    return v1.value == v2.value;
-}
-
-static inline bool operator!=(EasyVDF::color_t v1, EasyVDF::color_t v2)
-{
-    return v1.value != v2.value;
-}
-
-static inline bool operator<(EasyVDF::color_t v1, EasyVDF::color_t v2)
+inline bool operator<(pointer_t v1, pointer_t v2)
 {
     return v1.value < v2.value;
 }
 
-static inline bool operator<=(EasyVDF::color_t v1, EasyVDF::color_t v2)
+inline bool operator<=(pointer_t v1, pointer_t v2)
 {
     return v1.value <= v2.value;
 }
 
-static inline bool operator>(EasyVDF::color_t v1, EasyVDF::color_t v2)
+inline bool operator>(pointer_t v1, pointer_t v2)
 {
     return v1.value > v2.value;
 }
 
-static inline bool operator>=(EasyVDF::color_t v1, EasyVDF::color_t v2)
+inline bool operator>=(pointer_t v1, pointer_t v2)
 {
     return v1.value >= v2.value;
+}
+
+inline bool operator==(color_t v1, color_t v2)
+{
+    return v1.value == v2.value;
+}
+
+inline bool operator!=(color_t v1, color_t v2)
+{
+    return v1.value != v2.value;
+}
+
+inline bool operator<(color_t v1, color_t v2)
+{
+    return v1.value < v2.value;
+}
+
+inline bool operator<=(color_t v1, color_t v2)
+{
+    return v1.value <= v2.value;
+}
+
+inline bool operator>(color_t v1, color_t v2)
+{
+    return v1.value > v2.value;
+}
+
+inline bool operator>=(color_t v1, color_t v2)
+{
+    return v1.value >= v2.value;
+}
+
 }

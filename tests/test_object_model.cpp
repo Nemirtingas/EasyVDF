@@ -679,3 +679,75 @@ TEST_CASE("Serializing nodes with values still works", "[object_model][serialize
         CHECK(Dump(parsed.Collection()) == "a=A b=B c=C");
     }
 }
+
+namespace adl_check {
+
+// This namespace has its own operator== and operator<, which hide any
+// operator declared at global scope: pointer_t/color_t operators must be
+// found by argument-dependent lookup.
+struct Unrelated {};
+inline bool operator==(Unrelated, Unrelated) { return true; }
+inline bool operator<(Unrelated, Unrelated) { return false; }
+
+template<typename T>
+bool AllComparisons(T small, T big)
+{
+    return small == small && small != big && small < big && small <= big && big > small && big >= small
+        && !(small == big) && !(small != small) && !(big < small) && !(big <= small) && !(small > big) && !(small >= big);
+}
+
+}
+
+TEST_CASE("pointer_t and color_t comparison operators", "[object_model][operators]")
+{
+    CHECK(adl_check::AllComparisons(EasyVDF::pointer_t{1}, EasyVDF::pointer_t{2}));
+    CHECK(adl_check::AllComparisons(EasyVDF::color_t{1}, EasyVDF::color_t{2}));
+
+    // Catch's decomposition also lives in its own namespace.
+    ValveDataObject o("p", EasyVDF::pointer_t{0x90807060});
+    CHECK(o.Pointer() == EasyVDF::pointer_t{0x90807060});
+    CHECK(o.Pointer() != EasyVDF::pointer_t{0});
+    o = EasyVDF::color_t{0x99887766};
+    CHECK(o.Color() == EasyVDF::color_t{0x99887766});
+    CHECK(o.Color() > EasyVDF::color_t{0});
+}
+
+TEST_CASE("Color() reports the Color type in its error", "[object_model][operators]")
+{
+    ValveDataObject o("p", EasyVDF::pointer_t{1});
+    CHECK_THROWS_WITH(o.Color(), Catch::Contains("Color") && !Catch::Contains("Pointer"));
+}
+
+TEST_CASE("operator==(nullptr) works on const objects", "[object_model][operators]")
+{
+    ValveDataObject root("Root");
+    root.Collection().emplace_back("none", int32_t(0));
+    root.Collection()[0] = nullptr;
+    root.Collection().emplace_back("int", int32_t(1));
+
+    ValveDataObject const& croot = root;
+    CHECK_FALSE(croot == nullptr);
+    CHECK(croot.Collection()[0] == nullptr);
+
+    const EasyVDF::ValveDataObjectConstRef none = croot["none"][0];
+    const EasyVDF::ValveDataObjectConstRef value = croot["int"][0];
+    CHECK(none == nullptr);
+    CHECK_FALSE(value == nullptr);
+
+    const EasyVDF::ValveDataObjectRef ref = root["none"][0];
+    CHECK(ref == nullptr);
+}
+
+TEST_CASE("Assigning a std::string&& through a reference wrapper moves it", "[object_model][operators]")
+{
+    ValveDataObject root("Root");
+    root.Collection().emplace_back("s", int32_t(0));
+    auto refs = root["s"];
+    std::string value = LongValue;
+
+    // Moving only allocates the std::string object, not a copy of its buffer.
+    long long total_before = g_total_allocations;
+    refs[0] = std::move(value);
+    CHECK(g_total_allocations - total_before == 1);
+    CHECK(root.Collection()[0].String() == LongValue);
+}
