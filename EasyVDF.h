@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 
 namespace EasyVDF {
@@ -127,53 +128,31 @@ inline void ReadBinaryBytes(const char*& b, const char* e, std::string& buffer, 
 }
 
 /// <summary>
-/// Returns  0 when string is read to end (null char)
-/// Returns -1 when string was partially read
-/// Returns -2 when invalid utf8 codepoint was found
+/// Appends the bytes in [b, e) up to the null terminator to str.
+/// A binary string is an opaque byte sequence ended by '\0' (UTF-8 is not
+/// validated, a null byte can never appear inside a multi-byte UTF-8 sequence),
+/// so a string split across several chunks is rebuilt by calling this function
+/// again with the next chunk and the same str.
+/// Returns  0 when the string is read to its end (b points past the null char)
+/// Returns -1 when the string was partially read (b == e, all bytes were appended)
+/// Returns -2 is reserved for invalid codepoints and is never returned.
 /// </summary>
-/// <param name="b"></param>
-/// <param name="e"></param>
-/// <param name="str"></param>
-/// <returns></returns>
 inline int ParseBinaryString(const char*& b, const char* e, std::string& str)
 {
-    const char* string_start = b;
-    while (b != e)
+    if (b == e)
+        return -1;
+
+    const char* string_end = static_cast<const char*>(std::memchr(b, '\0', static_cast<size_t>(e - b)));
+    if (string_end == nullptr)
     {
-        char c = *b++;
-        if (c < 0x80u)
-        {
-            if (c == '\0')
-            {
-                str.insert(str.end(), string_start, b - 1);
-                return 0;
-            }
-        }
-        else if ((c >> 5) == 0x6)
-        {// 2 bytes utf8
-            if (b == e)
-                return -2;
-
-            ++b;
-        }
-        else if ((c >> 4) == 0xe)
-        {// 3 bytes utf8
-            if (b == (e - 1))
-                return -2;
-
-            b += 2;
-        }
-        else if ((c >> 3) == 0x1e)
-        {// 4 bytes utf8
-            if (b == (e - 2))
-                return -2;
-
-            b += 3;
-        }
+        str.append(b, e);
+        b = e;
+        return -1;
     }
 
-    str.insert(str.end(), string_start, b - 1);
-    return -1;
+    str.append(b, string_end);
+    b = string_end + 1;
+    return 0;
 }
 
 /// <summary>
