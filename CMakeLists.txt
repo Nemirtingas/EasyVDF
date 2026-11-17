@@ -9,6 +9,7 @@ add_executable(easyvdf_tests
     tests/tests.cpp
     tests/test_object_model.cpp
     tests/test_text_parser.cpp
+    tests/test_binary_parser.cpp
 )
 
 set_target_properties(easyvdf_tests PROPERTIES
