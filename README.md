@@ -236,8 +236,9 @@ std::string bytes = shortcuts.to_binary();                        // or Format::
 - **VBKV**: the header CRC is the standard CRC-32 (zlib) of every byte that follows the 8 bytes header.
   It is written, and checked when reading (`ParseError` on mismatch). Files written by tools that leave the
   CRC at zero can be read with `ReadOptions::verify_crc = false`.
-- Both end markers (`0x08`, `0x0B`) end an object in both formats. One extra end marker after the root object
-  is tolerated (`0x08`, or `0x0B` in a VBKV file); any other trailing data is a `ParseError`.
+- Both end markers (`0x08`, `0x0B`) end an object in both formats. Like Valve, the writer closes the root with one
+  more end marker (files end with `08 08`, or `0B 0B` for VBKV), so Steam and Dota 2 files round-trip byte for byte.
+  On read that extra marker is optional (`0x08`, or `0x0B` in a VBKV file); any other trailing data is a `ParseError`.
 - The format has no unsigned 32 bits type: Steam stores such values as `Int32` (the `appid` of a non-Steam
   shortcut is a negative `Int32`). `as<uint32_t>()` on an `Int32` returns the same bits; every other integer
   conversion is range checked. To write one, assign `static_cast<int32_t>(appid)` (a `uint32_t` is stored as `UInt64`).

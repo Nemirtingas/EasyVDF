@@ -214,6 +214,51 @@ TEST_CASE("Binary parser: binary.vdf with every chunk size", "[binary_parser][ch
     }
 }
 
+TEST_CASE("Binary parser: real Valve files round-trip byte for byte", "[binary_parser][valve]")
+{
+    // Written by Dota 2 (userdata/<id>/570/remote/cfg/dismissed_help_tips.txt): VBKV magic,
+    // CRC-32 of the rest, an empty root object closed by 0x0B, then the 0x0B list terminator.
+    const std::string dota("VBKV" "\x56\x00\x66\xe6" "\x00" "dismissed_help_tips\x00" "\x0b\x0b", 31);
+    KeyValue doc = EasyVDF::parse(dota);   // checksum verified
+    CHECK(doc.key() == "dismissed_help_tips");
+    CHECK(doc.is_object());
+    CHECK(doc.size() == 0);
+    CHECK(doc.to_binary(Format::Vbkv) == dota);
+    CHECK(EasyVDF::Details::Crc32(std::string_view(dota).substr(8)) == 0xe6660056u);
+
+    // Same layout as a Steam stats schema (UserGameStatsSchema / stats_schema.vdf), which ends with 08 08.
+    static const char schema_raw[] =
+        "\x00" "480\x00"
+            "\x00" "stats\x00"
+                "\x00" "1\x00"
+                    "\x00" "bits\x00"
+                        "\x00" "0\x00"
+                            "\x01" "name\x00" "ACH_WIN\x00"
+                            "\x00" "display\x00"
+                                "\x00" "name\x00"
+                                    "\x01" "english\x00" "Winner\x00"
+                                "\x08"
+                                "\x01" "hidden\x00" "0\x00"
+                            "\x08"
+                        "\x08"
+                    "\x08"
+                    "\x01" "type\x00" "ACHIEVEMENTS\x00"
+                "\x08"
+            "\x08"
+            "\x01" "version\x00" "2\x00"
+        "\x08"
+        "\x08";
+    const std::string schema(schema_raw, sizeof(schema_raw) - 1);
+    REQUIRE(schema.size() == 117);
+    REQUIRE(schema.substr(schema.size() - 2) == "\x08\x08");
+    KeyValue stats = EasyVDF::parse(schema);
+    CHECK(stats.key() == "480");
+    CHECK(stats["stats"]["1"]["type"].as<std::string>() == "ACHIEVEMENTS");
+    CHECK(stats["stats"]["1"]["bits"]["0"]["display"]["name"]["english"].as<std::string>() == "Winner");
+    CHECK(stats["version"].as<int>() == 2);
+    CHECK(stats.to_binary(Format::Binary) == schema);
+}
+
 TEST_CASE("Binary parser: unknown node type throws ParseError", "[binary_parser][errors]")
 {
     // 5 (WideString) and 9 (binary blob) are known but not supported.
@@ -251,7 +296,11 @@ TEST_CASE("Binary parser: truncated input throws ParseError", "[binary_parser][e
     {
         // Every strict prefix is truncated: in the root header, a key, a value, or a missing end marker.
         // This includes the inputs shorter than the 4 bytes magic, and the empty one.
-        for (std::size_t length = 0; length < blob.size(); ++length)
+        // The last byte is the optional list terminator written after the root: dropping it alone
+        // is not a truncation (see "optional list terminator" below), so stop one byte earlier.
+        REQUIRE(blob.size() >= 2);
+        CHECK(blob[blob.size() - 1] == blob[blob.size() - 2]);
+        for (std::size_t length = 0; length + 1 < blob.size(); ++length)
         {
             for (std::size_t chunk_size : {std::size_t(1), std::size_t(3), std::size_t(7), std::size_t(64), std::size_t(10 * 1024)})
             {
@@ -278,10 +327,19 @@ TEST_CASE("Binary parser: truncated input throws ParseError", "[binary_parser][e
 TEST_CASE("Binary parser: data after the root object", "[binary_parser][trailing]")
 {
     auto sample = MakeSample();
-    const std::string v1 = sample.to_binary(Format::Binary);
-    const std::string v2 = sample.to_binary(Format::Vbkv);
+    // The writer ends the root list with an extra end marker; strip it to get the bare root object.
+    std::string v1 = sample.to_binary(Format::Binary);
+    std::string v2 = sample.to_binary(Format::Vbkv);
+    REQUIRE(v1.substr(v1.size() - 2) == "\x08\x08");
+    REQUIRE(v2.substr(v2.size() - 2) == "\x0b\x0b");
+    v1.pop_back();
+    v2.pop_back();
     // The VBKV checksum covers everything after the header: recompute it for the altered payloads.
     const std::string p2 = v2.substr(8);
+
+    // Without the list terminator (old EasyVDF output, hand made files) both still parse.
+    CHECK(Compare(sample, ParseBinary(v1, 1024)) == "");
+    CHECK(Compare(sample, ParseBinary(Vbkv(p2), 1024)) == "");
 
     for (std::size_t chunk_size : {std::size_t(1), std::size_t(2), std::size_t(5), std::size_t(16), v1.size(), v1.size() + 1, v2.size(), v2.size() + 1, std::size_t(10 * 1024)})
     {
@@ -337,8 +395,9 @@ TEST_CASE("Binary parser: values are decoded as little-endian from unaligned off
         CHECK(o["u"].as<uint64_t>() == 0xf102030405060708ull);
     }
 
-    // The serializer writes the same bytes, whatever the byte order of the host.
-    CHECK(EasyVDF::parse(blob).to_binary() == blob);
+    // The serializer writes the same bytes, whatever the byte order of the host
+    // (plus the 0x08 list terminator that closes the root list).
+    CHECK(EasyVDF::parse(blob).to_binary() == blob + "\x08");
 
     KeyValue built("R");
     built.add("i", int32_t(-2130574588));
@@ -347,7 +406,7 @@ TEST_CASE("Binary parser: values are decoded as little-endian from unaligned off
     built.add("col", EasyVDF::Color{0xa1, 0xb2, 0xc3, 0xd4});
     built.add("i6", int64_t(-2));
     built.add("u", uint64_t(0xf102030405060708ull));
-    CHECK(built.to_binary() == blob);
+    CHECK(built.to_binary() == blob + "\x08");
 }
 
 TEST_CASE("Binary parser: VBKV magic and tiny chunk sizes", "[binary_parser][endianness]")
@@ -370,8 +429,8 @@ TEST_CASE("VBKV checksum is written and verified", "[binary_parser][crc]")
     CHECK(EasyVDF::Details::Crc32("") == 0u);
 
     const std::string blob = ReadFile("binary.vdf");
-    // binary.vdf: CRC32 of the 177 bytes after the header, little-endian.
-    CHECK(blob.substr(4, 4) == std::string("\x7b\x88\x85\x97", 4));
+    // binary.vdf: CRC32 of the 178 bytes after the header, little-endian.
+    CHECK(blob.substr(4, 4) == std::string("\x39\x1b\x90\x82", 4));
     CHECK(Vbkv(blob.substr(8)) == blob);
 
     KeyValue expected = MakeBinaryVdfFile();
@@ -396,7 +455,7 @@ TEST_CASE("VBKV checksum is written and verified", "[binary_parser][crc]")
         {
             std::string corrupted = blob;
             corrupted[position] ^= 0x01;
-            CHECK_THROWS_WITH(EasyVDF::parse(corrupted), Contains("checksum mismatch") && Contains("0x9785887b"));
+            CHECK_THROWS_WITH(EasyVDF::parse(corrupted), Contains("checksum mismatch") && Contains("0x82901b39"));
         }
     }
 
@@ -418,11 +477,14 @@ TEST_CASE("VBKV checksum is written and verified", "[binary_parser][crc]")
         }
     }
 
-    SECTION("the checksum covers a trailing end marker")
+    SECTION("the checksum covers the trailing list terminator")
     {
-        const std::string payload = blob.substr(8) + "\x0b";
+        // binary.vdf ends with 0B 0B; without the list terminator the file is still valid,
+        // but only with the checksum of the shorter payload.
+        REQUIRE(blob.substr(blob.size() - 2) == "\x0b\x0b");
+        const std::string payload = blob.substr(8, blob.size() - 9);
         CHECK(EasyVDF::parse(Vbkv(payload)) == expected);
-        CHECK_THROWS_WITH(EasyVDF::parse(blob + "\x0b"), Contains("checksum mismatch"));
+        CHECK_THROWS_WITH(EasyVDF::parse(blob.substr(0, blob.size() - 1)), Contains("checksum mismatch"));
     }
 }
 
@@ -440,8 +502,8 @@ TEST_CASE("Binary parser: both end markers end an object in both formats", "[bin
         CHECK(EasyVDF::parse(Vbkv(payload)) == expected);
     }
 
-    CHECK(expected.to_binary(Format::Binary) == with_08);
-    CHECK(expected.to_binary(Format::Vbkv) == Vbkv(with_0b));
+    CHECK(expected.to_binary(Format::Binary) == with_08 + "\x08");
+    CHECK(expected.to_binary(Format::Vbkv) == Vbkv(with_0b + "\x0b"));
 }
 
 TEST_CASE("Binary parser: nesting depth limit", "[binary_parser][depth]")
@@ -468,7 +530,7 @@ TEST_CASE("Binary parser: nesting depth limit", "[binary_parser][depth]")
     CHECK_THROWS_AS(EasyVDF::parse(nested(3), options), ParseError);
 
     options.max_depth = 500;
-    CHECK(EasyVDF::parse(nested(500), options).to_binary() == nested(500));
+    CHECK(EasyVDF::parse(nested(500), options).to_binary() == nested(500) + "\x08");
 }
 
 TEST_CASE("Streams are read sequentially, without seeking", "[binary_parser][streams]")

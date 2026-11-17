@@ -2552,8 +2552,12 @@ inline std::string KeyValue::dump(WriteOptions const& options) const
             Details::WriteText(out, *this, 0, options.escapes);
             break;
 
+        // Valve writes the root as a list of peer objects that is closed by one more end
+        // marker: Steam files end with 08 08 (stats schemas, shortcuts.vdf) and VBKV files
+        // with 0B 0B (Dota 2 remote cfg). Write the same so files round-trip byte for byte.
         case Format::Binary:
             Details::WriteBinary(out, *this, static_cast<char>(Details::BinaryEnd));
+            out.push_back(static_cast<char>(Details::BinaryEnd));
             break;
 
         case Format::Vbkv:
@@ -2561,8 +2565,9 @@ inline std::string KeyValue::dump(WriteOptions const& options) const
             out.append(Details::VbkvMagic, sizeof(Details::VbkvMagic));
             out.append(4, '\0');
             Details::WriteBinary(out, *this, static_cast<char>(Details::BinaryAlternateEnd));
+            out.push_back(static_cast<char>(Details::BinaryAlternateEnd));
 
-            // CRC32 of everything after the 8 bytes header, little-endian.
+            // CRC32 of everything after the 8 bytes header (end markers included), little-endian.
             std::string crc;
             Details::AppendLittleEndian32(crc, Details::Crc32(std::string_view(out).substr(8)));
             out.replace(4, 4, crc);

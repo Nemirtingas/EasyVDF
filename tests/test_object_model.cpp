@@ -862,7 +862,7 @@ TEST_CASE("Serializing nodes with values still works", "[object_model][serialize
     {
         KeyValue root("Root");
         CHECK(root.to_text() == "\"Root\"\n{\n}\n");
-        CHECK(root.to_binary() == std::string("\x00Root\x00\x08", 7));
+        CHECK(root.to_binary() == std::string("\x00Root\x00\x08\x08", 8));
     }
 
     SECTION("text and binary")
