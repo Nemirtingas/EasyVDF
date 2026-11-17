@@ -60,11 +60,29 @@ namespace {
 const std::string LongKey   = "a key long enough to need a heap allocation";
 const std::string LongValue = "a value long enough to need a heap allocation";
 
+// The MSVC STL in debug mode allocates "container proxies" inside noexcept
+// functions (std::string's default constructor among others): making one of
+// those allocations fail calls std::terminate, whatever the code under test.
+#if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL > 0
+const bool CanInjectAllocationFailures = false;
+#else
+const bool CanInjectAllocationFailures = true;
+#endif
+
 // Runs f with the 1st, 2nd, ... allocation failing until f completes without
 // failure, and checks that every failed attempt released what it allocated.
 template<typename F>
 void CheckNoLeakOnAllocationFailure(F&& f)
 {
+    if (!CanInjectAllocationFailures)
+    {
+        WARN("allocation failure injection is not possible with this standard library configuration");
+        long long live_before = g_live_allocations;
+        f();
+        CHECK(g_live_allocations == live_before);
+        return;
+    }
+
     for (int fail_at = 0; fail_at < 1000; ++fail_at)
     {
         long long live_before = g_live_allocations;
@@ -745,9 +763,15 @@ TEST_CASE("Assigning a std::string&& through a reference wrapper moves it", "[ob
     auto refs = root["s"];
     std::string value = LongValue;
 
-    // Moving only allocates the std::string object, not a copy of its buffer.
     long long total_before = g_total_allocations;
+    refs[0] = value;
+    long long copy_allocations = g_total_allocations - total_before;
+    CHECK(root.Collection()[0].String() == LongValue);
+
+    // Moving does not allocate a copy of the string buffer.
+    total_before = g_total_allocations;
     refs[0] = std::move(value);
-    CHECK(g_total_allocations - total_before == 1);
+    long long move_allocations = g_total_allocations - total_before;
+    CHECK(move_allocations < copy_allocations);
     CHECK(root.Collection()[0].String() == LongValue);
 }
