@@ -109,10 +109,12 @@ inline void SkipSpaces(const char*& s, const char*& e)
 
         ++s;
     }
-    while ((e-1) != s)
+    // Trim the EOL and any trailing spaces/tabs. Stops when the range is empty
+    // (never reads before s), so a line made only of blanks becomes empty.
+    while (e != s)
     {
         char c = *(e-1);
-        if (c != '\n' && c != '\r')
+        if (c != '\n' && c != '\r' && c != ' ' && c != '\t')
             break;
 
         --e;
@@ -1236,7 +1238,7 @@ inline void ValveDataObject::_ParseTextObject(std::istream& is, std::string& nam
             }
             Details::SkipSpaces(line_start, line_end);
 
-            if (*line_start == '"')
+            if (line_start != line_end && *line_start == '"')
             {// Parsing item value
                 error = Details::ParseString(line_start, line_end, tmp);
                 if (error == -1)
