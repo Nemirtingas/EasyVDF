@@ -112,6 +112,7 @@ if (auto* depot = manifest["InstalledDepots"].find("441"))
     std::cout << depot->key() << ": " << (*depot)["manifest"].as<std::string>() << '\n';
 
 manifest.at("appid");                             // throws EasyVDF::KeyError if missing
+manifest.try_at("appid");                         // or a Result, see "Error handling without exceptions"
 manifest.contains("appid");                       // true
 ```
 
@@ -234,7 +235,7 @@ std::string bytes = shortcuts.to_binary();                        // or Format::
 
 - Everything is read and written little-endian, whatever the host is.
 - **VBKV**: the header CRC is the standard CRC-32 (zlib) of every byte that follows the 8 bytes header.
-  It is written, and checked when reading (`ParseError` on mismatch). Files written by tools that leave the
+  It is written, and checked when reading (`ParseError`, `ErrorCode::ChecksumMismatch`). Files written by tools that leave the
   CRC at zero can be read with `ReadOptions::verify_crc = false`.
 - Both end markers (`0x08`, `0x0B`) end an object in both formats. Like Valve, the writer closes the root with one
   more end marker (files end with `08 08`, or `0B 0B` for VBKV), so Steam and Dota 2 files round-trip byte for byte.
@@ -284,15 +285,33 @@ line 2"                                 // values may span lines
 
 ## Errors
 
-Everything derives from `EasyVDF::Error` (a `std::runtime_error`):
+Every error has an `EasyVDF::ErrorCode`, a message and, for text input, a position. Each function that can
+fail comes in two forms: `parse()`, `load()`, `save()`, `at()`, ... throw an exception, and their `try_*`
+versions return an `EasyVDF::Result` that holds the value or the error
+(see [Error handling without exceptions](#error-handling-without-exceptions)).
 
-| Exception | Thrown when |
+The exceptions derive from `EasyVDF::Error` (a `std::runtime_error`):
+
+| Exception | Thrown when | `code()` |
+|---|---|---|
+| `ParseError` | The input is malformed (`line()`, `column()` for text). | One of the parse codes below. |
+| `TypeError` | `as<T>()` has no conversion; a scalar is used as an object. | `Type` |
+| `KeyError` | `at()` did not find the key. | `Key` |
+| `WriteError` | The document can't be written (the root is not an object, ...). | `Write` |
+| `IoError` | A file can't be opened, read or written; a stream can't be read. | `Io` |
+
+| Parse code | The input... |
 |---|---|
-| `ParseError` | The input is malformed (`line()`, `column()` for text). |
-| `TypeError` | `as<T>()` has no conversion; a scalar is used as an object. |
-| `KeyError` | `at()` did not find the key. |
-| `WriteError` | The document can't be written (the root is not an object, ...). |
-| `IoError` | A file can't be opened, read or written. |
+| `Syntax` | has a token that the grammar does not allow there (text). |
+| `UnexpectedEof` | ends before the end of the document: a truncated file. |
+| `EmptyInput` | holds no document: no byte, or only blanks, comments and `#include` / `#base`. |
+| `TrailingData` | goes on after the root object (`parse_all()` reads text files that hold several). |
+| `InvalidRoot` | is binary and its root is not an object. |
+| `UnknownNodeType` | is binary and holds a node type that is not part of the format. |
+| `UnsupportedNodeType` | is binary and holds a `WideString` (5) or a binary blob (9). |
+| `UnsupportedEncoding` | is UTF-16 text. |
+| `ChecksumMismatch` | is VBKV and its CRC32 does not match its header. |
+| `DepthExceeded` | nests objects deeper than `ReadOptions::max_depth`. |
 
 ```cpp
 try
@@ -305,8 +324,138 @@ catch (const EasyVDF::ParseError& e)
 }
 catch (const EasyVDF::Error& e)
 {
-    std::cerr << e.what() << '\n';
+    std::cerr << e.what() << '\n';                  // e.code(): EasyVDF::ErrorCode::Io, ...
 }
+```
+
+`line()` and `column()` are 1-based, and 0 when they don't apply (binary input, I/O); at the end of a text input
+only the line is known. `e.info()` gives the error as the `EasyVDF::ErrorInfo` that the `try_*` functions return.
+
+## Error handling without exceptions
+
+The `try_*` functions never throw (except `std::bad_alloc`): they return an `EasyVDF::Result<T>`, which holds
+either a `T` or an `EasyVDF::ErrorInfo`, like Rust's `Result<T, E>` or C++23's `std::expected<T, E>`.
+The parsers, writers and file functions report their errors this way; the throwing API is a thin layer on top.
+
+```cpp
+EasyVDF::Result<EasyVDF::KeyValue> doc = EasyVDF::try_load(path);
+if (!doc)
+{
+    const EasyVDF::ErrorInfo& error = doc.error();   // code, message, line, column
+    std::cerr << path << ':' << error.line << ':' << error.column << ": " << error.message << '\n';
+    return;
+}
+std::cout << (*doc)["name"].value_or("?") << '\n';   // *doc is the KeyValue, doc-> works too
+```
+
+| Throws | Returns |
+|---|---|
+| `parse(data)`, `parse(stream)`, `load(path)` | `try_parse(...)`, `try_load(path)`: `Result<KeyValue>` |
+| `parse_all(...)`, `load_all(path)` | `try_parse_all(...)`, `try_load_all(path)`: `Result<std::vector<KeyValue>>` |
+| `doc.dump()`, `doc.to_text()`, `doc.to_binary()` | `doc.try_dump()`, `doc.try_to_text()`, `doc.try_to_binary()`: `Result<std::string>` |
+| `doc.write(stream)`, `doc.save(path)` | `doc.try_write(stream)`, `doc.try_save(path)`: `Result<void>` |
+| `node.at(key)` | `node.try_at(key)`: `Result<Node&>` (`Result<Node const&>` on a const node) |
+| `node.as<T>()` | `node.try_as<T>()`: `std::optional<T>`; `node.value_or(default)` |
+
+The error is the one that the throwing function would throw: same code, message, line and column.
+
+### Result
+
+```cpp
+r.has_value();  if (r) ...          // a value?
+*r;  r->key();                      // the value (has_value() must be true)
+r.error();                          // the ErrorInfo (has_value() must be false)
+r.value();                          // the value, or the error thrown as its exception: Rust's unwrap()
+r.value_or(default_value);          // the value, or the default
+r.map(f);                           // Result<U> of f(value), or the same error
+r.and_then(f);                      // f(value), which returns a Result, or the same error
+r.or_else(f);                       // the value, or f(error), which returns a Result<T>
+r.map_error(f);                     // the value, or the ErrorInfo returned by f(error)
+
+return value;                       // a function returning Result<T> returns a T...
+return EasyVDF::ErrorInfo(EasyVDF::ErrorCode::Io, "message");   // ...or an error
+```
+
+Errors propagate like Rust's `?` with an early return, and lookups that can each fail chain with `and_then()`:
+
+```cpp
+EasyVDF::Result<uint32_t> ReadAppId(const std::filesystem::path& path)
+{
+    EasyVDF::Result<EasyVDF::KeyValue> manifest = EasyVDF::try_load(path);
+    if (!manifest)
+        return manifest.error();                       // pass the error up
+
+    if (auto appid = (*manifest)["appid"].try_as<uint32_t>())
+        return *appid;
+    return EasyVDF::ErrorInfo(EasyVDF::ErrorCode::Type, "appid is not a number");
+}
+
+EasyVDF::Result<EasyVDF::KeyValue> manifest = EasyVDF::try_load("appmanifest_440.acf");
+std::string language = manifest
+    .and_then([](const EasyVDF::KeyValue& doc) { return doc.try_at("UserConfig"); })
+    .and_then([](const EasyVDF::Node& config) { return config.try_at("language"); })
+    .map([](const EasyVDF::Node& node) { return node.value_or(std::string()); })
+    .value_or("english");                              // missing file, key or value: "english"
+
+// Recover from some errors only, add context to the others.
+EasyVDF::Result<EasyVDF::KeyValue> config = EasyVDF::try_load("config.vdf")
+    .or_else([](const EasyVDF::ErrorInfo& error) -> EasyVDF::Result<EasyVDF::KeyValue> {
+        if (error.code == EasyVDF::ErrorCode::Io)
+            return EasyVDF::KeyValue("Config");        // no file yet: start empty
+        return error;
+    })
+    .map_error([](EasyVDF::ErrorInfo error) {
+        error.message = "config.vdf: " + error.message;
+        return error;
+    });
+
+// and_then() also chains to a Result<void>: the error is the one of the load, or of the save.
+EasyVDF::Result<void> saved = config.and_then([](const EasyVDF::KeyValue& doc) { return doc.try_save("config.vdf"); });
+if (!saved)
+    std::cerr << saved.error() << '\n';                // "Syntax: config.vdf: Expected a key ..."
+```
+
+- `Result<void>` (from `try_write()`, `try_save()`) only tells success from failure; its `map()` and `and_then()`
+  take functions without parameter.
+- `Result<Node&>` (from `try_at()`) holds a reference, like a pointer: it is valid as long as the node it refers
+  to, exactly like the reference that `at()` returns. Assigning another `Result` rebinds it; `value_or()` returns
+  a copy. A `Result<Node&>` converts to a `Result<Node const&>`.
+- `map()` stores what the function returns by value; `and_then()` with `try_at()` stays on references.
+- `operator*`, `operator->` and `error()` check that the `Result` holds what they return with `assert()` only.
+  `value()` always checks.
+- `ErrorCode` and `ErrorInfo` print with `<<` (`"Syntax: Expected a key ... at line 3, column 5"`),
+  `EasyVDF::to_string(code)` gives the name of a code.
+- `Result` is EasyVDF's own type, also in C++23: `std::expected` has no reference specialization, its
+  `value()` throws `std::bad_expected_access` instead of `ParseError` / `IoError`..., and its `map()` is called
+  `transform()`.
+
+### Compiling without exceptions
+
+EasyVDF compiles with exceptions disabled (`-fno-exceptions` with GCC and clang, `/EHs-c- /D_HAS_EXCEPTIONS=0` with
+MSVC; clang with the Microsoft standard library needs `-D_HAS_EXCEPTIONS=0` too). The header detects it
+(`__cpp_exceptions`, `_CPPUNWIND`) and defines `EASYVDF_NO_EXCEPTIONS`. You can also define `EASYVDF_NO_EXCEPTIONS`
+before including it to get the same API in a build with exceptions, to make sure that some code never throws.
+In this mode:
+
+- **The throwing API is not declared**: `parse()`, `parse_all()`, `load()`, `load_all()`, `KeyValue::dump()`,
+  `to_text()`, `to_binary()`, `write()`, `save()`, `Node::as<T>()`, `Node::at()` and the exception classes.
+  Calling one is a compile error; use the `try_*` functions, `try_as<T>()` and `value_or()`.
+- **Everything else is available.** Reading never fails (`operator[]` on a const node, `find()`, `value_or()`,
+  iteration, ...), and the operations that can fail return a `Result`.
+- **Two mistakes have no error value**: `Result::value()` on an error, and a scalar used as an object (the
+  non-const `operator[]`, `add()` or `insert()` on a string or a number). They print the error on stderr and call
+  `std::abort()`, which is what an uncaught exception would do, or Rust's `unwrap()` and `panic!`. Test first
+  with `has_value()` or `is_object()` / `is_none()`.
+- An allocation failure (`std::bad_alloc` with exceptions) ends the program, as everywhere without exceptions.
+
+```cpp
+// g++ -std=c++17 -fno-exceptions ...
+EasyVDF::KeyValue doc("Settings");
+doc["window"]["width"] = 1280;                         // OK: objects are created as needed
+if (auto saved = doc.try_save("settings.vdf"); !saved)
+    std::cerr << saved.error() << '\n';
+
+doc["window"]["width"]["x"] = 1;                       // a number has no children: prints the error, aborts
 ```
 
 ## Options
@@ -350,11 +499,13 @@ Complete programs in [`examples/`](examples), built with the tests (`-DEASYVDF_B
 | [`quick_tour.cpp`](examples/quick_tour.cpp) | Build a document, read typed values with defaults, iterate, duplicate keys, modify, save as text and VBKV, reload, handle errors. |
 | [`achievements.cpp`](examples/achievements.cpp) | List the achievements and stats of a Steam stats schema (binary `UserGameStatsSchema_<appid>.bin`), in a given language. |
 | [`vdf_convert.cpp`](examples/vdf_convert.cpp) | Convert any VDF file between text, binary and VBKV. |
+| [`no_exceptions.cpp`](examples/no_exceptions.cpp) | Check VDF files and print their errors like a compiler, built with exceptions disabled: `Result`, `try_load_all()`, `try_at()` chains. |
 
 ```sh
 achievements UserGameStatsSchema_480.bin french
 vdf_convert shortcuts.vdf shortcuts.txt          # binary -> text
 vdf_convert shortcuts.txt shortcuts.vdf binary   # text -> binary
+no_exceptions appmanifest_440.acf broken.vdf     # broken.vdf:7:5: error [Syntax]: ...
 ```
 
 ## Tests

@@ -1,7 +1,9 @@
 // The examples of README.md, compiled and checked: keep both in sync.
 #include "../EasyVDF.h"
 
+#include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -399,5 +401,147 @@ TEST_CASE("README: errors", "[readme]")
     {
         CHECK(e.line() == 3);
         CHECK(e.column() == 8);
+    }
+}
+
+TEST_CASE("README: errors have a code", "[readme]")
+{
+    try
+    {
+        EasyVDF::load("does_not_exist.vdf");
+        FAIL("no exception");
+    }
+    catch (const EasyVDF::Error& e)
+    {
+        CHECK(e.code() == EasyVDF::ErrorCode::Io);
+        CHECK(e.info() == EasyVDF::try_load("does_not_exist.vdf").error());
+    }
+}
+
+namespace {
+
+EasyVDF::Result<uint32_t> ReadAppId(const std::filesystem::path& path)
+{
+    EasyVDF::Result<EasyVDF::KeyValue> manifest = EasyVDF::try_load(path);
+    if (!manifest)
+        return manifest.error();                       // pass the error up
+
+    if (auto appid = (*manifest)["appid"].try_as<uint32_t>())
+        return *appid;
+    return EasyVDF::ErrorInfo(EasyVDF::ErrorCode::Type, "appid is not a number");
+}
+
+} // namespace
+
+TEST_CASE("README: error handling without exceptions", "[readme]")
+{
+    TempFile manifest_file("readme_result_appmanifest_440.acf");
+    REQUIRE(EasyVDF::parse(AppManifest).try_save(manifest_file.path).has_value());
+
+    SECTION("try_load")
+    {
+        for (std::string path : {manifest_file.path, std::string("does_not_exist.vdf")})
+        {
+            std::ostringstream out, err;
+            [&] {
+                EasyVDF::Result<EasyVDF::KeyValue> doc = EasyVDF::try_load(path);
+                if (!doc)
+                {
+                    const EasyVDF::ErrorInfo& error = doc.error();   // code, message, line, column
+                    err << path << ':' << error.line << ':' << error.column << ": " << error.message << '\n';
+                    return;
+                }
+                out << (*doc)["name"].value_or("?") << '\n';   // *doc is the KeyValue, doc-> works too
+            }();
+            if (path == manifest_file.path)
+                CHECK(out.str() == "Team Fortress 2\n");
+            else
+                CHECK(err.str() == "does_not_exist.vdf:0:0: EasyVDF: can't open \"does_not_exist.vdf\" for reading\n");
+        }
+    }
+
+    SECTION("propagation and chains")
+    {
+        CHECK(ReadAppId(manifest_file.path).value() == 440);
+        CHECK(ReadAppId("does_not_exist.vdf").error().code == EasyVDF::ErrorCode::Io);
+
+        auto language_of = [](const std::string& path) {
+            EasyVDF::Result<EasyVDF::KeyValue> manifest = EasyVDF::try_load(path);
+            std::string language = manifest
+                .and_then([](const EasyVDF::KeyValue& doc) { return doc.try_at("UserConfig"); })
+                .and_then([](const EasyVDF::Node& config) { return config.try_at("language"); })
+                .map([](const EasyVDF::Node& node) { return node.value_or(std::string()); })
+                .value_or("english");                              // missing file, key or value: "english"
+            return language;
+        };
+        EasyVDF::KeyValue french = EasyVDF::parse(AppManifest);
+        french["UserConfig"]["language"] = "french";
+        REQUIRE(french.try_save(manifest_file.path).has_value());
+        CHECK(language_of(manifest_file.path) == "french");
+        CHECK(language_of("does_not_exist.vdf") == "english");
+    }
+
+    SECTION("recover, add context")
+    {
+        TempFile config_file("config.vdf");
+        auto load_and_save = [] {
+            // Recover from some errors only, add context to the others.
+            EasyVDF::Result<EasyVDF::KeyValue> config = EasyVDF::try_load("config.vdf")
+                .or_else([](const EasyVDF::ErrorInfo& error) -> EasyVDF::Result<EasyVDF::KeyValue> {
+                    if (error.code == EasyVDF::ErrorCode::Io)
+                        return EasyVDF::KeyValue("Config");        // no file yet: start empty
+                    return error;
+                })
+                .map_error([](EasyVDF::ErrorInfo error) {
+                    error.message = "config.vdf: " + error.message;
+                    return error;
+                });
+
+            // and_then() also chains to a Result<void>: the error is the one of the load, or of the save.
+            EasyVDF::Result<void> saved = config.and_then([](const EasyVDF::KeyValue& doc) { return doc.try_save("config.vdf"); });
+            return saved;
+        };
+
+        // No file: an empty one is created.
+        CHECK(load_and_save().has_value());
+        CHECK(EasyVDF::load("config.vdf") == EasyVDF::KeyValue("Config"));
+
+        // A malformed file: the error, with context.
+        {
+            std::ofstream out("config.vdf", std::ios::binary);
+            out << "\"Config\"\n{\n\t\"k\"\n}\n";
+        }
+        EasyVDF::Result<void> saved = load_and_save();
+        REQUIRE_FALSE(saved);
+        std::ostringstream err;
+        err << saved.error() << '\n';
+        CHECK(err.str() == "Syntax: config.vdf: Expected a value or an object start ('{') after key \"k\" at line 4, column 1\n");
+    }
+
+    SECTION("Result API")
+    {
+        EasyVDF::Result<EasyVDF::KeyValue> r = EasyVDF::try_parse(AppManifest);
+        CHECK(r.has_value());
+        CHECK(r->key() == "AppState");
+        CHECK((*r).key() == "AppState");
+        CHECK(r.value().key() == "AppState");
+        CHECK(r.map([](const EasyVDF::KeyValue& doc) { return doc.size(); }).value() == 12);
+
+        std::ostringstream os;
+        os << EasyVDF::try_parse("\"root\"\n{\n\t\"k\"\n}\n").error();
+        CHECK(os.str() == "Syntax: Expected a value or an object start ('{') after key \"k\" at line 4, column 1");
+        CHECK(std::string(EasyVDF::to_string(EasyVDF::ErrorCode::UnexpectedEof)) == "UnexpectedEof");
+    }
+
+    SECTION("compiling without exceptions")
+    {
+        // The part of the snippet that does not abort.
+        TempFile settings("settings.vdf");
+        EasyVDF::KeyValue doc("Settings");
+        doc["window"]["width"] = 1280;                         // OK: objects are created as needed
+        if (auto saved = doc.try_save("settings.vdf"); !saved)
+            FAIL(saved.error());
+        CHECK(EasyVDF::load("settings.vdf")["window"]["width"].value_or(0) == 1280);
+        CHECK_THROWS_AS(doc["window"]["width"]["x"] = 1, EasyVDF::TypeError);
     }
 }
