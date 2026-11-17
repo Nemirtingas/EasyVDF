@@ -4,13 +4,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <istream>
 #include <iterator>
@@ -39,6 +43,16 @@
     #else
         #define EASYVDF_HAS_FLOAT_CHARCONV 0
     #endif
+#endif
+
+// EasyVDF reports its errors by return value (EasyVDF::Result, the try_* functions);
+// the throwing API (parse(), load(), as<T>(), at(), save(), ...) and the exception
+// classes are a thin layer on top of it. Define EASYVDF_NO_EXCEPTIONS before including
+// this header to remove that layer. It is defined automatically when the compiler has
+// exceptions disabled (-fno-exceptions, /EHs-c-). See README.md, "Error handling
+// without exceptions".
+#if !defined(EASYVDF_NO_EXCEPTIONS) && !defined(__cpp_exceptions) && !defined(__EXCEPTIONS) && !defined(_CPPUNWIND)
+    #define EASYVDF_NO_EXCEPTIONS
 #endif
 
 namespace EasyVDF {
@@ -102,58 +116,506 @@ inline bool operator>=(Color l, Color r) noexcept { return !(l < r); }
 
 /////////////////////////////////////////////////////////////////////
 //
-//                          Exceptions
+//                              Errors
 //
 /////////////////////////////////////////////////////////////////////
 
-/// Base class of every exception thrown by EasyVDF.
-class Error : public std::runtime_error
+/// What went wrong. Every error has one of these codes, whether it is returned in a
+/// Result (try_* functions) or thrown (the exception class is given for each group).
+enum class ErrorCode
 {
-public:
-    using std::runtime_error::runtime_error;
+    // Malformed input, thrown as ParseError.
+    Syntax,              ///< Text: a token that the grammar does not allow there.
+    UnexpectedEof,       ///< The input ends before the end of the document (truncated input).
+    EmptyInput,          ///< The input holds no document: no byte, or only blanks, comments and directives.
+    TrailingData,        ///< Data after the root object (see parse_all() for the files that hold several).
+    InvalidRoot,         ///< Binary: the root item is not an object.
+    UnknownNodeType,     ///< Binary: a node type that is not part of the format.
+    UnsupportedNodeType, ///< Binary: WideString (5) or binary blob (9), not supported.
+    UnsupportedEncoding, ///< Text: UTF-16 input.
+    ChecksumMismatch,    ///< VBKV: the CRC32 of the data does not match the header.
+    DepthExceeded,       ///< Objects nested deeper than ReadOptions::max_depth.
+
+    Io,                  ///< IoError: a file can't be opened, read or written, or a stream can't be read.
+    Write,               ///< WriteError: the document can't be written (root not an object, ...).
+    Type,                ///< TypeError: no conversion to the requested type, or a scalar used as an object.
+    Key,                 ///< KeyError: Node::at() / try_at() did not find the key.
 };
 
-/// Malformed input. line() and column() are 1-based and 0 when unknown (binary input).
-class ParseError : public Error
+/// The name of the code: "Syntax", "UnexpectedEof", ...
+inline const char* to_string(ErrorCode code) noexcept
 {
+    switch (code)
+    {
+        case ErrorCode::Syntax             : return "Syntax";
+        case ErrorCode::UnexpectedEof      : return "UnexpectedEof";
+        case ErrorCode::EmptyInput         : return "EmptyInput";
+        case ErrorCode::TrailingData       : return "TrailingData";
+        case ErrorCode::InvalidRoot        : return "InvalidRoot";
+        case ErrorCode::UnknownNodeType    : return "UnknownNodeType";
+        case ErrorCode::UnsupportedNodeType: return "UnsupportedNodeType";
+        case ErrorCode::UnsupportedEncoding: return "UnsupportedEncoding";
+        case ErrorCode::ChecksumMismatch   : return "ChecksumMismatch";
+        case ErrorCode::DepthExceeded      : return "DepthExceeded";
+        case ErrorCode::Io                 : return "Io";
+        case ErrorCode::Write              : return "Write";
+        case ErrorCode::Type               : return "Type";
+        case ErrorCode::Key                : return "Key";
+    }
+    return "Unknown";
+}
+
+inline std::ostream& operator<<(std::ostream& os, ErrorCode code)
+{
+    return os << to_string(code);
+}
+
+/// An error: its code, a readable message (the what() of the matching exception)
+/// and, for text input, the 1-based position of the error. line and column are 0
+/// when they do not apply (binary input, I/O, ...); column is 0 at the end of the input.
+struct ErrorInfo
+{
+    ErrorCode code;
+    std::string message;
+    std::size_t line = 0;
+    std::size_t column = 0;
+
+    ErrorInfo(ErrorCode error_code, std::string error_message, std::size_t error_line = 0, std::size_t error_column = 0) :
+        code(error_code), message(std::move(error_message)), line(error_line), column(error_column)
+    {}
+
+    friend bool operator==(ErrorInfo const& l, ErrorInfo const& r) noexcept
+    {
+        return l.code == r.code && l.line == r.line && l.column == r.column && l.message == r.message;
+    }
+
+    friend bool operator!=(ErrorInfo const& l, ErrorInfo const& r) noexcept { return !(l == r); }
+};
+
+/// "Code: message", e.g. "UnexpectedEof: Unexpected end of file, ... at line 3".
+inline std::ostream& operator<<(std::ostream& os, ErrorInfo const& error)
+{
+    return os << to_string(error.code) << ": " << error.message;
+}
+
+#ifndef EASYVDF_NO_EXCEPTIONS
+
+/// Base class of every exception thrown by EasyVDF. code(), line() and column()
+/// give the same information as the ErrorInfo of the try_* functions; info() rebuilds it.
+class Error : public std::runtime_error
+{
+    ErrorCode m_Code;
     std::size_t m_Line;
     std::size_t m_Column;
 
-public:
-    explicit ParseError(std::string const& message, std::size_t line = 0, std::size_t column = 0) :
-        Error(message), m_Line(line), m_Column(column)
+protected:
+    Error(ErrorCode code, std::string const& message, std::size_t line, std::size_t column) :
+        std::runtime_error(message), m_Code(code), m_Line(line), m_Column(column)
     {}
 
+public:
+    explicit Error(ErrorInfo const& info) :
+        Error(info.code, info.message, info.line, info.column)
+    {}
+
+    ErrorCode code() const noexcept { return m_Code; }
+
+    /// 1-based position in a text input, 0 when unknown or not applicable.
     std::size_t line() const noexcept { return m_Line; }
     std::size_t column() const noexcept { return m_Column; }
+
+    /// The error as a value, with what() as its message.
+    ErrorInfo info() const { return ErrorInfo(m_Code, what(), m_Line, m_Column); }
+};
+
+/// Malformed input. line() and column() are 1-based and 0 when unknown (binary input).
+/// Its code() is one of the parse codes, Syntax to UnsupportedEncoding.
+class ParseError : public Error
+{
+public:
+    explicit ParseError(std::string const& message, std::size_t line = 0, std::size_t column = 0) :
+        Error(ErrorCode::Syntax, message, line, column)
+    {}
+
+    explicit ParseError(ErrorInfo const& info) : Error(info) {}
 };
 
 /// A value has no conversion to the requested type, or a non-object was used as an object.
 class TypeError : public Error
 {
 public:
-    using Error::Error;
+    explicit TypeError(std::string const& message) : Error(ErrorCode::Type, message, 0, 0) {}
+    explicit TypeError(const char* message) : Error(ErrorCode::Type, message, 0, 0) {}
+    explicit TypeError(ErrorInfo const& info) : Error(info) {}
 };
 
 /// Node::at() did not find the key.
 class KeyError : public Error
 {
 public:
-    using Error::Error;
+    explicit KeyError(std::string const& message) : Error(ErrorCode::Key, message, 0, 0) {}
+    explicit KeyError(const char* message) : Error(ErrorCode::Key, message, 0, 0) {}
+    explicit KeyError(ErrorInfo const& info) : Error(info) {}
 };
 
 /// The tree can't be written (root without value or not an object, ...).
 class WriteError : public Error
 {
 public:
-    using Error::Error;
+    explicit WriteError(std::string const& message) : Error(ErrorCode::Write, message, 0, 0) {}
+    explicit WriteError(const char* message) : Error(ErrorCode::Write, message, 0, 0) {}
+    explicit WriteError(ErrorInfo const& info) : Error(info) {}
 };
 
 /// A file could not be opened, read or written.
 class IoError : public Error
 {
 public:
-    using Error::Error;
+    explicit IoError(std::string const& message) : Error(ErrorCode::Io, message, 0, 0) {}
+    explicit IoError(const char* message) : Error(ErrorCode::Io, message, 0, 0) {}
+    explicit IoError(ErrorInfo const& info) : Error(info) {}
+};
+
+#endif // EASYVDF_NO_EXCEPTIONS
+
+namespace Details {
+
+/// Reports an error that the caller did not handle: Result::value() on an error,
+/// a scalar used as an object, ... Throws the exception that matches the code;
+/// without exceptions, prints the error on stderr and calls std::abort().
+[[noreturn]] inline void Raise(ErrorInfo const& error)
+{
+#ifndef EASYVDF_NO_EXCEPTIONS
+    switch (error.code)
+    {
+        case ErrorCode::Io   : throw IoError(error);
+        case ErrorCode::Write: throw WriteError(error);
+        case ErrorCode::Type : throw TypeError(error);
+        case ErrorCode::Key  : throw KeyError(error);
+        default              : throw ParseError(error);
+    }
+#else
+    std::fprintf(stderr, "EasyVDF: unhandled %s error: %s\n", to_string(error.code), error.message.c_str());
+    std::fflush(stderr);
+    std::abort();
+#endif
+}
+
+} // namespace Details
+
+/////////////////////////////////////////////////////////////////////
+//
+//                              Result
+//
+/////////////////////////////////////////////////////////////////////
+
+template<typename T> class Result;
+
+namespace Details {
+
+template<typename T> struct IsResult : std::false_type {};
+template<typename T> struct IsResult<Result<T>> : std::true_type {};
+
+template<typename T>
+using RemoveCvRef = std::remove_cv_t<std::remove_reference_t<T>>;
+
+/// Arguments that construct the value of a Result<T> (not an error, not another Result).
+template<typename T, typename U>
+constexpr bool IsResultValueArgument =
+    std::is_constructible_v<T, U&&>
+    && !std::is_same_v<RemoveCvRef<U>, Result<T>>
+    && !std::is_same_v<RemoveCvRef<U>, ErrorInfo>
+    && !std::is_same_v<RemoveCvRef<U>, std::in_place_t>
+    && (!IsResult<RemoveCvRef<U>>::value || std::is_same_v<RemoveCvRef<U>, std::remove_cv_t<T>>);
+
+/// The combinators shared by every kind of Result.
+struct ResultOps
+{
+    // f(value), or f() for Result<void>.
+    template<typename Self, typename F>
+    static decltype(auto) Call(Self&& self, F&& f)
+    {
+        if constexpr (std::is_void_v<typename RemoveCvRef<Self>::value_type>)
+            return std::invoke(std::forward<F>(f));
+        else
+            return std::invoke(std::forward<F>(f), *std::forward<Self>(self));
+    }
+
+    template<typename Self, typename F>
+    static auto Map(Self&& self, F&& f)
+    {
+        using U = RemoveCvRef<decltype(Call(std::forward<Self>(self), std::forward<F>(f)))>;
+        if (!self.has_value())
+            return Result<U>(std::forward<Self>(self).error());
+
+        if constexpr (std::is_void_v<U>)
+        {
+            Call(std::forward<Self>(self), std::forward<F>(f));
+            return Result<U>();
+        }
+        else
+        {
+            return Result<U>(Call(std::forward<Self>(self), std::forward<F>(f)));
+        }
+    }
+
+    template<typename Self, typename F>
+    static auto AndThen(Self&& self, F&& f)
+    {
+        using R = RemoveCvRef<decltype(Call(std::forward<Self>(self), std::forward<F>(f)))>;
+        static_assert(IsResult<R>::value, "EasyVDF: the function given to and_then() must return a Result");
+        if (!self.has_value())
+            return R(std::forward<Self>(self).error());
+        return R(Call(std::forward<Self>(self), std::forward<F>(f)));
+    }
+
+    template<typename Self, typename F>
+    static RemoveCvRef<Self> OrElse(Self&& self, F&& f)
+    {
+        using R = RemoveCvRef<Self>;
+        static_assert(std::is_same_v<RemoveCvRef<std::invoke_result_t<F, decltype(std::forward<Self>(self).error())>>, R>,
+            "EasyVDF: the function given to or_else() must return a Result of the same type");
+        if (self.has_value())
+            return R(std::forward<Self>(self));
+        return std::invoke(std::forward<F>(f), std::forward<Self>(self).error());
+    }
+
+    template<typename Self, typename F>
+    static RemoveCvRef<Self> MapError(Self&& self, F&& f)
+    {
+        using R = RemoveCvRef<Self>;
+        if (self.has_value())
+            return R(std::forward<Self>(self));
+        return R(ErrorInfo(std::invoke(std::forward<F>(f), std::forward<Self>(self).error())));
+    }
+};
+
+} // namespace Details
+
+/// A value of type T or an ErrorInfo, like C++23 std::expected<T, ErrorInfo> or
+/// Rust's Result<T, E>. Returned by the try_* functions, which never throw
+/// (except std::bad_alloc).
+///
+/// ```
+/// EasyVDF::Result<EasyVDF::KeyValue> doc = EasyVDF::try_load(path);
+/// if (!doc)
+///     std::cerr << doc.error() << '\n';      // "Syntax: Expected a key ... at line 3, column 5"
+/// else
+///     std::cout << (*doc)["name"].value_or("?") << '\n';
+/// ```
+///
+/// - `*r` and `r->` access the value (has_value() must be true), `r.error()` the
+///   error (has_value() must be false).
+/// - `r.value()` returns the value, or reports the error like an uncaught one: it
+///   throws the matching exception (ParseError, IoError, ...), and without
+///   exceptions prints the error on stderr and calls std::abort(), like Rust's unwrap().
+/// - `map(f)` transforms the value, `and_then(f)` chains an operation that can fail,
+///   `or_else(f)` recovers from an error, `map_error(f)` transforms the error.
+///
+/// Result<T&> holds a reference (see Node::try_at()), Result<void> only tells
+/// success from failure (see KeyValue::try_save()).
+template<typename T>
+class [[nodiscard]] Result
+{
+    static_assert(std::is_object_v<T> && !std::is_array_v<T>, "EasyVDF: Result<T> holds an object type, an lvalue reference or void");
+    static_assert(!std::is_same_v<std::remove_cv_t<T>, ErrorInfo>, "EasyVDF: Result<ErrorInfo> can't tell a value from an error");
+
+    std::variant<T, ErrorInfo> m_Storage;
+
+public:
+    using value_type = T;
+    using error_type = ErrorInfo;
+
+    /// A value: `Result<int> r = 42;`
+    template<typename U = T, std::enable_if_t<Details::IsResultValueArgument<T, U> && std::is_convertible_v<U&&, T>, int> = 0>
+    Result(U&& value) :
+        m_Storage(std::in_place_index<0>, std::forward<U>(value))
+    {}
+
+    template<typename U = T, std::enable_if_t<Details::IsResultValueArgument<T, U> && !std::is_convertible_v<U&&, T>, int> = 0>
+    explicit Result(U&& value) :
+        m_Storage(std::in_place_index<0>, std::forward<U>(value))
+    {}
+
+    /// An error: `return EasyVDF::ErrorInfo(EasyVDF::ErrorCode::Io, "can't open the file");`
+    Result(ErrorInfo error) :
+        m_Storage(std::in_place_index<1>, std::move(error))
+    {}
+
+    bool has_value() const noexcept { return m_Storage.index() == 0; }
+    explicit operator bool() const noexcept { return has_value(); }
+
+    /// The value; has_value() must be true.
+    T& operator*() & noexcept { assert(has_value()); return *std::get_if<0>(&m_Storage); }
+    T const& operator*() const& noexcept { assert(has_value()); return *std::get_if<0>(&m_Storage); }
+    T&& operator*() && noexcept { assert(has_value()); return std::move(*std::get_if<0>(&m_Storage)); }
+    T const&& operator*() const&& noexcept { assert(has_value()); return std::move(*std::get_if<0>(&m_Storage)); }
+    T* operator->() noexcept { assert(has_value()); return std::get_if<0>(&m_Storage); }
+    T const* operator->() const noexcept { assert(has_value()); return std::get_if<0>(&m_Storage); }
+
+    /// The value; an error is thrown as the matching exception, or printed before
+    /// std::abort() without exceptions.
+    T& value() & { Check(); return **this; }
+    T const& value() const& { Check(); return **this; }
+    T&& value() && { Check(); return std::move(**this); }
+    T const&& value() const&& { Check(); return std::move(**this); }
+
+    /// The error; has_value() must be false.
+    ErrorInfo& error() & noexcept { assert(!has_value()); return *std::get_if<1>(&m_Storage); }
+    ErrorInfo const& error() const& noexcept { assert(!has_value()); return *std::get_if<1>(&m_Storage); }
+    ErrorInfo&& error() && noexcept { assert(!has_value()); return std::move(*std::get_if<1>(&m_Storage)); }
+
+    /// The value, or default_value converted to T when this holds an error.
+    template<typename U>
+    T value_or(U&& default_value) const&
+    {
+        if (has_value())
+            return **this;
+        return static_cast<T>(std::forward<U>(default_value));
+    }
+
+    template<typename U>
+    T value_or(U&& default_value) &&
+    {
+        if (has_value())
+            return std::move(**this);
+        return static_cast<T>(std::forward<U>(default_value));
+    }
+
+    /// Result<U> holding f(value), or this error. f may return void (Result<void>).
+    template<typename F> auto map(F&& f) & { return Details::ResultOps::Map(*this, std::forward<F>(f)); }
+    template<typename F> auto map(F&& f) const& { return Details::ResultOps::Map(*this, std::forward<F>(f)); }
+    template<typename F> auto map(F&& f) && { return Details::ResultOps::Map(std::move(*this), std::forward<F>(f)); }
+
+    /// f(value), which returns a Result, or this error.
+    template<typename F> auto and_then(F&& f) & { return Details::ResultOps::AndThen(*this, std::forward<F>(f)); }
+    template<typename F> auto and_then(F&& f) const& { return Details::ResultOps::AndThen(*this, std::forward<F>(f)); }
+    template<typename F> auto and_then(F&& f) && { return Details::ResultOps::AndThen(std::move(*this), std::forward<F>(f)); }
+
+    /// This value, or f(error), which returns a Result<T>.
+    template<typename F> Result or_else(F&& f) & { return Details::ResultOps::OrElse(*this, std::forward<F>(f)); }
+    template<typename F> Result or_else(F&& f) const& { return Details::ResultOps::OrElse(*this, std::forward<F>(f)); }
+    template<typename F> Result or_else(F&& f) && { return Details::ResultOps::OrElse(std::move(*this), std::forward<F>(f)); }
+
+    /// This value, or the error f(error) returns (an ErrorInfo).
+    template<typename F> Result map_error(F&& f) & { return Details::ResultOps::MapError(*this, std::forward<F>(f)); }
+    template<typename F> Result map_error(F&& f) const& { return Details::ResultOps::MapError(*this, std::forward<F>(f)); }
+    template<typename F> Result map_error(F&& f) && { return Details::ResultOps::MapError(std::move(*this), std::forward<F>(f)); }
+
+private:
+    void Check() const
+    {
+        if (!has_value())
+            Details::Raise(*std::get_if<1>(&m_Storage));
+    }
+};
+
+/// A reference or an error, see Node::try_at(). Like a pointer, the Result does not
+/// own the value: the reference stays valid as long as the node it refers to.
+/// value_or() returns a copy.
+template<typename T>
+class [[nodiscard]] Result<T&>
+{
+    template<typename> friend class Result;
+
+    std::variant<T*, ErrorInfo> m_Storage;
+
+public:
+    using value_type = T&;
+    using error_type = ErrorInfo;
+
+    Result(T& value) noexcept :
+        m_Storage(std::in_place_index<0>, std::addressof(value))
+    {}
+
+    /// No reference to a temporary.
+    Result(T&& value) = delete;
+
+    /// Result<Node const&> from Result<Node&>.
+    template<typename U, std::enable_if_t<!std::is_same_v<U, T> && std::is_convertible_v<U*, T*>, int> = 0>
+    Result(Result<U&> const& other) :
+        m_Storage(other.has_value()
+            ? std::variant<T*, ErrorInfo>(std::in_place_index<0>, *std::get_if<0>(&other.m_Storage))
+            : std::variant<T*, ErrorInfo>(std::in_place_index<1>, *std::get_if<1>(&other.m_Storage)))
+    {}
+
+    Result(ErrorInfo error) :
+        m_Storage(std::in_place_index<1>, std::move(error))
+    {}
+
+    bool has_value() const noexcept { return m_Storage.index() == 0; }
+    explicit operator bool() const noexcept { return has_value(); }
+
+    T& operator*() const noexcept { assert(has_value()); return **std::get_if<0>(&m_Storage); }
+    T* operator->() const noexcept { assert(has_value()); return *std::get_if<0>(&m_Storage); }
+
+    T& value() const
+    {
+        if (!has_value())
+            Details::Raise(*std::get_if<1>(&m_Storage));
+        return **this;
+    }
+
+    ErrorInfo& error() & noexcept { assert(!has_value()); return *std::get_if<1>(&m_Storage); }
+    ErrorInfo const& error() const& noexcept { assert(!has_value()); return *std::get_if<1>(&m_Storage); }
+    ErrorInfo&& error() && noexcept { assert(!has_value()); return std::move(*std::get_if<1>(&m_Storage)); }
+
+    /// A copy of the value, or default_value converted to it.
+    template<typename U>
+    std::remove_cv_t<T> value_or(U&& default_value) const
+    {
+        if (has_value())
+            return **this;
+        return static_cast<std::remove_cv_t<T>>(std::forward<U>(default_value));
+    }
+
+    template<typename F> auto map(F&& f) const { return Details::ResultOps::Map(*this, std::forward<F>(f)); }
+    template<typename F> auto and_then(F&& f) const { return Details::ResultOps::AndThen(*this, std::forward<F>(f)); }
+    template<typename F> Result or_else(F&& f) const { return Details::ResultOps::OrElse(*this, std::forward<F>(f)); }
+    template<typename F> Result map_error(F&& f) const { return Details::ResultOps::MapError(*this, std::forward<F>(f)); }
+};
+
+/// Success or an error, see KeyValue::try_save(). The functions given to map()
+/// and and_then() take no argument.
+template<>
+class [[nodiscard]] Result<void>
+{
+    std::optional<ErrorInfo> m_Error;
+
+public:
+    using value_type = void;
+    using error_type = ErrorInfo;
+
+    /// Success.
+    Result() noexcept = default;
+
+    Result(ErrorInfo error) :
+        m_Error(std::move(error))
+    {}
+
+    bool has_value() const noexcept { return !m_Error.has_value(); }
+    explicit operator bool() const noexcept { return has_value(); }
+
+    /// Reports the error, if any: throws the matching exception, or prints it
+    /// before std::abort() without exceptions.
+    void value() const
+    {
+        if (m_Error)
+            Details::Raise(*m_Error);
+    }
+
+    ErrorInfo& error() & noexcept { assert(!has_value()); return *m_Error; }
+    ErrorInfo const& error() const& noexcept { assert(!has_value()); return *m_Error; }
+    ErrorInfo&& error() && noexcept { assert(!has_value()); return std::move(*m_Error); }
+
+    template<typename F> auto map(F&& f) const& { return Details::ResultOps::Map(*this, std::forward<F>(f)); }
+    template<typename F> auto map(F&& f) && { return Details::ResultOps::Map(std::move(*this), std::forward<F>(f)); }
+    template<typename F> auto and_then(F&& f) const& { return Details::ResultOps::AndThen(*this, std::forward<F>(f)); }
+    template<typename F> auto and_then(F&& f) && { return Details::ResultOps::AndThen(std::move(*this), std::forward<F>(f)); }
+    template<typename F> Result or_else(F&& f) const& { return Details::ResultOps::OrElse(*this, std::forward<F>(f)); }
+    template<typename F> Result or_else(F&& f) && { return Details::ResultOps::OrElse(std::move(*this), std::forward<F>(f)); }
+    template<typename F> Result map_error(F&& f) const& { return Details::ResultOps::MapError(*this, std::forward<F>(f)); }
+    template<typename F> Result map_error(F&& f) && { return Details::ResultOps::MapError(std::move(*this), std::forward<F>(f)); }
 };
 
 class Node;
@@ -572,11 +1034,13 @@ public:
     bool is_object() const noexcept { return type() == Type::Object; }
     bool is_string() const noexcept { return type() == Type::String; }
 
+#ifndef EASYVDF_NO_EXCEPTIONS
     /// Converts the value to T: std::string, std::string_view (String nodes only),
     /// bool, any integer or floating point type, Color or Pointer.
     /// Strings are parsed ("42", "0x2A", "1.5", "255 0 0 255"), numbers are range
     /// checked, any scalar converts to std::string.
     /// Throws TypeError when there is no value or no lossless conversion.
+    /// Not available with EASYVDF_NO_EXCEPTIONS: use try_as<T>() or value_or().
     template<typename T>
     T as() const
     {
@@ -589,6 +1053,7 @@ public:
         }
         return result;
     }
+#endif
 
     /// Like as<T>(), but returns std::nullopt instead of throwing.
     template<typename T>
@@ -624,16 +1089,25 @@ public:
 
     /// First child with this key, for reading or writing. A missing key is created
     /// lazily: it only becomes part of the tree once it is given a value.
-    /// Throws TypeError if this node holds a scalar.
+    /// Throws TypeError if this node holds a scalar (without exceptions: prints the
+    /// error and calls std::abort(), test is_object() / is_none() first).
     Node& operator[](std::string_view key);
 
     /// First child with this key, nullptr if there is none.
     KeyValue const* find(std::string_view key) const noexcept;
     KeyValue* find(std::string_view key) noexcept;
 
+#ifndef EASYVDF_NO_EXCEPTIONS
     /// First child with this key, throws KeyError if there is none.
     Node const& at(std::string_view key) const;
     Node& at(std::string_view key);
+#endif
+
+    /// First child with this key, or an ErrorCode::Key error if there is none:
+    /// `if (auto appid = doc.try_at("appid")) appid->as<int>();`
+    /// The reference is valid as long as the child, like the one at() returns.
+    Result<Node const&> try_at(std::string_view key) const;
+    Result<Node&> try_at(std::string_view key);
 
     bool contains(std::string_view key) const noexcept { return find(key) != nullptr; }
 
@@ -646,7 +1120,7 @@ public:
     Details::ChildRange<false> all(std::string_view key);
 
     /// Appends a child, even if the key already exists (duplicate keys are legal).
-    /// A node without value becomes an object; throws TypeError on a scalar.
+    /// A node without value becomes an object; a scalar is a TypeError, like for operator[].
     KeyValue& add(std::string key, Node value);
 
     /// Appends an empty object.
@@ -694,6 +1168,7 @@ private:
     Details::Children* ChildrenPtr() noexcept { return std::get_if<Details::Children>(&m_Value); }
 
     // The children of this node, making it an object if it has no value.
+    // A scalar has none: Details::Raise() reports a TypeError.
     Details::Children& MakeChildren();
 
     // Moves the pending children that were given a value to the end of the items.
@@ -954,10 +1429,10 @@ struct ReadOptions
     Format format = Format::Auto;
     /// Text: decode escape sequences (\n \t \\ \" ...) in quoted strings.
     bool escapes = true;
-    /// VBKV: check the CRC32 of the file, throw ParseError on mismatch.
+    /// VBKV: check the CRC32 of the file, ErrorCode::ChecksumMismatch (ParseError) on mismatch.
     bool verify_crc = true;
-    /// Maximum object nesting, the root object counts for 1; deeper input is a
-    /// ParseError. The parsers themselves are not recursive, but writing, copying,
+    /// Maximum object nesting, the root object counts for 1; deeper input is an
+    /// ErrorCode::DepthExceeded ParseError. The parsers themselves are not recursive, but writing, copying,
     /// comparing and destroying a tree use stack space proportional to its depth:
     /// keep this limit reasonable for untrusted input.
     std::size_t max_depth = 128;
@@ -1067,6 +1542,7 @@ public:
             m_Condition = std::make_unique<std::string>(condition);
     }
 
+#ifndef EASYVDF_NO_EXCEPTIONS
     /// Serializes the document. The value must be an object, else WriteError is thrown.
     std::string dump(WriteOptions const& options = {}) const;
 
@@ -1076,11 +1552,22 @@ public:
     /// dump() as binary: Format::Binary or Format::Vbkv.
     std::string to_binary(Format format = Format::Binary) const { return dump(format); }
 
-    /// Writes dump() to a stream (open it in binary mode).
+    /// Writes dump() to a stream (open it in binary mode). The state of the stream
+    /// is not checked, test it after the call.
     void write(std::ostream& os, WriteOptions const& options = {}) const;
 
     /// Writes dump() to a file. Throws IoError if the file can't be written.
     void save(std::filesystem::path const& path, WriteOptions const& options = {}) const;
+#endif
+
+    /// The non-throwing versions of dump(), to_text(), to_binary(), write() and save():
+    /// ErrorCode::Write when the document can't be written, ErrorCode::Io when the
+    /// file can't be. Nothing is written when the document can't be serialized.
+    Result<std::string> try_dump(WriteOptions const& options = {}) const;
+    Result<std::string> try_to_text() const { return try_dump(Format::Text); }
+    Result<std::string> try_to_binary(Format format = Format::Binary) const { return try_dump(format); }
+    Result<void> try_write(std::ostream& os, WriteOptions const& options = {}) const;
+    Result<void> try_save(std::filesystem::path const& path, WriteOptions const& options = {}) const;
 
     /// Structured bindings: `auto& [key, value] = kv;` (key is const, value is the Node).
     template<std::size_t I>
@@ -1119,13 +1606,15 @@ public:
     friend bool operator!=(KeyValue const& l, KeyValue const& r) noexcept { return !(l == r); }
 };
 
+#ifndef EASYVDF_NO_EXCEPTIONS
 /// Parses a document held in memory (text or binary, see ReadOptions::format).
 /// A document is one root key and its object: anything after it is an error,
 /// see parse_all() for the files that hold several. Throws ParseError.
 KeyValue parse(std::string_view data, ReadOptions const& options = {});
 
 /// Parses a document from a stream, read sequentially to its end: pipes and
-/// std::cin work. Open files in binary mode. Throws ParseError.
+/// std::cin work. Open files in binary mode. Throws ParseError, or IoError if
+/// the stream reports a read error.
 KeyValue parse(std::istream& is, ReadOptions const& options = {});
 
 /// Parses a file. Throws IoError if it can't be opened, ParseError if it is malformed.
@@ -1138,6 +1627,17 @@ KeyValue load(std::filesystem::path const& path, ReadOptions const& options = {}
 std::vector<KeyValue> parse_all(std::string_view data, ReadOptions const& options = {});
 std::vector<KeyValue> parse_all(std::istream& is, ReadOptions const& options = {});
 std::vector<KeyValue> load_all(std::filesystem::path const& path, ReadOptions const& options = {});
+#endif
+
+/// The non-throwing versions of parse(), load(), parse_all() and load_all(): the
+/// error that they throw is returned instead, with the same message.
+/// `if (auto doc = EasyVDF::try_load(path)) use(*doc); else report(doc.error());`
+Result<KeyValue> try_parse(std::string_view data, ReadOptions const& options = {});
+Result<KeyValue> try_parse(std::istream& is, ReadOptions const& options = {});
+Result<KeyValue> try_load(std::filesystem::path const& path, ReadOptions const& options = {});
+Result<std::vector<KeyValue>> try_parse_all(std::string_view data, ReadOptions const& options = {});
+Result<std::vector<KeyValue>> try_parse_all(std::istream& is, ReadOptions const& options = {});
+Result<std::vector<KeyValue>> try_load_all(std::filesystem::path const& path, ReadOptions const& options = {});
 
 /// Prints a value: the text of a scalar (`std::cout << doc["name"]`), the
 /// `{ ... }` block of an object, nothing for a node without value.
@@ -1384,7 +1884,7 @@ inline Details::Children& Node::MakeChildren()
     if (Details::Children* c = ChildrenPtr())
         return *c;
 
-    throw TypeError(std::string("EasyVDF: a ") + Details::TypeName(type()) + " value has no children");
+    Details::Raise(ErrorInfo(ErrorCode::Type, std::string("EasyVDF: a ") + Details::TypeName(type()) + " value has no children"));
 }
 
 inline void Node::Promote(Details::Children& children)
@@ -1423,18 +1923,40 @@ inline Node& Node::operator[](std::string_view key)
     return *c.pending.back();
 }
 
-inline Node const& Node::at(std::string_view key) const
+namespace Details {
+
+inline ErrorInfo KeyNotFound(std::string_view key)
+{
+    return ErrorInfo(ErrorCode::Key, "EasyVDF: key \"" + std::string(key) + "\" not found");
+}
+
+} // namespace Details
+
+inline Result<Node const&> Node::try_at(std::string_view key) const
 {
     if (KeyValue const* child = find(key))
-        return *child;
+        return static_cast<Node const&>(*child);
+    return Details::KeyNotFound(key);
+}
 
-    throw KeyError("EasyVDF: key \"" + std::string(key) + "\" not found");
+inline Result<Node&> Node::try_at(std::string_view key)
+{
+    if (KeyValue* child = find(key))
+        return static_cast<Node&>(*child);
+    return Details::KeyNotFound(key);
+}
+
+#ifndef EASYVDF_NO_EXCEPTIONS
+inline Node const& Node::at(std::string_view key) const
+{
+    return try_at(key).value();
 }
 
 inline Node& Node::at(std::string_view key)
 {
-    return const_cast<Node&>(std::as_const(*this).at(key));
+    return try_at(key).value();
 }
+#endif
 
 inline std::size_t Node::count(std::string_view key) const noexcept
 {
@@ -1645,6 +2167,8 @@ class Reader
     uint32_t m_Crc = 0;
     const char* m_CrcMark = nullptr;
 
+    bool m_ReadFailed = false;
+
     bool Fill()
     {
         if (m_InPushback)
@@ -1663,9 +2187,16 @@ class Reader
             m_Crc = Crc32Update(m_Crc, m_CrcMark, static_cast<std::size_t>(m_Current - m_CrcMark));
 
         m_Stream->read(&m_Buffer[0], static_cast<std::streamsize>(m_Buffer.size()));
-        // The end of the stream is expected, a read error is not.
+        // The end of the stream is expected, a read error is not: it ends the input
+        // here, and ReadFailed() tells the caller to report it instead of the result.
         if (m_Stream->bad())
-            throw IoError("EasyVDF: failed to read the input stream");
+        {
+            m_ReadFailed = true;
+            m_Stream = nullptr;
+            m_Current = m_End = m_Buffer.data();
+            m_CrcMark = m_Current;
+            return false;
+        }
 
         m_Current = m_Buffer.data();
         m_End = m_Current + m_Stream->gcount();
@@ -1686,6 +2217,9 @@ public:
 
     Reader(Reader const&) = delete;
     Reader& operator=(Reader const&) = delete;
+
+    /// True once the stream reported a read error; the input looks ended from then on.
+    bool ReadFailed() const noexcept { return m_ReadFailed; }
 
     /// Next byte without consuming it, -1 at the end of the input.
     int Peek()
@@ -1792,6 +2326,14 @@ class BinaryParser
     Reader& m_Reader;
     ReadOptions const& m_Options;
     std::string m_Scratch;
+    std::optional<ErrorInfo> m_Error;
+
+    // Records the error, returns false: `return Fail(...);`
+    bool Fail(ErrorCode code, std::string message)
+    {
+        m_Error.emplace(code, std::move(message));
+        return false;
+    }
 
     // Reads a null terminated string; a binary string is an opaque byte sequence.
     bool ReadString(std::string& out)
@@ -1832,7 +2374,7 @@ class BinaryParser
 
     // Parses the children of root, down to the end marker of root. Not recursive:
     // the objects being parsed are kept in a stack, nested input can't overflow ours.
-    void ParseObjects(KeyValue& root)
+    bool ParseObjects(KeyValue& root)
     {
         std::vector<KeyValue*> open{ &root };
         std::string key;
@@ -1843,7 +2385,7 @@ class BinaryParser
 
             const int type = m_Reader.Get();
             if (type < 0)
-                throw ParseError("Premature end of file: missing end marker of binary object \"" + name + "\"");
+                return Fail(ErrorCode::UnexpectedEof, "Premature end of file: missing end marker of binary object \"" + name + "\"");
 
             switch (type)
             {
@@ -1868,29 +2410,29 @@ class BinaryParser
                 case BinaryBlob:
                     // The known implementations disagree on the encoding of these
                     // two types and Valve's public code does not read them.
-                    throw ParseError("Unsupported binary VDF node type " + std::to_string(type)
+                    return Fail(ErrorCode::UnsupportedNodeType, "Unsupported binary VDF node type " + std::to_string(type)
                         + (type == BinaryWideString ? " (WideString)" : " (binary blob)") + " in binary object \"" + name + "\"");
 
                 default:
-                    throw ParseError("Unknown binary VDF node type " + std::to_string(type) + " in binary object \"" + name + "\"");
+                    return Fail(ErrorCode::UnknownNodeType, "Unknown binary VDF node type " + std::to_string(type) + " in binary object \"" + name + "\"");
             }
 
             if (!ReadString(key))
-                throw ParseError("Premature end of file while parsing a key of binary object \"" + name + "\"");
+                return Fail(ErrorCode::UnexpectedEof, "Premature end of file while parsing a key of binary object \"" + name + "\"");
 
             char raw[8];
             switch (type)
             {
                 case BinaryObject:
                     if (open.size() >= m_Options.max_depth)
-                        throw ParseError("Binary object \"" + key + "\" is nested deeper than the limit of " + std::to_string(m_Options.max_depth) + " levels");
+                        return Fail(ErrorCode::DepthExceeded, "Binary object \"" + key + "\" is nested deeper than the limit of " + std::to_string(m_Options.max_depth) + " levels");
 
                     open.push_back(&object.add(std::move(key)));
                     break;
 
                 case BinaryString:
                     if (!ReadString(m_Scratch))
-                        throw ParseError("Premature end of file while parsing the value of key \"" + key + "\"");
+                        return Fail(ErrorCode::UnexpectedEof, "Premature end of file while parsing the value of key \"" + key + "\"");
 
                     object.add(std::move(key), Node(m_Scratch));
                     break;
@@ -1899,7 +2441,7 @@ class BinaryParser
                 {
                     const std::size_t size = (type == BinaryInt64 || type == BinaryUInt64) ? 8 : 4;
                     if (!ReadBytes(raw, size))
-                        throw ParseError("Premature end of file while parsing the value of key \"" + key + "\"");
+                        return Fail(ErrorCode::UnexpectedEof, "Premature end of file while parsing the value of key \"" + key + "\"");
 
                     switch (type)
                     {
@@ -1915,6 +2457,7 @@ class BinaryParser
                 }
             }
         }
+        return true;
     }
 
 public:
@@ -1923,14 +2466,14 @@ public:
     {}
 
     /// vbkv: the "VBKV" magic was already consumed.
-    KeyValue Parse(bool vbkv)
+    Result<KeyValue> Parse(bool vbkv)
     {
         uint32_t stored_crc = 0;
         if (vbkv)
         {
             char raw[4];
             if (!ReadBytes(raw, 4))
-                throw ParseError("Premature end of file while reading the VBKV header");
+                return ErrorInfo(ErrorCode::UnexpectedEof, "Premature end of file while reading the VBKV header");
 
             stored_crc = LoadLittleEndian32(raw);
             m_Reader.StartCrc();
@@ -1938,29 +2481,30 @@ public:
 
         const int root_type = m_Reader.Get();
         if (root_type < 0)
-            throw ParseError("Premature end of file while parsing root binary object");
+            return ErrorInfo(ErrorCode::UnexpectedEof, "Premature end of file while parsing root binary object");
         if (root_type != BinaryObject)
-            throw ParseError("Binary root item type is not an object");
+            return ErrorInfo(ErrorCode::InvalidRoot, "Binary root item type is not an object");
 
         std::string name;
         if (!ReadString(name))
-            throw ParseError("Premature end of file while parsing root binary object name");
+            return ErrorInfo(ErrorCode::UnexpectedEof, "Premature end of file while parsing root binary object name");
 
         KeyValue root(std::move(name));
-        ParseObjects(root);
+        if (!ParseObjects(root))
+            return std::move(*m_Error);
 
         // Only one root object is allowed. Valve binary files commonly end with one
         // extra end marker after the root object end: accept a single one.
         const int root_end = vbkv ? BinaryAlternateEnd : BinaryEnd;
         const int trailing = m_Reader.Get();
         if (trailing >= 0 && ((trailing != BinaryEnd && trailing != root_end) || m_Reader.Peek() >= 0))
-            throw ParseError("Unexpected data after the binary root object");
+            return ErrorInfo(ErrorCode::TrailingData, "Unexpected data after the binary root object");
 
         if (vbkv && m_Options.verify_crc)
         {
             const uint32_t computed_crc = m_Reader.Crc();
             if (computed_crc != stored_crc)
-                throw ParseError("VBKV checksum mismatch: the header says " + Hex32(stored_crc) + ", the data gives " + Hex32(computed_crc));
+                return ErrorInfo(ErrorCode::ChecksumMismatch, "VBKV checksum mismatch: the header says " + Hex32(stored_crc) + ", the data gives " + Hex32(computed_crc));
         }
 
         return root;
@@ -1989,6 +2533,7 @@ class TextParser
     bool m_LastWasCr = false;
     Token m_Ahead;
     bool m_HasAhead = false;
+    std::optional<ErrorInfo> m_Error;
 
     // Consumes one byte and tracks the position. LF, CRLF and CR all end a line.
     int Get()
@@ -2017,21 +2562,24 @@ class TextParser
         return c;
     }
 
-    [[noreturn]] void Fail(std::string const& message, std::size_t line, std::size_t column) const
+    // Record the error and return false: `return Fail(...);`
+    bool Fail(ErrorCode code, std::string const& message, std::size_t line, std::size_t column)
     {
-        throw ParseError(message + " at line " + std::to_string(line) + ", column " + std::to_string(column), line, column);
+        m_Error.emplace(code, message + " at line " + std::to_string(line) + ", column " + std::to_string(column), line, column);
+        return false;
     }
 
-    [[noreturn]] void Fail(std::string const& message, Token const& token) const
+    bool Fail(ErrorCode code, std::string const& message, Token const& token)
     {
-        Fail(message, token.line, token.column);
+        return Fail(code, message, token.line, token.column);
     }
 
     // The end of file is reported on the last line that holds at least one character.
-    [[noreturn]] void FailAtEnd(std::string const& message) const
+    bool FailAtEnd(ErrorCode code, std::string const& message)
     {
         const std::size_t line = (m_Column == 1 && m_Line > 1) ? m_Line - 1 : m_Line;
-        throw ParseError("Unexpected end of file, " + message + " at line " + std::to_string(line), line, 0);
+        m_Error.emplace(code, "Unexpected end of file, " + message + " at line " + std::to_string(line), line, 0);
+        return false;
     }
 
     static bool EndsUnquoted(int c) noexcept
@@ -2039,22 +2587,22 @@ class TextParser
         return c < 0 || c == '"' || c == '{' || c == '}' || IsSpace(static_cast<char>(c));
     }
 
-    void ReadQuoted(Token& token)
+    bool ReadQuoted(Token& token)
     {
         for (;;)
         {
             int c = Get();
             if (c < 0)
-                Fail("Unexpected end of file in the quoted string started", token);
+                return Fail(ErrorCode::UnexpectedEof, "Unexpected end of file in the quoted string started", token);
 
             if (c == '"')
-                return;
+                return true;
 
             if (c == '\\' && m_Options.escapes)
             {
                 c = Get();
                 if (c < 0)
-                    Fail("Unexpected end of file in the quoted string started", token);
+                    return Fail(ErrorCode::UnexpectedEof, "Unexpected end of file in the quoted string started", token);
 
                 switch (c)
                 {
@@ -2083,13 +2631,13 @@ class TextParser
         }
     }
 
-    void Next(Token& token)
+    bool Next(Token& token)
     {
         if (m_HasAhead)
         {
             token = std::move(m_Ahead);
             m_HasAhead = false;
-            return;
+            return true;
         }
 
         token.text.clear();
@@ -2108,19 +2656,18 @@ class TextParser
             if (c < 0)
             {
                 token.kind = TokenKind::End;
-                return;
+                return true;
             }
 
             Get();
             switch (c)
             {
-                case '{': token.kind = TokenKind::Open; return;
-                case '}': token.kind = TokenKind::Close; return;
+                case '{': token.kind = TokenKind::Open; return true;
+                case '}': token.kind = TokenKind::Close; return true;
 
                 case '"':
                     token.kind = TokenKind::String;
-                    ReadQuoted(token);
-                    return;
+                    return ReadQuoted(token);
 
                 case '[':
                     token.kind = TokenKind::Condition;
@@ -2128,11 +2675,12 @@ class TextParser
                     {
                         c = m_Reader.Peek();
                         if (c < 0 || c == '\n' || c == '\r')
-                            Fail("Unterminated conditional, expected ']' on the same line as the '['", token);
+                            return Fail(c < 0 ? ErrorCode::UnexpectedEof : ErrorCode::Syntax,
+                                "Unterminated conditional, expected ']' on the same line as the '['", token);
 
                         Get();
                         if (c == ']')
-                            return;
+                            return true;
                         token.text += static_cast<char>(c);
                     }
 
@@ -2154,7 +2702,7 @@ class TextParser
             token.text += static_cast<char>(c);
             while (!EndsUnquoted(m_Reader.Peek()))
                 token.text += static_cast<char>(Get());
-            return;
+            return true;
         }
     }
 
@@ -2166,7 +2714,7 @@ class TextParser
 
     // Parses the members of root, down to its closing brace. Not recursive: the
     // objects being parsed are kept in a stack, nested input can't overflow ours.
-    void ParseMembers(KeyValue& root)
+    bool ParseMembers(KeyValue& root)
     {
         std::vector<KeyValue*> open{ &root };
         Token key, value;
@@ -2174,24 +2722,27 @@ class TextParser
         {
             KeyValue& object = *open.back();
 
-            Next(key);
+            if (!Next(key))
+                return false;
             if (key.kind == TokenKind::End)
-                FailAtEnd("expected object end ('}')");
+                return FailAtEnd(ErrorCode::UnexpectedEof, "expected object end ('}')");
             if (key.kind == TokenKind::Close)
             {
                 open.pop_back();
                 continue;
             }
             if (key.kind != TokenKind::String)
-                Fail("Expected a key or an object end ('}')", key);
+                return Fail(ErrorCode::Syntax, "Expected a key or an object end ('}')", key);
 
-            Next(value);
+            if (!Next(value))
+                return false;
             std::string condition;
             const bool has_condition = value.kind == TokenKind::Condition;
             if (has_condition)
             {// "key" [$COND] { ... }
                 condition = std::move(value.text);
-                Next(value);
+                if (!Next(value))
+                    return false;
             }
 
             switch (value.kind)
@@ -2199,7 +2750,7 @@ class TextParser
                 case TokenKind::Open:
                 {
                     if (open.size() >= m_Options.max_depth)
-                        Fail("Objects are nested deeper than the limit of " + std::to_string(m_Options.max_depth) + " levels", value);
+                        return Fail(ErrorCode::DepthExceeded, "Objects are nested deeper than the limit of " + std::to_string(m_Options.max_depth) + " levels", value);
 
                     KeyValue& child = object.add(std::move(key.text));
                     child.set_condition(condition);
@@ -2216,7 +2767,8 @@ class TextParser
                     }
                     else
                     {// "key" "value" [$COND]
-                        Next(value);
+                        if (!Next(value))
+                            return false;
                         if (value.kind == TokenKind::Condition)
                             child.set_condition(value.text);
                         else
@@ -2226,12 +2778,13 @@ class TextParser
                 }
 
                 case TokenKind::End:
-                    FailAtEnd("expected a value or an object start ('{') after key \"" + key.text + "\"");
+                    return FailAtEnd(ErrorCode::UnexpectedEof, "expected a value or an object start ('{') after key \"" + key.text + "\"");
 
                 default:
-                    Fail("Expected a value or an object start ('{') after key \"" + key.text + "\"", value);
+                    return Fail(ErrorCode::Syntax, "Expected a value or an object start ('{') after key \"" + key.text + "\"", value);
             }
         }
+        return true;
     }
 
     static bool IsDirective(Token const& token, Directive::Kind& kind) noexcept
@@ -2251,24 +2804,18 @@ class TextParser
         return false;
     }
 
-public:
-    TextParser(Reader& reader, ReadOptions const& options) :
-        m_Reader(reader), m_Options(options)
-    {}
-
-    /// Returns the root objects: exactly one, or one and more when multiple is set.
-    std::vector<KeyValue> Parse(bool multiple)
+    bool ParseRoots(bool multiple, std::vector<KeyValue>& roots)
     {
-        std::vector<KeyValue> roots;
         Token token, next;
-
         for (;;)
         {
-            Next(token);
+            if (!Next(token))
+                return false;
             if (token.kind == TokenKind::End)
                 break;
 
-            Next(next);
+            if (!Next(next))
+                return false;
 
             // #include "file" / #base "file": only meaningful next to the root object.
             Directive::Kind directive_kind = Directive::Kind::Include;
@@ -2281,49 +2828,70 @@ public:
 
             if (!roots.empty() && !multiple)
             {
-                throw ParseError("Unexpected data after root object at line " + std::to_string(token.line) + ", column " + std::to_string(token.column)
+                m_Error.emplace(ErrorCode::TrailingData,
+                    "Unexpected data after root object at line " + std::to_string(token.line) + ", column " + std::to_string(token.column)
                     + (token.kind == TokenKind::String && next.kind == TokenKind::Open ? ": the input holds several root objects, parse_all() / load_all() read them" : ""),
                     token.line, token.column);
+                return false;
             }
             if (token.kind != TokenKind::String)
-                Fail("Expected the root key", token);
+                return Fail(ErrorCode::Syntax, "Expected the root key", token);
 
             roots.emplace_back(std::move(token.text));
             KeyValue& root = roots.back();
             if (next.kind == TokenKind::Condition)
             {
                 root.set_condition(next.text);
-                Next(next);
+                if (!Next(next))
+                    return false;
             }
             if (next.kind == TokenKind::End)
-                FailAtEnd("expected object start ('{') after the root key");
+                return FailAtEnd(ErrorCode::UnexpectedEof, "expected object start ('{') after the root key");
             if (next.kind != TokenKind::Open)
-                Fail("Expected object start ('{') after the root key", next);
+                return Fail(ErrorCode::Syntax, "Expected object start ('{') after the root key", next);
 
-            ParseMembers(root);
+            if (!ParseMembers(root))
+                return false;
         }
 
         if (roots.empty())
-            FailAtEnd("expected the root key (the input holds no object)");
+            return FailAtEnd(ErrorCode::EmptyInput, "expected the root key (the input holds no object)");
 
+        return true;
+    }
+
+public:
+    TextParser(Reader& reader, ReadOptions const& options) :
+        m_Reader(reader), m_Options(options)
+    {}
+
+    /// Returns the root objects: exactly one, or one and more when multiple is set.
+    Result<std::vector<KeyValue>> Parse(bool multiple)
+    {
+        std::vector<KeyValue> roots;
+        if (!ParseRoots(multiple, roots))
+            return std::move(*m_Error);
         return roots;
     }
 };
 
 /// Detects the format and parses the input. multiple: accept several root
 /// objects (text only, a binary document always holds one).
-inline std::vector<KeyValue> ParseDocument(Reader& reader, ReadOptions const& options, bool multiple)
+inline Result<std::vector<KeyValue>> ParseInput(Reader& reader, ReadOptions const& options, bool multiple)
 {
-    auto single = [](KeyValue&& root)
+    auto single = [](Result<KeyValue>&& root) -> Result<std::vector<KeyValue>>
     {
+        if (!root)
+            return std::move(root).error();
+
         std::vector<KeyValue> roots;
-        roots.push_back(std::move(root));
+        roots.push_back(std::move(*root));
         return roots;
     };
 
     const int first = reader.Peek();
     if (first < 0)
-        throw ParseError("Empty input: expected a text or binary VDF document");
+        return ErrorInfo(ErrorCode::EmptyInput, "Empty input: expected a text or binary VDF document");
 
     if (options.format != Format::Text)
     {
@@ -2357,7 +2925,7 @@ inline std::vector<KeyValue> ParseDocument(Reader& reader, ReadOptions const& op
         const int a = reader.Get();
         const int b = reader.Peek();
         if ((a == 0xFF && b == 0xFE) || (a == 0xFE && b == 0xFF))
-            throw ParseError("UTF-16 text is not supported, convert the file to UTF-8", 1, 1);
+            return ErrorInfo(ErrorCode::UnsupportedEncoding, "UTF-16 text is not supported, convert the file to UTF-8", 1, 1);
 
         reader.Unread(std::string(1, static_cast<char>(a)));
     }
@@ -2365,16 +2933,40 @@ inline std::vector<KeyValue> ParseDocument(Reader& reader, ReadOptions const& op
     return TextParser(reader, options).Parse(multiple);
 }
 
+/// ParseInput(), with the read errors of a stream: the input ends where the
+/// stream failed, whatever was parsed up to there is replaced by an Io error.
+inline Result<std::vector<KeyValue>> ParseDocument(Reader& reader, ReadOptions const& options, bool multiple)
+{
+    Result<std::vector<KeyValue>> result = ParseInput(reader, options, multiple);
+    if (reader.ReadFailed())
+        return ErrorInfo(ErrorCode::Io, "EasyVDF: failed to read the input stream");
+    return result;
+}
+
+/// One root object: the single root of a document.
+inline Result<KeyValue> ParseSingle(Reader& reader, ReadOptions const& options)
+{
+    Result<std::vector<KeyValue>> roots = ParseDocument(reader, options, false);
+    if (!roots)
+        return std::move(roots).error();
+    return std::move(roots->front());
+}
+
 /////////////////////////////////////////////////////////////////////
 // Writers
 /////////////////////////////////////////////////////////////////////
-inline void AppendQuoted(std::string& out, std::string_view text, bool escapes)
+// The writers return false when the tree can't be written: a '"' in a text
+// string with escape sequences disabled, a null character in a binary string.
+inline constexpr const char* QuoteWithoutEscapesError = "EasyVDF: can't write a string containing '\"' with escape sequences disabled";
+inline constexpr const char* NullInBinaryError = "EasyVDF: can't write a key or a string containing a null character in binary";
+
+[[nodiscard]] inline bool AppendQuoted(std::string& out, std::string_view text, bool escapes)
 {
     out += '"';
     if (!escapes)
     {
         if (text.find('"') != std::string_view::npos)
-            throw WriteError("EasyVDF: can't write a string containing '\"' with escape sequences disabled");
+            return false;
         out += text;
     }
     else
@@ -2392,24 +2984,30 @@ inline void AppendQuoted(std::string& out, std::string_view text, bool escapes)
         }
     }
     out += '"';
+    return true;
 }
 
-inline void WriteText(std::string& out, KeyValue const& item, std::size_t depth, bool escapes);
+[[nodiscard]] inline bool WriteText(std::string& out, KeyValue const& item, std::size_t depth, bool escapes);
 
-inline void WriteTextBlock(std::string& out, Node const& object, std::size_t depth, bool escapes)
+[[nodiscard]] inline bool WriteTextBlock(std::string& out, Node const& object, std::size_t depth, bool escapes)
 {
     out.append(depth, '\t');
     out += "{\n";
     for (KeyValue const& child : object)
-        WriteText(out, child, depth + 1, escapes);
+    {
+        if (!WriteText(out, child, depth + 1, escapes))
+            return false;
+    }
     out.append(depth, '\t');
     out += "}\n";
+    return true;
 }
 
-inline void WriteText(std::string& out, KeyValue const& item, std::size_t depth, bool escapes)
+inline bool WriteText(std::string& out, KeyValue const& item, std::size_t depth, bool escapes)
 {
     out.append(depth, '\t');
-    AppendQuoted(out, item.key(), escapes);
+    if (!AppendQuoted(out, item.key(), escapes))
+        return false;
 
     if (item.is_object())
     {
@@ -2420,12 +3018,13 @@ inline void WriteText(std::string& out, KeyValue const& item, std::size_t depth,
             out += ']';
         }
         out += '\n';
-        WriteTextBlock(out, item, depth, escapes);
-        return;
+        return WriteTextBlock(out, item, depth, escapes);
     }
 
     out += "\t\t";
-    AppendQuoted(out, item.as<std::string>(), escapes);
+    // Every scalar converts to a string.
+    if (!AppendQuoted(out, item.value_or(std::string()), escapes))
+        return false;
     if (!item.condition().empty())
     {
         out += "\t\t[";
@@ -2433,81 +3032,94 @@ inline void WriteText(std::string& out, KeyValue const& item, std::size_t depth,
         out += ']';
     }
     out += '\n';
+    return true;
 }
 
-inline void AppendBinaryString(std::string& out, std::string_view text)
+[[nodiscard]] inline bool AppendBinaryString(std::string& out, std::string_view text)
 {
     if (text.find('\0') != std::string_view::npos)
-        throw WriteError("EasyVDF: can't write a key or a string containing a null character in binary");
+        return false;
 
     out += text;
     out += '\0';
+    return true;
 }
 
-inline void WriteBinary(std::string& out, KeyValue const& item, char object_end)
+// The values are read with try_as<T>() on a node of the matching type: they always convert.
+[[nodiscard]] inline bool WriteBinary(std::string& out, KeyValue const& item, char object_end)
 {
     switch (item.type())
     {
         case Type::Object:
             out += static_cast<char>(BinaryObject);
-            AppendBinaryString(out, item.key());
+            if (!AppendBinaryString(out, item.key()))
+                return false;
             for (KeyValue const& child : item)
-                WriteBinary(out, child, object_end);
+            {
+                if (!WriteBinary(out, child, object_end))
+                    return false;
+            }
             out += object_end;
-            break;
+            return true;
 
         case Type::String:
             out += static_cast<char>(BinaryString);
-            AppendBinaryString(out, item.key());
-            AppendBinaryString(out, item.as<std::string_view>());
-            break;
+            return AppendBinaryString(out, item.key())
+                && AppendBinaryString(out, item.try_as<std::string_view>().value_or(std::string_view()));
 
         case Type::Int32:
             out += static_cast<char>(BinaryInt32);
-            AppendBinaryString(out, item.key());
-            AppendLittleEndian32(out, BitCast<uint32_t>(item.as<int32_t>()));
-            break;
+            if (!AppendBinaryString(out, item.key()))
+                return false;
+            AppendLittleEndian32(out, BitCast<uint32_t>(item.try_as<int32_t>().value_or(0)));
+            return true;
 
         case Type::Float:
             out += static_cast<char>(BinaryFloat);
-            AppendBinaryString(out, item.key());
-            AppendLittleEndian32(out, BitCast<uint32_t>(item.as<float>()));
-            break;
+            if (!AppendBinaryString(out, item.key()))
+                return false;
+            AppendLittleEndian32(out, BitCast<uint32_t>(item.try_as<float>().value_or(0.f)));
+            return true;
 
         case Type::Pointer:
             out += static_cast<char>(BinaryPointer);
-            AppendBinaryString(out, item.key());
-            AppendLittleEndian32(out, item.as<Pointer>().value);
-            break;
+            if (!AppendBinaryString(out, item.key()))
+                return false;
+            AppendLittleEndian32(out, item.try_as<Pointer>().value_or(Pointer()).value);
+            return true;
 
         case Type::Color:
         {
-            const Color color = item.as<Color>();
+            const Color color = item.try_as<Color>().value_or(Color());
             out += static_cast<char>(BinaryColor);
-            AppendBinaryString(out, item.key());
+            if (!AppendBinaryString(out, item.key()))
+                return false;
             out += static_cast<char>(color.r);
             out += static_cast<char>(color.g);
             out += static_cast<char>(color.b);
             out += static_cast<char>(color.a);
-            break;
+            return true;
         }
 
         case Type::UInt64:
             out += static_cast<char>(BinaryUInt64);
-            AppendBinaryString(out, item.key());
-            AppendLittleEndian64(out, item.as<uint64_t>());
-            break;
+            if (!AppendBinaryString(out, item.key()))
+                return false;
+            AppendLittleEndian64(out, item.try_as<uint64_t>().value_or(0));
+            return true;
 
         case Type::Int64:
             out += static_cast<char>(BinaryInt64);
-            AppendBinaryString(out, item.key());
-            AppendLittleEndian64(out, BitCast<uint64_t>(item.as<int64_t>()));
-            break;
+            if (!AppendBinaryString(out, item.key()))
+                return false;
+            AppendLittleEndian64(out, BitCast<uint64_t>(item.try_as<int64_t>().value_or(0)));
+            return true;
 
         case Type::None:
             // Children without value are never iterated; only a root can get here.
             break;
     }
+    return true;
 }
 
 } // namespace Details
@@ -2520,10 +3132,11 @@ inline void WriteBinary(std::string& out, KeyValue const& item, char object_end)
 
 namespace Details {
 
-/// A path for an error message. Never throws for a path that the narrow
+/// A path for an error message. Never fails for a path that the narrow
 /// character set can't represent (Windows).
 inline std::string PathText(std::filesystem::path const& path)
 {
+#ifndef EASYVDF_NO_EXCEPTIONS
     try
     {
         return path.string();
@@ -2532,31 +3145,45 @@ inline std::string PathText(std::filesystem::path const& path)
     {
         return "<path>";
     }
+#else
+    // path.string() can't report a conversion error without exceptions: UTF-8 always converts.
+    std::string text;
+    for (auto c : path.u8string())
+        text += static_cast<char>(c);
+    return text;
+#endif
+}
+
+inline ErrorInfo OpenForReadingError(std::filesystem::path const& path)
+{
+    return ErrorInfo(ErrorCode::Io, "EasyVDF: can't open \"" + PathText(path) + "\" for reading");
 }
 
 } // namespace Details
 
-inline std::string KeyValue::dump(WriteOptions const& options) const
+inline Result<std::string> KeyValue::try_dump(WriteOptions const& options) const
 {
     // VDF has no representation for a key without a value, and a document is an object.
     if (!has_value())
-        throw WriteError("EasyVDF: can't write a document without value (Type::None)");
+        return ErrorInfo(ErrorCode::Write, "EasyVDF: can't write a document without value (Type::None)");
     if (!is_object())
-        throw WriteError(std::string("EasyVDF: can't write a document whose root is a ") + Details::TypeName(type()) + ", it must be an object");
+        return ErrorInfo(ErrorCode::Write, std::string("EasyVDF: can't write a document whose root is a ") + Details::TypeName(type()) + ", it must be an object");
 
     std::string out;
     switch (options.format)
     {
         case Format::Auto:
         case Format::Text:
-            Details::WriteText(out, *this, 0, options.escapes);
+            if (!Details::WriteText(out, *this, 0, options.escapes))
+                return ErrorInfo(ErrorCode::Write, Details::QuoteWithoutEscapesError);
             break;
 
         // Valve writes the root as a list of peer objects that is closed by one more end
         // marker: Steam files end with 08 08 (stats schemas, shortcuts.vdf) and VBKV files
         // with 0B 0B (Dota 2 remote cfg). Write the same so files round-trip byte for byte.
         case Format::Binary:
-            Details::WriteBinary(out, *this, static_cast<char>(Details::BinaryEnd));
+            if (!Details::WriteBinary(out, *this, static_cast<char>(Details::BinaryEnd)))
+                return ErrorInfo(ErrorCode::Write, Details::NullInBinaryError);
             out.push_back(static_cast<char>(Details::BinaryEnd));
             break;
 
@@ -2564,7 +3191,8 @@ inline std::string KeyValue::dump(WriteOptions const& options) const
         {
             out.append(Details::VbkvMagic, sizeof(Details::VbkvMagic));
             out.append(4, '\0');
-            Details::WriteBinary(out, *this, static_cast<char>(Details::BinaryAlternateEnd));
+            if (!Details::WriteBinary(out, *this, static_cast<char>(Details::BinaryAlternateEnd)))
+                return ErrorInfo(ErrorCode::Write, Details::NullInBinaryError);
             out.push_back(static_cast<char>(Details::BinaryAlternateEnd));
 
             // CRC32 of everything after the 8 bytes header (end markers included), little-endian.
@@ -2577,76 +3205,133 @@ inline std::string KeyValue::dump(WriteOptions const& options) const
     return out;
 }
 
+inline Result<void> KeyValue::try_write(std::ostream& os, WriteOptions const& options) const
+{
+    Result<std::string> data = try_dump(options);
+    if (!data)
+        return std::move(data).error();
+
+    os.write(data->data(), static_cast<std::streamsize>(data->size()));
+    return {};
+}
+
+inline Result<void> KeyValue::try_save(std::filesystem::path const& path, WriteOptions const& options) const
+{
+    // Serialize first: nothing is created or truncated if the tree can't be written.
+    Result<std::string> data = try_dump(options);
+    if (!data)
+        return std::move(data).error();
+
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file)
+        return ErrorInfo(ErrorCode::Io, "EasyVDF: can't open \"" + Details::PathText(path) + "\" for writing");
+
+    file.write(data->data(), static_cast<std::streamsize>(data->size()));
+    file.close();
+    if (!file)
+        return ErrorInfo(ErrorCode::Io, "EasyVDF: failed to write \"" + Details::PathText(path) + "\"");
+    return {};
+}
+
+inline Result<KeyValue> try_parse(std::string_view data, ReadOptions const& options)
+{
+    Details::Reader reader(data);
+    return Details::ParseSingle(reader, options);
+}
+
+inline Result<KeyValue> try_parse(std::istream& is, ReadOptions const& options)
+{
+    Details::Reader reader(is, options.chunk_size);
+    return Details::ParseSingle(reader, options);
+}
+
+inline Result<KeyValue> try_load(std::filesystem::path const& path, ReadOptions const& options)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return Details::OpenForReadingError(path);
+
+    return try_parse(file, options);
+}
+
+inline Result<std::vector<KeyValue>> try_parse_all(std::string_view data, ReadOptions const& options)
+{
+    Details::Reader reader(data);
+    return Details::ParseDocument(reader, options, true);
+}
+
+inline Result<std::vector<KeyValue>> try_parse_all(std::istream& is, ReadOptions const& options)
+{
+    Details::Reader reader(is, options.chunk_size);
+    return Details::ParseDocument(reader, options, true);
+}
+
+inline Result<std::vector<KeyValue>> try_load_all(std::filesystem::path const& path, ReadOptions const& options)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return Details::OpenForReadingError(path);
+
+    return try_parse_all(file, options);
+}
+
+#ifndef EASYVDF_NO_EXCEPTIONS
+// The throwing API: the try_* functions, with the error thrown by Result::value().
+
+inline std::string KeyValue::dump(WriteOptions const& options) const
+{
+    return try_dump(options).value();
+}
+
 inline void KeyValue::write(std::ostream& os, WriteOptions const& options) const
 {
-    const std::string data = dump(options);
-    os.write(data.data(), static_cast<std::streamsize>(data.size()));
+    try_write(os, options).value();
 }
 
 inline void KeyValue::save(std::filesystem::path const& path, WriteOptions const& options) const
 {
-    // Serialize first: nothing is created or truncated if the tree can't be written.
-    const std::string data = dump(options);
-
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file)
-        throw IoError("EasyVDF: can't open \"" + Details::PathText(path) + "\" for writing");
-
-    file.write(data.data(), static_cast<std::streamsize>(data.size()));
-    file.close();
-    if (!file)
-        throw IoError("EasyVDF: failed to write \"" + Details::PathText(path) + "\"");
+    try_save(path, options).value();
 }
 
 inline KeyValue parse(std::string_view data, ReadOptions const& options)
 {
-    Details::Reader reader(data);
-    return std::move(Details::ParseDocument(reader, options, false).front());
+    return try_parse(data, options).value();
 }
 
 inline KeyValue parse(std::istream& is, ReadOptions const& options)
 {
-    Details::Reader reader(is, options.chunk_size);
-    return std::move(Details::ParseDocument(reader, options, false).front());
+    return try_parse(is, options).value();
 }
 
 inline KeyValue load(std::filesystem::path const& path, ReadOptions const& options)
 {
-    std::ifstream file(path, std::ios::binary);
-    if (!file)
-        throw IoError("EasyVDF: can't open \"" + Details::PathText(path) + "\" for reading");
-
-    return parse(file, options);
+    return try_load(path, options).value();
 }
 
 inline std::vector<KeyValue> parse_all(std::string_view data, ReadOptions const& options)
 {
-    Details::Reader reader(data);
-    return Details::ParseDocument(reader, options, true);
+    return try_parse_all(data, options).value();
 }
 
 inline std::vector<KeyValue> parse_all(std::istream& is, ReadOptions const& options)
 {
-    Details::Reader reader(is, options.chunk_size);
-    return Details::ParseDocument(reader, options, true);
+    return try_parse_all(is, options).value();
 }
 
 inline std::vector<KeyValue> load_all(std::filesystem::path const& path, ReadOptions const& options)
 {
-    std::ifstream file(path, std::ios::binary);
-    if (!file)
-        throw IoError("EasyVDF: can't open \"" + Details::PathText(path) + "\" for reading");
-
-    return parse_all(file, options);
+    return try_load_all(path, options).value();
 }
+#endif // EASYVDF_NO_EXCEPTIONS
 
 inline std::ostream& operator<<(std::ostream& os, Node const& node)
 {
+    // Escape sequences are on: writing can't fail.
     std::string text;
     if (node.is_object())
-        Details::WriteTextBlock(text, node, 0, true);
-    else if (node.has_value())
-        text = node.as<std::string>();
+        static_cast<void>(Details::WriteTextBlock(text, node, 0, true));
+    else
+        text = node.value_or(std::string());
 
     return os.write(text.data(), static_cast<std::streamsize>(text.size()));
 }
@@ -2655,7 +3340,7 @@ inline std::ostream& operator<<(std::ostream& os, KeyValue const& entry)
 {
     std::string text;
     if (entry.has_value())
-        Details::WriteText(text, entry, 0, true);
+        static_cast<void>(Details::WriteText(text, entry, 0, true));
 
     return os.write(text.data(), static_cast<std::streamsize>(text.size()));
 }
