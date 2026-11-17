@@ -348,13 +348,21 @@ bool ParseInteger(std::string_view s, T& out) noexcept
     return IntegerCast(static_cast<int64_t>(~magnitude + 1), out);
 }
 
-/// Parses a whole string as a floating point number, independently of the global locale.
-inline bool ParseDouble(std::string_view s, double& out)
+/// Parses a whole string as a floating point number, independently of the global
+/// locale: optional sign, decimal or scientific notation, surrounding blanks ignored.
+/// False if it is not a number or if it is out of the range of T.
+template<typename T>
+bool ParseFloating(std::string_view s, T& out)
 {
     s = Trim(s);
     if (!s.empty() && s.front() == '+')
+    {
         s.remove_prefix(1);
-    if (s.empty())
+        if (!s.empty() && (s.front() == '+' || s.front() == '-'))
+            return false;
+    }
+    // Hexadecimal floats are refused everywhere (some stream implementations take them).
+    if (s.empty() || s.find_first_of("xX") != std::string_view::npos)
         return false;
 
 #if EASYVDF_HAS_FLOAT_CHARCONV
@@ -377,25 +385,35 @@ void AppendInteger(std::string& out, T value)
     out.append(buffer, result.ptr);
 }
 
-/// Appends the shortest text that parses back to exactly the same float.
+/// Appends the shortest text that parses back to exactly the same float, in
+/// plain decimal notation ("100000", "0.0001") unless the number is very large
+/// or very small ("1e+20", "1.5e-30").
 inline void AppendFloat(std::string& out, float value)
 {
+    const float magnitude = std::fabs(value);
+    const bool fixed = value == 0 || (magnitude >= 1e-4f && magnitude < 1e16f);
+
 #if EASYVDF_HAS_FLOAT_CHARCONV
     char buffer[64];
-    const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value);
+    const auto result = fixed
+        ? std::to_chars(buffer, buffer + sizeof(buffer), value, std::chars_format::fixed)
+        : std::to_chars(buffer, buffer + sizeof(buffer), value);
     out.append(buffer, result.ptr);
 #else
+    // The first precision whose text reads back as the same float.
     std::string text;
-    for (int precision = 6; precision <= 9; ++precision)
+    for (int precision = fixed ? 0 : 6; precision <= (fixed ? 20 : 9); ++precision)
     {
         std::ostringstream os;
         os.imbue(std::locale::classic());
+        if (fixed)
+            os.setf(std::ios_base::fixed, std::ios_base::floatfield);
         os.precision(precision);
         os << value;
         text = os.str();
 
-        double parsed = 0;
-        if (ParseDouble(text, parsed) && static_cast<float>(parsed) == value)
+        float parsed = 0;
+        if (ParseFloating(text, parsed) && parsed == value)
             break;
     }
     out += text;
@@ -623,6 +641,7 @@ public:
     std::size_t count(std::string_view key) const noexcept;
 
     /// Every child with this key, in order: `for (auto& value : node.all("key"))`.
+    /// The iterators of the returned range must not outlive it.
     Details::ChildRange<true> all(std::string_view key) const;
     Details::ChildRange<false> all(std::string_view key);
 
@@ -687,7 +706,25 @@ private:
         if constexpr (std::is_same_v<D, bool>)
             m_Value.template emplace<int32_t>(value ? 1 : 0);
         else if constexpr (std::is_floating_point_v<D>)
-            m_Value.template emplace<float>(static_cast<float>(value));
+        {
+            // Out of the range of a float: infinity, not an undefined conversion.
+            if constexpr (std::is_same_v<D, float>)
+            {
+                m_Value.template emplace<float>(value);
+            }
+            else
+            {
+                // Only values in range are converted (NaN goes through unchanged).
+                const D limit = static_cast<D>((std::numeric_limits<float>::max)());
+                const D clamped = value > limit ? limit : (value < -limit ? -limit : value);
+                float narrowed = static_cast<float>(clamped);
+                if (value > limit)
+                    narrowed = std::numeric_limits<float>::infinity();
+                else if (value < -limit)
+                    narrowed = -std::numeric_limits<float>::infinity();
+                m_Value.template emplace<float>(narrowed);
+            }
+        }
         else if constexpr (std::is_integral_v<D> && std::is_signed_v<D>)
         {
             if constexpr (sizeof(D) <= sizeof(int32_t))
@@ -792,7 +829,19 @@ private:
             static_assert(!Details::IsCharacter<T>, "EasyVDF: as<T>() does not support character types, use an integer or a string");
             switch (t)
             {
-                case Type::Int32  : return Details::IntegerCast(*std::get_if<int32_t>(&m_Value), out);
+                case Type::Int32:
+                    // The binary format has no unsigned 32 bits type: Steam stores such
+                    // values (appid of a shortcut, ...) as Int32, so the 32 bits unsigned
+                    // types get the bit pattern instead of a range error.
+                    if constexpr (std::is_unsigned_v<T> && sizeof(T) == sizeof(uint32_t))
+                    {
+                        out = static_cast<T>(static_cast<uint32_t>(*std::get_if<int32_t>(&m_Value)));
+                        return true;
+                    }
+                    else
+                    {
+                        return Details::IntegerCast(*std::get_if<int32_t>(&m_Value), out);
+                    }
                 case Type::Int64  : return Details::IntegerCast(*std::get_if<int64_t>(&m_Value), out);
                 case Type::UInt64 : return Details::IntegerCast(*std::get_if<uint64_t>(&m_Value), out);
                 case Type::Pointer: return Details::IntegerCast(std::get_if<Pointer>(&m_Value)->value, out);
@@ -820,8 +869,14 @@ private:
                 case Type::Float : out = static_cast<T>(*std::get_if<float>(&m_Value)); return true;
                 case Type::String:
                 {
+                    // Parsed directly as T: going through a double could round twice.
+                    std::string const& text = *std::get_if<std::string>(&m_Value);
+                    if (Details::ParseFloating(text, out))
+                        return true;
+
+                    // Too small for T: zero, like any other rounding. Too big: no conversion.
                     double parsed = 0;
-                    if (!Details::ParseDouble(*std::get_if<std::string>(&m_Value), parsed))
+                    if (!Details::ParseFloating(text, parsed) || !(std::fabs(parsed) < 1.0))
                         return false;
                     out = static_cast<T>(parsed);
                     return true;
@@ -1104,7 +1159,7 @@ inline Children& Children::operator=(Children&&) noexcept = default;
 inline Children::~Children() = default;
 
 inline Children::Children(Children const& other) :
-    implicit(other.implicit)
+    implicit(false)
 {
     // Children without value are not part of the tree: they are not copied.
     std::size_t count = 0;
@@ -1117,6 +1172,8 @@ inline Children::Children(Children const& other) :
         if (other.slot(i)->has_value())
             items.push_back(std::make_unique<KeyValue>(*other.slot(i)));
     }
+    // An object with children exists for good; one without stays as it was.
+    implicit = other.implicit && items.empty();
 }
 
 inline Children& Children::operator=(Children const& other)
@@ -1135,7 +1192,9 @@ inline KeyValue* Children::slot(std::size_t i) const noexcept
 }
 
 /// Forward iterator over the children of an object that have a value,
-/// optionally restricted to one key. Stays valid when children are appended.
+/// optionally restricted to one key. Appending children (add(), assigning to a
+/// new key) keeps it valid; erasing or inserting children does not, use the
+/// iterator returned by Node::erase() / Node::insert().
 template<bool Const>
 class ChildIterator
 {
@@ -1435,6 +1494,10 @@ inline Node::iterator Node::erase(const_iterator pos)
     if (c == nullptr || pos.m_Index >= c->slots())
         return end();
 
+    // An object that exists keeps existing once emptied.
+    if (has_value())
+        c->implicit = false;
+
     if (pos.m_Index < c->items.size())
         c->items.erase(c->items.begin() + static_cast<std::ptrdiff_t>(pos.m_Index));
     else
@@ -1450,6 +1513,9 @@ inline std::size_t Node::erase(std::string_view key)
     {
         // key may point into a child that is about to be destroyed.
         const std::string owned_key(key);
+        // An object that exists keeps existing once emptied.
+        if (has_value())
+            c->implicit = false;
         auto matches = [&](std::unique_ptr<KeyValue> const& child)
         {
             if (child->key() != owned_key)
@@ -1467,6 +1533,8 @@ inline void Node::clear() noexcept
 {
     if (Details::Children* c = ChildrenPtr())
     {
+        if (has_value())
+            c->implicit = false;
         c->items.clear();
         c->pending.clear();
     }
@@ -1540,7 +1608,7 @@ inline bool operator==(Node const& l, Node const& r) noexcept
 /////////////////////////////////////////////////////////////////////
 namespace Details {
 
-static constexpr char VbkvMagic[4] = { 'V', 'B', 'K', 'V' };
+inline constexpr char VbkvMagic[4] = { 'V', 'B', 'K', 'V' };
 
 enum BinaryNodeType : unsigned char
 {
@@ -1595,6 +1663,10 @@ class Reader
             m_Crc = Crc32Update(m_Crc, m_CrcMark, static_cast<std::size_t>(m_Current - m_CrcMark));
 
         m_Stream->read(&m_Buffer[0], static_cast<std::streamsize>(m_Buffer.size()));
+        // The end of the stream is expected, a read error is not.
+        if (m_Stream->bad())
+            throw IoError("EasyVDF: failed to read the input stream");
+
         m_Current = m_Buffer.data();
         m_End = m_Current + m_Stream->gcount();
         m_CrcMark = m_Current;
@@ -2199,7 +2271,7 @@ public:
             Next(next);
 
             // #include "file" / #base "file": only meaningful next to the root object.
-            Directive::Kind directive_kind;
+            Directive::Kind directive_kind = Directive::Kind::Include;
             if (IsDirective(token, directive_kind) && next.kind == TokenKind::String)
             {
                 if (m_Options.directives != nullptr)

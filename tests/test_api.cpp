@@ -183,7 +183,9 @@ TEST_CASE("as<T>() converts between the stored types", "[api][conversions]")
         CHECK(n.as<bool>());
         CHECK(n.as<std::string>() == "-1337");
         CHECK_THROWS_AS(n.as<int8_t>(), TypeError);
-        CHECK_THROWS_AS(n.as<unsigned>(), TypeError);
+        // Int32 is how the binary format stores 32 bits unsigned values: same bits.
+        CHECK(n.as<uint32_t>() == 4294965959u);
+        CHECK_THROWS_AS(n.as<uint16_t>(), TypeError);
         CHECK_THROWS_AS(n.as<uint64_t>(), TypeError);
         CHECK_THROWS_AS(n.as<std::string_view>(), TypeError);
         CHECK_THROWS_AS(n.as<Color>(), TypeError);
@@ -996,4 +998,142 @@ TEST_CASE("Stream output", "[api][stream]")
     }
     CHECK(doc.dump() == doc.to_text());
     CHECK(doc.dump(EasyVDF::Format::Auto) == doc.to_text());
+}
+
+/////////////////////////////////////////////////////////////////////
+// Regressions found by review
+/////////////////////////////////////////////////////////////////////
+
+TEST_CASE("An object that got a value keeps existing once emptied", "[api][lookup]")
+{
+    KeyValue doc("root");
+
+    SECTION("erase by key")
+    {
+        doc["a"]["b"] = 1;
+        CHECK(doc["a"].erase("b") == 1);
+        CHECK(doc.contains("a"));
+        CHECK(doc["a"].is_object());
+        CHECK(doc["a"].empty());
+    }
+    SECTION("erase by iterator")
+    {
+        doc["a"]["b"] = 1;
+        Node& a = doc["a"];
+        a.erase(std::as_const(a).begin());
+        CHECK(doc.contains("a"));
+        CHECK(a.is_object());
+    }
+    SECTION("clear")
+    {
+        doc["a"]["b"] = 1;
+        doc["a"].clear();
+        CHECK(doc["a"].is_object());
+        CHECK(doc.to_text() == "\"root\"\n{\n\t\"a\"\n\t{\n\t}\n}\n");
+    }
+    SECTION("copies behave the same")
+    {
+        doc["a"]["b"] = 1;
+        KeyValue copy(doc);
+        copy["a"].erase("b");
+        CHECK(copy.contains("a"));
+        CHECK(copy["a"].is_object());
+    }
+    SECTION("an object that never had a value does not appear")
+    {
+        CHECK(doc["a"]["b"].is_none());
+        CHECK(doc["a"].erase("b") == 0);
+        doc["a"].clear();
+        CHECK_FALSE(doc.contains("a"));
+        CHECK(KeyValue(doc).empty());
+    }
+}
+
+TEST_CASE("Floating point text is plain decimal when reasonable", "[api][float]")
+{
+    CHECK(Node(100000.f).as<std::string>() == "100000");
+    CHECK(Node(1e10f).as<std::string>() == "10000000000");
+    CHECK(Node(0.0001f).as<std::string>() == "0.0001");
+    CHECK(Node(-0.5f).as<std::string>() == "-0.5");
+    CHECK(Node(16777216.f).as<std::string>() == "16777216");
+    CHECK(Node(1234567.875f).as<std::string>() == "1234567.9");
+    // Very large or very small numbers use the scientific notation.
+    CHECK(Node(1e20f).as<std::string>().find('e') != std::string::npos);
+    CHECK(Node(1.5e-30f).as<std::string>().find('e') != std::string::npos);
+    CHECK(Node(Node(1e20f).as<std::string>()).as<float>() == 1e20f);
+    CHECK(Node(Node(1.5e-30f).as<std::string>()).as<float>() == 1.5e-30f);
+
+    // Strings are parsed as the requested type, with its range.
+    CHECK_THROWS_AS(Node("1e39").as<float>(), TypeError);
+    CHECK_THROWS_AS(Node("-1e39").as<float>(), TypeError);
+    CHECK(Node("1e39").as<double>() == 1e39);
+    CHECK_THROWS_AS(Node("1e999").as<double>(), TypeError);
+    CHECK(Node("1e-60").as<float>() == 0.f);
+    CHECK(Node("3.4028235e38").as<float>() == (std::numeric_limits<float>::max)());
+
+    // Malformed signs and hexadecimal floats are refused on every platform.
+    for (const char* bad : {"+-5", "++5", "-+5", "+", "0x10.8", "0x1p3", "0X10"})
+    {
+        INFO("'" << bad << "'");
+        CHECK_THROWS_AS(Node(bad).as<double>(), TypeError);
+        CHECK_THROWS_AS(Node(bad).as<float>(), TypeError);
+    }
+    CHECK(Node("+5").as<double>() == 5.0);
+    CHECK(Node("-5").as<float>() == -5.f);
+
+    // A double out of the range of a float is stored as an infinity.
+    CHECK(Node(1e300).as<float>() == std::numeric_limits<float>::infinity());
+    CHECK(Node(-1e300).as<float>() == -std::numeric_limits<float>::infinity());
+    CHECK(Node(static_cast<double>((std::numeric_limits<float>::max)())).as<float>() == (std::numeric_limits<float>::max)());
+}
+
+TEST_CASE("Int32 values read as 32 bits unsigned", "[api][conversions]")
+{
+    // The appid of a non-Steam shortcut, as stored in shortcuts.vdf.
+    const uint32_t appid = 3000000000u;
+    KeyValue shortcuts("shortcuts");
+    shortcuts.add("0").add("appid", static_cast<int32_t>(appid));
+
+    KeyValue parsed = EasyVDF::parse(shortcuts.to_binary());
+    CHECK(parsed["0"]["appid"].type() == Type::Int32);
+    CHECK(parsed["0"]["appid"].as<int32_t>() == -1294967296);
+    CHECK(parsed["0"]["appid"].as<uint32_t>() == appid);
+    CHECK(parsed["0"]["appid"].value_or<uint32_t>(0) == appid);
+    CHECK(parsed["0"]["appid"].try_as<uint32_t>() == appid);
+    // Only for the 32 bits unsigned types: everything else is range checked.
+    CHECK_THROWS_AS(parsed["0"]["appid"].as<uint64_t>(), TypeError);
+    CHECK_THROWS_AS(parsed["0"]["appid"].as<uint16_t>(), TypeError);
+    CHECK_THROWS_AS(Node("-1294967296").as<uint32_t>(), TypeError);
+    CHECK_THROWS_AS(Node(int64_t(-1294967296)).as<uint32_t>(), TypeError);
+}
+
+TEST_CASE("A stream read error is an IoError, not a truncated document", "[api][stream]")
+{
+    // Fails after a few bytes, like a device error in the middle of a file.
+    struct FailingBuffer : std::streambuf
+    {
+        std::string data = "\"root\" { \"k\" \"v\"";
+        std::size_t position = 0;
+        char current = 0;
+
+        int_type underflow() override
+        {
+            if (position == data.size())
+                throw std::runtime_error("device error");
+
+            current = data[position++];
+            setg(&current, &current, &current + 1);
+            return traits_type::to_int_type(current);
+        }
+    };
+
+    FailingBuffer buffer;
+    std::istream is(&buffer);
+    CHECK_THROWS_AS(EasyVDF::parse(is), EasyVDF::IoError);
+
+    // The end of a stream is not an error.
+    std::istringstream complete("\"root\" { \"k\" \"v\" }");
+    CHECK(EasyVDF::parse(complete)["k"].as<std::string>() == "v");
+    std::istringstream truncated("\"root\" { \"k\" \"v\"");
+    CHECK_THROWS_AS(EasyVDF::parse(truncated), EasyVDF::ParseError);
 }

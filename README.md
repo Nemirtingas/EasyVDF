@@ -236,7 +236,11 @@ std::string bytes = shortcuts.to_binary();                        // or Format::
 - **VBKV**: the header CRC is the standard CRC-32 (zlib) of every byte that follows the 8 bytes header.
   It is written, and checked when reading (`ParseError` on mismatch). Files written by tools that leave the
   CRC at zero can be read with `ReadOptions::verify_crc = false`.
-- Both end markers (`0x08`, `0x0B`) are accepted in both formats, and one extra end marker after the root object is tolerated.
+- Both end markers (`0x08`, `0x0B`) end an object in both formats. One extra end marker after the root object
+  is tolerated (`0x08`, or `0x0B` in a VBKV file); any other trailing data is a `ParseError`.
+- The format has no unsigned 32 bits type: Steam stores such values as `Int32` (the `appid` of a non-Steam
+  shortcut is a negative `Int32`). `as<uint32_t>()` on an `Int32` returns the same bits; every other integer
+  conversion is range checked. To write one, assign `static_cast<int32_t>(appid)` (a `uint32_t` is stored as `UInt64`).
 - `WideString` (type 5) and binary blobs (type 9) are rejected with a `ParseError`: the existing
   implementations disagree on their encoding and Valve's public code does not read them.
 
@@ -325,6 +329,13 @@ write_options.escapes = true;
 - A `Node` without value (`Type::None`) is what a missing key, a default constructed or a moved-from node is.
   A child without value is not part of its parent: it is not iterated, counted or written.
 - `Node::size()` is linear in the number of children.
+- Braces build objects: `Node copy(other)` copies, `Node wrapped{key_value}` is an object holding `key_value`.
+  `{}` is "no value"; an empty object is `Node::object()` (or `node.add("key")`).
+- A key requested through a non-const `operator[]` and never assigned stays allocated (invisible) until its
+  parent is cleared or destroyed, so that the reference you got stays valid. Use `find()` or a const reference
+  to probe a long-lived document for many different keys.
+- Floats are written in plain decimal notation (`100000`, `0.0001`), in scientific notation only when very
+  large or very small. A `double` is stored as a 32 bits float (infinity when out of range).
 - Text files do not store types: a document built with typed values and saved as text reads back as strings
   (`as<T>()` gives the values back).
 - Requires C++17 (`std::string_view`, `std::optional`, `std::variant`, structured bindings, `<charconv>`, `<filesystem>`).
