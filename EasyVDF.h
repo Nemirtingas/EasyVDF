@@ -1208,6 +1208,8 @@ inline void ValveDataObject::_ParseTextObject(std::istream& is, std::string& nam
     bool is_object = false;
     bool is_closed = false;
 
+    // Release any previous value so it can't leak.
+    o._ResetValue();
     o._Obj->_NameHash = std::hash<std::string>()(name);
     o._Obj->_Name = std::move(name);
     o._Obj->_U._Collection = new ValveCollection();
@@ -1587,6 +1589,7 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
     std::string object_name;
     int error;
     bool has_root_key = false;
+    bool has_root_object = false;
     BinaryNodeType binary_root_end = BinaryNodeType::ObjectEnd;
 
     is.read(&buffer[0], 4);
@@ -1622,6 +1625,11 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
             // Skip empty line
             if (buffer_start == buffer_end)
                 continue;
+
+            if (has_root_object)
+            {// Only blank lines may follow the root object.
+                throw ParserException("Got datas after root object at line " + std::to_string(line_num));
+            }
 
             if (!has_root_key)
             {
@@ -1659,6 +1667,7 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
 
                 _ParseTextObject(is, object_name, buffer, line_num, parsed_object);
                 has_root_key = false;
+                has_root_object = true;
             }
         }
 

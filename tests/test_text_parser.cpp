@@ -201,3 +201,29 @@ TEST_CASE("Text parser accepts an empty root key", "[text_parser][unexpected_eof
     REQUIRE(o["k"].size() == 1);
     CHECK(o["k"][0].String() == "v");
 }
+
+TEST_CASE("Text parser rejects data after the root object", "[text_parser][trailing_data]")
+{
+    using Catch::Matchers::Contains;
+
+    SECTION("Second root object")
+    {
+        CHECK_THROWS_AS(ParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n}\n\"other\"\n{\n}\n"), EasyVDF::ParserException);
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n}\n\"other\"\n{\n}\n"), Contains("after root object at line 5"));
+        CHECK_THROWS_WITH(ParseText("\"root\"\r\n{\r\n}\r\n\r\n\"other\"\r\n{\r\n}"), Contains("after root object at line 5"));
+    }
+    SECTION("Stray data")
+    {
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n}\n}\n"), Contains("after root object at line 4"));
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n}\n\n  x"), Contains("after root object at line 5"));
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n}\n\"k\"\t\"v\"\n"), Contains("after root object at line 4"));
+    }
+    SECTION("Blank lines after the root object are accepted")
+    {
+        auto o = ParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n}\n\n \t\n\r\n\r\t ");
+        REQUIRE(o.Type() == EasyVDF::ObjectType::Object);
+        CHECK(o.Name() == "root");
+        REQUIRE(o.Collection().size() == 1);
+        CHECK(o["k"][0].String() == "v");
+    }
+}
