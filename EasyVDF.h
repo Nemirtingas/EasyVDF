@@ -457,6 +457,9 @@ private:
 
     static void _ParseBinaryObject(std::istream& is, std::string& name, BinaryNodeType object_end, std::string& buffer, const char*& buffer_start, const char*& buffer_end, ValveDataObject& o);
 
+    // Throws SerializeException for the types that have no serialized form.
+    static void _CheckSerializable(ObjectType type);
+
     void _SerializeAsText(std::ostream& os, size_t depth) const;
 
     void _SerializeAsBinary(std::ostream& os, BinaryNodeType object_end, uint32_t crc) const;
@@ -1532,12 +1535,43 @@ inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& n
     }
 }
 
+inline void ValveDataObject::_CheckSerializable(ObjectType type)
+{
+    switch (type)
+    {
+        case ObjectType::Object:
+        case ObjectType::String:
+        case ObjectType::Int32:
+        case ObjectType::Float:
+        case ObjectType::Pointer:
+        case ObjectType::Color:
+        case ObjectType::UInt64:
+        case ObjectType::Int64:
+            return;
+
+        // VDF has no representation for a key without a value: refuse rather
+        // than silently dropping the key or writing an unreadable file.
+        case ObjectType::None:
+            throw SerializeException("Can't serialize a ValveDataObject without value (ObjectType::None).");
+
+        case ObjectType::WideString:
+            throw SerializeException("Can't serialize a ValveDataObject of type WideString: not supported.");
+
+        case ObjectType::Binary:
+            throw SerializeException("Can't serialize a ValveDataObject of type Binary: not supported.");
+    }
+    throw SerializeException("Can't serialize a ValveDataObject of unknown type.");
+}
+
 inline void ValveDataObject::_SerializeAsText(std::ostream& os, size_t depth) const
 {
+    ObjectType type = Type();
+    _CheckSerializable(type);
+
     std::string indent(depth, '\t');
 
     os << indent << '"' << Name() << '"';
-    switch (Type())
+    switch (type)
     {
         case ObjectType::Object:
             os << '\n' << indent << "{\n";
@@ -1555,17 +1589,20 @@ inline void ValveDataObject::_SerializeAsText(std::ostream& os, size_t depth) co
         case ObjectType::Int64  : os << "\t\t\"" << _Obj->_U._Int64         << "\"\n"; break;
         case ObjectType::UInt64 : os << "\t\t\"" << _Obj->_U._UInt64        << "\"\n"; break;
         case ObjectType::String : os << "\t\t\"" << *_Obj->_U._String       << "\"\n"; break;
-        
-        //case ObjectType::WideString: TODO;
-        //case ObjectType::Binary    : TODO;
-        
-        case ObjectType::None: break; // Warning fix.
+
+        // Rejected by _CheckSerializable.
+        case ObjectType::WideString:
+        case ObjectType::Binary:
+        case ObjectType::None:
+            break;
     }
 }
 
 inline void ValveDataObject::_SerializeAsBinary(std::ostream& os, BinaryNodeType object_end, uint32_t crc) const
 {
     ObjectType type = Type();
+    _CheckSerializable(type);
+
     os.write((const char*)&type, 1);
     os.write(Name().c_str(), Name().length() + 1);
 
@@ -1586,11 +1623,12 @@ inline void ValveDataObject::_SerializeAsBinary(std::ostream& os, BinaryNodeType
         case ObjectType::Int64  : os.write((const char*)&_Obj->_U._Int64, 8); break;
         case ObjectType::UInt64 : os.write((const char*)&_Obj->_U._UInt64, 8); break;
         case ObjectType::String : os.write(_Obj->_U._String->c_str(), _Obj->_U._String->length() + 1); break;
-        
-        //case ObjectType::WideString: TODO;
-        //case ObjectType::Binary    : TODO;
-        
-        case ObjectType::None: break; // Warning fix.
+
+        // Rejected by _CheckSerializable.
+        case ObjectType::WideString:
+        case ObjectType::Binary:
+        case ObjectType::None:
+            break;
     }
 }
 

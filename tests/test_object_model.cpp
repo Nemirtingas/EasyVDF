@@ -621,3 +621,61 @@ TEST_CASE("A collection holding a moved-from element stays usable", "[object_mod
     root.Collection()[1] = std::move(taken);
     CHECK(Dump(root.Collection()) == "a=A b=B c=C");
 }
+
+TEST_CASE("Serializing a node without value throws", "[object_model][serialize]")
+{
+    ValveDataObject root = MakeABC();
+
+    SECTION("default constructed child")
+    {
+        root.Collection().emplace_back();
+        root.Collection().back().Name("none");
+    }
+    SECTION("child assigned nullptr")
+    {
+        root["b"][0] = nullptr;
+    }
+    SECTION("moved-from child")
+    {
+        ValveDataObject taken(std::move(root.Collection()[1]));
+    }
+    SECTION("nested child")
+    {
+        ValveDataObject inner("inner");
+        inner.Collection().emplace_back("none", int32_t(0));
+        inner.Collection()[0] = nullptr;
+        root.Collection().emplace_back(std::move(inner));
+    }
+
+    CHECK_THROWS_AS(root.SerializeAsText(), EasyVDF::SerializeException);
+    CHECK_THROWS_AS(root.SerializeAsBinary(1), EasyVDF::SerializeException);
+    CHECK_THROWS_AS(root.SerializeAsBinary(2), EasyVDF::SerializeException);
+}
+
+TEST_CASE("Serializing nodes with values still works", "[object_model][serialize]")
+{
+    SECTION("empty object")
+    {
+        ValveDataObject root("Root");
+        CHECK(root.SerializeAsText() == "\"Root\"\n{\n}\n");
+    }
+
+    SECTION("removing the empty node makes the tree serializable")
+    {
+        ValveDataObject root = MakeABC();
+        root.Collection().emplace_back();
+        REQUIRE_THROWS_AS(root.SerializeAsText(), EasyVDF::SerializeException);
+        root.Collection().pop_back();
+
+        CHECK(root.SerializeAsText() ==
+            "\"Root\"\n"
+            "{\n"
+            "\t\"a\"\t\t\"A\"\n"
+            "\t\"b\"\t\t\"B\"\n"
+            "\t\"c\"\t\t\"C\"\n"
+            "}\n");
+
+        ValveDataObject parsed = RoundTripBinary(root, 2);
+        CHECK(Dump(parsed.Collection()) == "a=A b=B c=C");
+    }
+}
