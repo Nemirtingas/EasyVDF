@@ -1033,7 +1033,7 @@ inline ValveDataObject& ValveDataObject::operator=(pointer_t value)
 {
     _ResetValue();
     _Obj->_U._Pointer = value;
-    _Obj->_Type = ObjectType::Int32;
+    _Obj->_Type = ObjectType::Pointer;
 
     return *this;
 }
@@ -1042,7 +1042,7 @@ inline ValveDataObject& ValveDataObject::operator=(color_t value)
 {
     _ResetValue();
     _Obj->_U._Color = value;
-    _Obj->_Type = ObjectType::Int32;
+    _Obj->_Type = ObjectType::Color;
 
     return *this;
 }
