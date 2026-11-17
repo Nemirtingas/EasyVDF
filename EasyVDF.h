@@ -1206,6 +1206,7 @@ inline void ValveDataObject::_ParseTextObject(std::istream& is, std::string& nam
     std::string tmp;
     int error;
     bool is_object = false;
+    bool is_closed = false;
 
     o._Obj->_NameHash = std::hash<std::string>()(name);
     o._Obj->_Name = std::move(name);
@@ -1224,7 +1225,20 @@ inline void ValveDataObject::_ParseTextObject(std::istream& is, std::string& nam
             continue;
             
         if (*line_start == '}')
+        {
+            if (is_object)
+            {
+                throw ParserException("Expected object start at line " + std::to_string(line_num));
+            }
+            ++line_start;
+            Details::SkipSpaces(line_start, line_end);
+            if (line_start != line_end)
+            {
+                throw ParserException("Got datas after object end at line " + std::to_string(line_num));
+            }
+            is_closed = true;
             break;
+        }
 
         if (!is_object)
         {
@@ -1291,6 +1305,11 @@ inline void ValveDataObject::_ParseTextObject(std::istream& is, std::string& nam
             _ParseTextObject(is, object_name, buffer, line_num, *o._Obj->_U._Collection->rbegin());
             is_object = false;
         }
+    }
+
+    if (!is_closed)
+    {
+        throw ParserException("Unexpected end of file, expected object end at line " + std::to_string(line_num));
     }
 }
     
@@ -1567,6 +1586,7 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
     std::string buffer(chunk_size, '\0');
     std::string object_name;
     int error;
+    bool has_root_key = false;
     BinaryNodeType binary_root_end = BinaryNodeType::ObjectEnd;
 
     is.read(&buffer[0], 4);
@@ -1603,7 +1623,7 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
             if (buffer_start == buffer_end)
                 continue;
 
-            if (object_name.empty())
+            if (!has_root_key)
             {
                 error = Details::ParseString(buffer_start, buffer_end, object_name);
                 if (error == -1)
@@ -1623,6 +1643,7 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
                 {
                     throw ParserException("Got datas after object key at line " + std::to_string(line_num));
                 }
+                has_root_key = true;
             }
             else
             {
@@ -1637,7 +1658,13 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
                 }
 
                 _ParseTextObject(is, object_name, buffer, line_num, parsed_object);
+                has_root_key = false;
             }
+        }
+
+        if (has_root_key)
+        {
+            throw ParserException("Unexpected end of file, expected object start at line " + std::to_string(line_num));
         }
     }
     else

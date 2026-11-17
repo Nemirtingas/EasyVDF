@@ -155,3 +155,49 @@ TEST_CASE("Text parser handles a file without trailing EOL", "[text_parser][getl
     SECTION("CR")   { CheckSimpleRoot(ParseText(WithEol(text, "\r"))); }
     SECTION("Trailing blanks") { CheckSimpleRoot(ParseText(text + "\n \t")); }
 }
+
+TEST_CASE("Text parser rejects an unterminated document", "[text_parser][unexpected_eof]")
+{
+    using Catch::Matchers::Contains;
+
+    SECTION("Unclosed root object")
+    {
+        CHECK_THROWS_AS(ParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n"), EasyVDF::ParserException);
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n"), Contains("end of file") && Contains("line 3"));
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n\n \n"), Contains("end of file") && Contains("line 5"));
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{"), Contains("end of file") && Contains("line 2"));
+    }
+    SECTION("Unclosed nested object")
+    {
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"sub\"\n\t{\n\t\t\"k\"\t\"v\"\n\t}\n"), Contains("end of file") && Contains("line 6"));
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"sub\"\n\t{\n\t\t\"k\"\t\"v\"\n}\n"), Contains("end of file") && Contains("line 6"));
+    }
+    SECTION("Root key without object")
+    {
+        CHECK_THROWS_WITH(ParseText("\"root\"\n"), Contains("end of file") && Contains("line 1"));
+        CHECK_THROWS_WITH(ParseText("\"root\""), Contains("end of file") && Contains("line 1"));
+        CHECK_THROWS_WITH(ParseText("\"root\"\n\n \n"), Contains("end of file") && Contains("line 3"));
+    }
+    SECTION("Item key without value at end of file")
+    {
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\"\n"), Contains("end of file") && Contains("line 3"));
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\""), Contains("end of file") && Contains("line 3"));
+    }
+    SECTION("Item key without value before object end")
+    {
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\"\n}\n"), Contains("Expected object start at line 4"));
+    }
+    SECTION("Data after object end")
+    {
+        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n} \"x\"\n"), Contains("Got datas after object end at line 3"));
+    }
+}
+
+TEST_CASE("Text parser accepts an empty root key", "[text_parser][unexpected_eof]")
+{
+    auto o = ParseText("\"\"\n{\n\t\"k\"\t\"v\"\n}\n");
+    REQUIRE(o.Type() == EasyVDF::ObjectType::Object);
+    CHECK(o.Name() == "");
+    REQUIRE(o["k"].size() == 1);
+    CHECK(o["k"][0].String() == "v");
+}
