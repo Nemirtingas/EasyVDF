@@ -120,11 +120,40 @@ inline void SkipSpaces(const char*& s, const char*& e)
     }
 }
 
+/// <summary>
+/// Appends bytes from [b, e) to buffer until buffer holds max_size bytes or [b, e) is consumed.
+/// </summary>
 inline void ReadBinaryBytes(const char*& b, const char* e, std::string& buffer, size_t max_size)
 {
-    size_t left_count = (b + max_size - buffer.length()) > e ? e - b : max_size - buffer.length();
-    buffer.insert(buffer.end(), b, b + left_count);
+    const size_t missing = max_size > buffer.length() ? max_size - buffer.length() : 0;
+    const size_t available = static_cast<size_t>(e - b);
+    const size_t left_count = missing < available ? missing : available;
+    buffer.append(b, left_count);
     b += left_count;
+}
+
+// Binary VDF values are little-endian, decode them byte by byte (no aliasing, no alignment requirement, host endianness independent).
+inline uint32_t LoadLittleEndian32(const char* p)
+{
+    const unsigned char* u = reinterpret_cast<const unsigned char*>(p);
+    return static_cast<uint32_t>(u[0])
+         | (static_cast<uint32_t>(u[1]) << 8)
+         | (static_cast<uint32_t>(u[2]) << 16)
+         | (static_cast<uint32_t>(u[3]) << 24);
+}
+
+inline uint64_t LoadLittleEndian64(const char* p)
+{
+    return static_cast<uint64_t>(LoadLittleEndian32(p)) | (static_cast<uint64_t>(LoadLittleEndian32(p + 4)) << 32);
+}
+
+template<typename T, typename U>
+inline T BitCast(U value)
+{
+    static_assert(sizeof(T) == sizeof(U), "BitCast requires types of the same size");
+    T result;
+    std::memcpy(&result, &value, sizeof(T));
+    return result;
 }
 
 /// <summary>
@@ -1365,14 +1394,15 @@ inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& n
                 if (!Details::ReadFullBinaryBytes(is, buffer, buffer_start, buffer_end, tmp1, value_size))
                     throw ParserException("Premature end of file while parsing the value of key \"" + item_key + "\"");
 
+                const char* value = tmp1.data();
                 switch (state)
                 {
-                    case BinaryNodeType::Int32  : collection.emplace_back(std::move(item_key), *reinterpret_cast<const int32_t*>(tmp1.data())); break;
-                    case BinaryNodeType::Float  : collection.emplace_back(std::move(item_key), *reinterpret_cast<const float*>(tmp1.data())); break;
-                    case BinaryNodeType::Pointer: collection.emplace_back(std::move(item_key), *reinterpret_cast<const pointer_t*>(tmp1.data())); break;
-                    case BinaryNodeType::Color  : collection.emplace_back(std::move(item_key), *reinterpret_cast<const color_t*>(tmp1.data())); break;
-                    case BinaryNodeType::Int64  : collection.emplace_back(std::move(item_key), *reinterpret_cast<const int64_t*>(tmp1.data())); break;
-                    case BinaryNodeType::UInt64 : collection.emplace_back(std::move(item_key), *reinterpret_cast<const uint64_t*>(tmp1.data())); break;
+                    case BinaryNodeType::Int32  : collection.emplace_back(std::move(item_key), Details::BitCast<int32_t>(Details::LoadLittleEndian32(value))); break;
+                    case BinaryNodeType::Float  : collection.emplace_back(std::move(item_key), Details::BitCast<float>(Details::LoadLittleEndian32(value))); break;
+                    case BinaryNodeType::Pointer: collection.emplace_back(std::move(item_key), pointer_t{ Details::LoadLittleEndian32(value) }); break;
+                    case BinaryNodeType::Color  : collection.emplace_back(std::move(item_key), color_t{ Details::LoadLittleEndian32(value) }); break;
+                    case BinaryNodeType::Int64  : collection.emplace_back(std::move(item_key), Details::BitCast<int64_t>(Details::LoadLittleEndian64(value))); break;
+                    case BinaryNodeType::UInt64 : collection.emplace_back(std::move(item_key), Details::LoadLittleEndian64(value)); break;
                     default: break; // Not reachable, filtered above.
                 }
             }
@@ -1502,11 +1532,12 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
     int error;
     BinaryNodeType binary_root_end = BinaryNodeType::ObjectEnd;
 
-    is.read(&buffer[0], 4);
+    char header[4];
+    is.read(header, 4);
     if (!is)
         throw ParserException("Failed to read stream.");
 
-    if (*reinterpret_cast<const uint32_t*>(buffer.data()) == BinaryVDFMagic)
+    if (Details::LoadLittleEndian32(header) == BinaryVDFMagic)
     {
         as_binary = true;
         binary_root_end = BinaryNodeType::AlternativeEnd;
@@ -1515,7 +1546,7 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
     }
     else
     {
-        if (buffer[0] == '\0')
+        if (header[0] == '\0')
         {// Likely, This is the root object as binary
             as_binary = true;
         }

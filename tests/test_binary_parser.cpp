@@ -187,9 +187,9 @@ TEST_CASE("Binary parser: binary.vdf with every chunk size", "[binary_parser][ch
 
 TEST_CASE("Binary parser: unknown node type throws ParserException", "[binary_parser][errors]")
 {
-    for (unsigned char type : {5, 9, 12, 0x42, 0x7F, 0x80, 0xFF})
+    for (int type : {5, 9, 12, 0x42, 0x7F, 0x80, 0xFF})
     {
-        INFO("node type " << (int)type);
+        INFO("node type " << type);
         std::string blob("\x00Root\x00", 6);
         blob += static_cast<char>(type);
         blob += std::string("key\x00value\x00\x08", 11);
@@ -279,5 +279,50 @@ TEST_CASE("Binary parser: data after the root object", "[binary_parser][trailing
         // A second root object (used to be parsed into the same object, leaking the first one).
         CHECK(ParseOutcome(v1 + v1, chunk_size) == "ParserException");
         CHECK(ParseOutcome(v2 + v2.substr(8), chunk_size) == "ParserException");
+    }
+}
+
+TEST_CASE("Binary parser: values are decoded as little-endian from unaligned offsets", "[binary_parser][endianness]")
+{
+    // Hand written blob (independent of the serializer): keys have odd lengths so values are unaligned.
+    static const char raw[] =
+        "\x00" "R\x00"
+        "\x02" "i\x00"   "\x04\x03\x02\x81"
+        "\x03" "fl\x00"  "\x00\x00\xc0\xbf"
+        "\x04" "p\x00"   "\x11\x22\x33\x44"
+        "\x06" "col\x00" "\xa1\xb2\xc3\xd4"
+        "\x0a" "i6\x00"  "\xfe\xff\xff\xff\xff\xff\xff\xff"
+        "\x07" "u\x00"   "\x08\x07\x06\x05\x04\x03\x02\xf1"
+        "\x08";
+    const std::string blob(raw, sizeof(raw) - 1);
+    REQUIRE(blob.size() == 58);
+
+    for (size_t chunk_size = 0; chunk_size <= blob.size() + 1; ++chunk_size)
+    {
+        INFO("chunk size " << chunk_size);
+        auto o = ParseBinary(blob, chunk_size);
+        REQUIRE(o.Type() == EasyVDF::ObjectType::Object);
+        CHECK(o.Name() == "R");
+        auto const& c = o.Collection();
+        REQUIRE(c.size() == 6);
+        CHECK(c[0].Int32() == int32_t(-2130574588)); // 0x81020304
+        CHECK(c[1].Float() == -1.5f);
+        CHECK(c[2].Pointer().value == 0x44332211u);
+        CHECK(c[3].Color().value == 0xd4c3b2a1u);
+        CHECK(c[4].Int64() == -2);
+        CHECK(c[5].UInt64() == 0xf102030405060708ull);
+    }
+}
+
+TEST_CASE("Binary parser: VBKV magic and tiny chunk sizes", "[binary_parser][endianness]")
+{
+    auto sample = MakeSample();
+    const std::string v2 = sample.SerializeAsBinary(2);
+    REQUIRE(v2.compare(0, 4, "VBKV") == 0);
+    for (size_t chunk_size : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(4)})
+    {
+        INFO("chunk size " << chunk_size);
+        CHECK(Compare(sample, ParseBinary(v2, chunk_size)) == "");
+        CHECK(Compare(sample, ParseBinary(sample.SerializeAsBinary(1), chunk_size)) == "");
     }
 }
