@@ -295,7 +295,7 @@ namespace Details {
         default              : throw ParseError(error);
     }
 #else
-    std::fprintf(stderr, "EasyVDF: unhandled %s error: %s\n", to_string(error.code), error.message.c_str());
+    std::fprintf(stderr, "Unhandled EasyVDF error (%s): %s\n", to_string(error.code), error.message.c_str());
     std::fflush(stderr);
     std::abort();
 #endif

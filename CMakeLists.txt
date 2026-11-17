@@ -88,3 +88,8 @@ if(EASYVDF_BUILD_TESTS)
         set_tests_properties(example_achievements PROPERTIES PASS_REGULAR_EXPRESSION "Vainqueur.*ACH_SECRET \\(hidden\\).*NumGames")
     endif()
 endif()
+
+# The test and the example built with exceptions disabled.
+if(EASYVDF_BUILD_TESTS OR EASYVDF_BUILD_EXAMPLES)
+    add_subdirectory(tests/no_exceptions)
+endif()
