@@ -326,3 +326,15 @@ TEST_CASE("Binary parser: VBKV magic and tiny chunk sizes", "[binary_parser][end
         CHECK(Compare(sample, ParseBinary(sample.SerializeAsBinary(1), chunk_size)) == "");
     }
 }
+
+TEST_CASE("Text parser: escaped backslash before the closing quote", "[text_parser][escape]")
+{
+    // Escape sequences are kept verbatim (not unescaped), but "\\" must not escape the closing quote.
+    auto o = ParseText("\"root\"\n{\n\t\"path\"\t\"C:\\\\\"\n\t\"quote\"\t\"a\\\"b\"\n\t\"k\\\\\"\t\"v\"\n}\n");
+    REQUIRE(o.Collection().size() == 3);
+    CHECK(o.Collection()[0].Name() == "path");
+    CHECK(o.Collection()[0].String() == "C:\\\\");
+    CHECK(o.Collection()[1].String() == "a\\\"b");
+    CHECK(o.Collection()[2].Name() == "k\\\\");
+    CHECK(o.Collection()[2].String() == "v");
+}

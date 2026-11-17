@@ -266,14 +266,14 @@ inline int ParseString(const char*& b, const char* e, std::string& str)
     while (b != e)
     {
         char c = *b++;
+        if (has_escape)
+        {// Escaped char, including an escaped '\\'
+            has_escape = false;
+            continue;
+        }
         if (c == '\\')
         {
             has_escape = true;
-            continue;
-        }
-        if (has_escape)
-        {
-            has_escape = false;
             continue;
         }
         if (c == '"')
