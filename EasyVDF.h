@@ -1152,7 +1152,9 @@ inline ValveCollectionRef ValveDataObject::operator[](std::string const& key)
 
     for (auto& item : c)
     {
-        if (item._Obj->_NameHash == key_hash)
+        // The hash is only a fast reject: compare the key itself, two
+        // different keys can share a hash.
+        if (item._Obj->_NameHash == key_hash && item._Obj->_Name == key)
             r.emplace_back(ValveDataObjectRef(&item));
     }
 
@@ -1173,7 +1175,9 @@ inline ValveCollectionConstRef ValveDataObject::operator[](std::string const& ke
 
     for (auto& item : c)
     {
-        if (item._Obj->_NameHash == key_hash)
+        // The hash is only a fast reject: compare the key itself, two
+        // different keys can share a hash.
+        if (item._Obj->_NameHash == key_hash && item._Obj->_Name == key)
             r.emplace_back(ValveDataObjectConstRef(&item));
     }
 
