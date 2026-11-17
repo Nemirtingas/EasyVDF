@@ -53,6 +53,7 @@ if(EASYVDF_BUILD_TESTS)
         object_model
         api
         readme
+        result
     )
 
     foreach(name IN LISTS EASYVDF_TESTS)
