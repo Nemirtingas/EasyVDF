@@ -307,6 +307,10 @@ public:
 
     inline bool operator==(std::nullptr_t);
 
+    // A ValveDataObjectRefWrapper is a reference to an element of a collection.
+    // Assigning through it replaces the VALUE of the referenced element and keeps
+    // its key (name): `o["x"][0] = other;` leaves an element named "x" holding a
+    // copy of other's value. It never rebinds the wrapper to another element.
     inline ValveDataObjectRefWrapper& operator=(ValveDataObjectRefWrapper const&);
 
     inline ValveDataObjectRefWrapper& operator=(ValveDataObjectRefWrapper &&);
@@ -410,7 +414,15 @@ private:
 
     Data_t *_Obj;
 
+    template<typename T>
+    friend class ValveDataObjectRefWrapper;
+
     void _ResetValue();
+
+    // Replace the value of this object, keep its name (ValveDataObjectRefWrapper::operator= semantics).
+    void _AssignValue(ValveDataObject const& other);
+
+    void _AssignValue(ValveDataObject&& other);
 
     static void _ParseTextObject(std::istream& is, std::string& name, std::string& buffer, uint32_t& line_num, ValveDataObject& o);
 
@@ -471,6 +483,12 @@ public:
 
     inline bool operator==(std::nullptr_t);
 
+    // ValveDataObject is a regular value type: copy/move construction and
+    // copy/move assignment transfer the name (key) together with the value, so
+    // std::vector<ValveDataObject> algorithms (erase, insert, swap, sort, ...)
+    // keep every key paired with its value.
+    // To replace only the value of an element and keep its key, assign through
+    // a reference wrapper: `o["x"][0] = other;`.
     ValveDataObject& operator=(ValveDataObject const& other);
 
     ValveDataObject& operator=(ValveDataObject&& other) noexcept;
@@ -592,28 +610,28 @@ inline bool ValveDataObjectRefWrapper<T>::operator==(std::nullptr_t)
 template<typename T>
 inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(ValveDataObjectRefWrapper<T> const& value)
 {
-    (*_Obj) = *value._Obj;
+    _Obj->_AssignValue(*value._Obj);
     return *this;
 }
 
 template<typename T>
 inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(ValveDataObjectRefWrapper<T>&& value)
 {
-    (*_Obj) = std::move(*value._Obj);
+    _Obj->_AssignValue(std::move(*value._Obj));
     return *this;
 }
 
 template<typename T>
 inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(T const& value)
 {
-    (*_Obj) = value;
+    _Obj->_AssignValue(value);
     return *this;
 }
 
 template<typename T>
 inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(T&& value)
 {
-    (*_Obj) = std::move(value);
+    _Obj->_AssignValue(std::move(value));
     return *this;
 }
 
@@ -981,20 +999,16 @@ inline bool ValveDataObject::operator==(std::nullptr_t)
 
 inline ValveDataObject& ValveDataObject::operator=(ValveDataObject const& value)
 {
-    return (*this = ValveDataObject(value));
+    // Copy first: strong exception guarantee, and safe when value lives inside *this.
+    ValveDataObject tmp(value);
+    std::swap(_Obj, tmp._Obj);
+    return *this;
 }
 
 inline ValveDataObject& ValveDataObject::operator=(ValveDataObject&& value) noexcept
 {
-    auto type = value._Obj->_Type;
-    auto v = value._Obj->_U;
-    
-    value._Obj->_Type = _Obj->_Type;
-    value._Obj->_U = _Obj->_U;
-
-    _Obj->_Type = type;
-    _Obj->_U = v;
-
+    // Name and value travel together.
+    std::swap(_Obj, value._Obj);
     return *this;
 }
 
@@ -1182,6 +1196,31 @@ inline ValveCollectionConstRef ValveDataObject::operator[](std::string const& ke
     }
 
     return r;
+}
+
+inline void ValveDataObject::_AssignValue(ValveDataObject const& other)
+{
+    if (this == &other)
+        return;
+
+    // Copy first: strong exception guarantee, and safe when other lives inside *this.
+    ValveDataObject tmp(other);
+    _AssignValue(std::move(tmp));
+}
+
+inline void ValveDataObject::_AssignValue(ValveDataObject&& other)
+{
+    if (this == &other)
+        return;
+
+    // Detach other's value before releasing ours: other may live inside our collection.
+    auto type = other._Obj->_Type;
+    auto value = other._Obj->_U;
+    other._Obj->_Type = ObjectType::None;
+
+    _ResetValue();
+    _Obj->_U = value;
+    _Obj->_Type = type;
 }
 
 inline void ValveDataObject::_ResetValue()

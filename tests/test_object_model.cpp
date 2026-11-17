@@ -1,6 +1,7 @@
 // EasyVDF.h is included first on purpose: it must compile on its own.
 #include "../EasyVDF.h"
 
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -12,6 +13,28 @@ using EasyVDF::ObjectType;
 using EasyVDF::ValveDataObject;
 
 namespace {
+
+// "a=A b=B" for a collection of String values.
+std::string Dump(EasyVDF::ValveCollection const& c)
+{
+    std::string r;
+    for (auto const& item : c)
+    {
+        if (!r.empty())
+            r += ' ';
+        r += item.Name() + '=' + (item.Type() == ObjectType::String ? item.String() : std::string("?"));
+    }
+    return r;
+}
+
+ValveDataObject MakeABC()
+{
+    ValveDataObject root("Root");
+    root.Collection().emplace_back("a", std::string("A"));
+    root.Collection().emplace_back("b", std::string("B"));
+    root.Collection().emplace_back("c", std::string("C"));
+    return root;
+}
 
 ValveDataObject RoundTripBinary(ValveDataObject const& o, int version)
 {
@@ -159,4 +182,190 @@ TEST_CASE("operator[] does not confuse keys sharing a hash", "[object_model][loo
     REQUIRE(r2.size() == 1);
     CHECK(r2[0].Name() == second);
     CHECK(r2[0].Int32() == 2);
+}
+
+TEST_CASE("Collection algorithms keep keys paired with values", "[object_model][assignment]")
+{
+    ValveDataObject root = MakeABC();
+    auto& c = root.Collection();
+    REQUIRE(Dump(c) == "a=A b=B c=C");
+
+    SECTION("erase")
+    {
+        c.erase(c.begin());
+        CHECK(Dump(c) == "b=B c=C");
+    }
+
+    SECTION("insert in the middle")
+    {
+        c.insert(c.begin() + 1, ValveDataObject("x", std::string("X")));
+        CHECK(Dump(c) == "a=A x=X b=B c=C");
+    }
+
+    SECTION("std::swap")
+    {
+        std::swap(c[0], c[1]);
+        CHECK(Dump(c) == "b=B a=A c=C");
+    }
+
+    SECTION("std::sort")
+    {
+        std::sort(c.begin(), c.end(), [](ValveDataObject const& l, ValveDataObject const& r) { return l.Name() > r.Name(); });
+        CHECK(Dump(c) == "c=C b=B a=A");
+    }
+
+    SECTION("remove_if + erase")
+    {
+        c.erase(std::remove_if(c.begin(), c.end(), [](ValveDataObject const& o) { return o.Name() == "b"; }), c.end());
+        CHECK(Dump(c) == "a=A c=C");
+    }
+
+    SECTION("lookup after reordering")
+    {
+        std::reverse(c.begin(), c.end());
+        CHECK(root["a"][0].String() == "A");
+        CHECK(root["b"][0].String() == "B");
+        CHECK(root["c"][0].String() == "C");
+    }
+}
+
+TEST_CASE("ValveDataObject copy and move carry the name with the value", "[object_model][assignment]")
+{
+    ValveDataObject src = MakeABC();
+    src.Name("Source");
+
+    SECTION("copy construction is deep")
+    {
+        ValveDataObject copy(src);
+        CHECK(copy.Name() == "Source");
+        CHECK(Dump(copy.Collection()) == "a=A b=B c=C");
+        copy.Collection()[0].String() = "changed";
+        CHECK(src.Collection()[0].String() == "A");
+    }
+
+    SECTION("copy assignment")
+    {
+        ValveDataObject dst("dst", int32_t(5));
+        dst = src;
+        CHECK(dst.Name() == "Source");
+        CHECK(Dump(dst.Collection()) == "a=A b=B c=C");
+        CHECK(src.Name() == "Source");
+        CHECK(Dump(src.Collection()) == "a=A b=B c=C");
+    }
+
+    SECTION("move construction")
+    {
+        ValveDataObject dst(std::move(src));
+        CHECK(dst.Name() == "Source");
+        CHECK(Dump(dst.Collection()) == "a=A b=B c=C");
+    }
+
+    SECTION("move assignment")
+    {
+        ValveDataObject dst("dst", int32_t(5));
+        dst = std::move(src);
+        CHECK(dst.Name() == "Source");
+        CHECK(Dump(dst.Collection()) == "a=A b=B c=C");
+    }
+
+    SECTION("self copy assignment")
+    {
+        ValveDataObject& alias = src;
+        src = alias;
+        CHECK(src.Name() == "Source");
+        CHECK(Dump(src.Collection()) == "a=A b=B c=C");
+    }
+
+    SECTION("self move assignment")
+    {
+        ValveDataObject& alias = src;
+        src = std::move(alias);
+        CHECK(src.Name() == "Source");
+        CHECK(Dump(src.Collection()) == "a=A b=B c=C");
+    }
+
+    SECTION("assign a child to its parent (copy)")
+    {
+        src = src.Collection()[1];
+        CHECK(src.Name() == "b");
+        CHECK(src.String() == "B");
+    }
+
+    SECTION("assign a child to its parent (move)")
+    {
+        src = std::move(src.Collection()[1]);
+        CHECK(src.Name() == "b");
+        CHECK(src.String() == "B");
+    }
+}
+
+TEST_CASE("Assigning through a reference wrapper keeps the key", "[object_model][assignment]")
+{
+    ValveDataObject root = MakeABC();
+    root.Collection().emplace_back("obj", ValveDataObject("child", std::string("Child")));
+
+    SECTION("from a ValveDataObject copy")
+    {
+        ValveDataObject other("other", std::string("Other"));
+        root["a"][0] = other;
+        CHECK(Dump(root.Collection()).find("a=Other b=B c=C") == 0);
+        CHECK(other.Name() == "other");
+        CHECK(other.String() == "Other");
+    }
+
+    SECTION("from a moved ValveDataObject")
+    {
+        ValveDataObject other("other", std::string("Other"));
+        root["a"][0] = std::move(other);
+        CHECK(Dump(root.Collection()).find("a=Other b=B c=C") == 0);
+    }
+
+    SECTION("from another reference wrapper")
+    {
+        root["a"][0] = root["c"][0];
+        CHECK(Dump(root.Collection()).find("a=C b=B c=C") == 0);
+    }
+
+    SECTION("from a moved reference wrapper")
+    {
+        auto refs = root["c"];
+        root["a"][0] = std::move(refs[0]);
+        CHECK(root["a"][0].String() == "C");
+        CHECK(root.Collection()[0].Name() == "a");
+        CHECK(root.Collection()[2].Name() == "c");
+    }
+
+    SECTION("self assignment")
+    {
+        auto refs = root["a"];
+        refs[0] = refs[0];
+        CHECK(Dump(root.Collection()).find("a=A b=B c=C") == 0);
+        refs[0] = std::move(refs[0]);
+        CHECK(Dump(root.Collection()).find("a=A b=B c=C") == 0);
+    }
+
+    SECTION("an object element receives the value of its own child (copy)")
+    {
+        root["obj"][0] = root["obj"][0]["child"][0];
+        REQUIRE(root["obj"].size() == 1);
+        CHECK(root["obj"][0].Type() == ObjectType::String);
+        CHECK(root["obj"][0].String() == "Child");
+    }
+
+    SECTION("an object element receives the value of its own child (move)")
+    {
+        auto obj = root["obj"];
+        auto child = obj[0]["child"];
+        obj[0] = std::move(child[0]);
+        REQUIRE(root["obj"].size() == 1);
+        CHECK(root["obj"][0].Type() == ObjectType::String);
+        CHECK(root["obj"][0].String() == "Child");
+    }
+
+    SECTION("typed values")
+    {
+        root["b"][0] = int32_t(42);
+        CHECK(root.Collection()[1].Name() == "b");
+        CHECK(root.Collection()[1].Int32() == 42);
+    }
 }
