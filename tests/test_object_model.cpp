@@ -1,7 +1,9 @@
+// EasyVDF.h is included first on purpose: it must compile on its own.
+#include "../EasyVDF.h"
+
+#include <iostream>
 #include <sstream>
 #include <string>
-
-#include "../EasyVDF.h"
 
 #include "catch.hpp"
 
@@ -76,4 +78,18 @@ TEST_CASE("Assigned pointer_t and color_t survive a binary round trip", "[object
         REQUIRE(parsed["ColorKey"][0].Type() == ObjectType::Color);
         CHECK(parsed["ColorKey"][0].Color().value == 0x99887766u);
     }
+}
+
+TEST_CASE("Copy assignment does not write to std::cout", "[object_model][assignment]")
+{
+    std::stringstream captured;
+    std::streambuf* old_buf = std::cout.rdbuf(captured.rdbuf());
+
+    ValveDataObject a("a", std::string("A"));
+    ValveDataObject b("b", std::string("B"));
+    b = a;
+
+    std::cout.rdbuf(old_buf);
+
+    CHECK(captured.str().empty());
 }

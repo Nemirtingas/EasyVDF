@@ -1,11 +1,16 @@
 #pragma once
 
-#include <iostream>
+#include <istream>
+#include <ostream>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <stdexcept>
+#include <functional>
+#include <utility>
 
 namespace EasyVDF {
 
@@ -976,7 +981,6 @@ inline bool ValveDataObject::operator==(std::nullptr_t)
 
 inline ValveDataObject& ValveDataObject::operator=(ValveDataObject const& value)
 {
-    std::cout << "Copy" << std::endl;
     return (*this = ValveDataObject(value));
 }
 
