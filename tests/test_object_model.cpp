@@ -2,9 +2,12 @@
 #include "../EasyVDF.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
+#include <new>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 
 #include "catch.hpp"
@@ -12,7 +15,82 @@
 using EasyVDF::ObjectType;
 using EasyVDF::ValveDataObject;
 
+/////////////////////////////////////////////////////////////////////
+// Global operator new/delete replacement: counts allocations and can be
+// told to fail the Nth one, to check that moves do not allocate and that
+// nothing leaks when an allocation throws. Inactive unless armed.
+/////////////////////////////////////////////////////////////////////
 namespace {
+long long g_live_allocations = 0;
+long long g_total_allocations = 0;
+long long g_fail_countdown = -1; // < 0: disabled, N: let N allocations through, fail the next one.
+}
+
+void* operator new(std::size_t size)
+{
+    if (g_fail_countdown >= 0 && g_fail_countdown-- == 0)
+        throw std::bad_alloc();
+
+    void* p = std::malloc(size == 0 ? 1 : size);
+    if (p == nullptr)
+        throw std::bad_alloc();
+
+    ++g_live_allocations;
+    ++g_total_allocations;
+    return p;
+}
+
+void operator delete(void* p) noexcept
+{
+    if (p == nullptr)
+        return;
+
+    --g_live_allocations;
+    std::free(p);
+}
+
+void operator delete(void* p, std::size_t) noexcept { operator delete(p); }
+void* operator new[](std::size_t size) { return operator new(size); }
+void operator delete[](void* p) noexcept { operator delete(p); }
+void operator delete[](void* p, std::size_t) noexcept { operator delete(p); }
+
+namespace {
+
+// Long enough to defeat the small string optimization of every implementation.
+const std::string LongKey   = "a key long enough to need a heap allocation";
+const std::string LongValue = "a value long enough to need a heap allocation";
+
+// Runs f with the 1st, 2nd, ... allocation failing until f completes without
+// failure, and checks that every failed attempt released what it allocated.
+template<typename F>
+void CheckNoLeakOnAllocationFailure(F&& f)
+{
+    for (int fail_at = 0; fail_at < 1000; ++fail_at)
+    {
+        long long live_before = g_live_allocations;
+        bool threw = false;
+
+        {
+            struct Disarm { ~Disarm() { g_fail_countdown = -1; } } disarm;
+            g_fail_countdown = fail_at;
+            try
+            {
+                f();
+            }
+            catch (std::bad_alloc const&)
+            {
+                threw = true;
+            }
+        }
+        long long leaked = g_live_allocations - live_before;
+
+        INFO("allocation #" << fail_at << " failed: " << (threw ? "threw" : "completed"));
+        CHECK(leaked == 0);
+        if (!threw)
+            return;
+    }
+    FAIL("f never completed");
+}
 
 // "a=A b=B" for a collection of String values.
 std::string Dump(EasyVDF::ValveCollection const& c)
@@ -368,4 +446,178 @@ TEST_CASE("Assigning through a reference wrapper keeps the key", "[object_model]
         CHECK(root.Collection()[1].Name() == "b");
         CHECK(root.Collection()[1].Int32() == 42);
     }
+}
+
+static_assert(std::is_nothrow_move_constructible<ValveDataObject>::value, "moves must be noexcept");
+static_assert(std::is_nothrow_move_assignable<ValveDataObject>::value, "moves must be noexcept");
+
+TEST_CASE("Moves do not allocate", "[object_model][exception_safety]")
+{
+    ValveDataObject a = MakeABC();
+
+    long long total_before = g_total_allocations;
+    ValveDataObject b(std::move(a));
+    a = std::move(b);
+    b = std::move(a);
+    std::swap(a, b);
+    CHECK(g_total_allocations == total_before);
+
+    SECTION("vector growth only allocates the new buffer")
+    {
+        auto& c = a.Collection();
+        c.shrink_to_fit();
+        REQUIRE(c.size() == c.capacity());
+
+        total_before = g_total_allocations;
+        c.reserve(c.capacity() + 1);
+        CHECK(g_total_allocations - total_before == 1);
+        CHECK(Dump(c) == "a=A b=B c=C");
+    }
+}
+
+TEST_CASE("Constructors and assignments do not leak when an allocation fails", "[object_model][exception_safety]")
+{
+    ValveDataObject child(LongKey, LongValue);
+    ValveDataObject tree(LongKey);
+    tree.Collection().emplace_back(child);
+    tree.Collection().emplace_back(LongKey, int32_t(1));
+    tree.Collection().emplace_back(LongKey, ValveDataObject(LongKey, LongValue));
+
+    SECTION("default") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o; }); }
+    SECTION("key") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey); }); }
+    SECTION("key, string const&") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, LongValue); }); }
+    SECTION("key, string&&") { CheckNoLeakOnAllocationFailure([&] { std::string v = LongValue; ValveDataObject o(LongKey, std::move(v)); }); }
+    SECTION("key, int32_t") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, int32_t(1)); }); }
+    SECTION("key, float") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, 1.f); }); }
+    SECTION("key, pointer_t") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, EasyVDF::pointer_t{1}); }); }
+    SECTION("key, color_t") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, EasyVDF::color_t{1}); }); }
+    SECTION("key, int64_t") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, int64_t(1)); }); }
+    SECTION("key, uint64_t") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, uint64_t(1)); }); }
+    SECTION("key, ValveDataObject const&") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, tree); }); }
+    SECTION("key, ValveDataObject&&") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject tmp(tree); ValveDataObject o(LongKey, std::move(tmp)); }); }
+    SECTION("copy") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(tree); }); }
+    SECTION("copy assignment")
+    {
+        CheckNoLeakOnAllocationFailure([&] {
+            ValveDataObject o(LongKey, LongValue);
+            bool threw = false;
+            try
+            {
+                o = tree;
+            }
+            catch (std::bad_alloc const&)
+            {
+                threw = true;
+            }
+            if (threw)
+            {// Strong guarantee: o is unchanged.
+                if (o.Name() != LongKey || o.Type() != ObjectType::String || o.String() != LongValue)
+                    FAIL("copy assignment modified the target before throwing");
+                throw std::bad_alloc();
+            }
+        });
+    }
+    SECTION("assignments on a moved-from object")
+    {
+        CheckNoLeakOnAllocationFailure([&] {
+            ValveDataObject src(LongKey, LongValue);
+            ValveDataObject o(std::move(src));
+            src = LongValue;
+            src.Name(LongKey);
+            o = int32_t(1);
+        });
+    }
+    SECTION("reference wrapper assignment")
+    {
+        CheckNoLeakOnAllocationFailure([&] {
+            ValveDataObject root(LongKey);
+            root.Collection().emplace_back(LongKey, int32_t(1));
+            root[LongKey][0] = tree;
+        });
+    }
+}
+
+TEST_CASE("A moved-from object is empty and usable", "[object_model][moved_from]")
+{
+    bool by_assignment = GENERATE(false, true);
+    CAPTURE(by_assignment);
+
+    ValveDataObject a("a", std::string("A"));
+    if (by_assignment)
+    {
+        ValveDataObject b;
+        b = std::move(a);
+        CHECK(b.Name() == "a");
+    }
+    else
+    {
+        ValveDataObject b(std::move(a));
+        CHECK(b.Name() == "a");
+    }
+
+    // Observers
+    CHECK(a.Name().empty());
+    CHECK(a.Type() == ObjectType::None);
+    CHECK(a.Empty());
+    CHECK((a == nullptr));
+    CHECK_THROWS_AS(a.String(), std::invalid_argument);
+    CHECK_THROWS_AS(a.Collection(), std::invalid_argument);
+    CHECK_THROWS_AS(a.Int32(), std::invalid_argument);
+    CHECK_THROWS_AS(a["key"], std::invalid_argument);
+    CHECK_THROWS_AS(a.SerializeAsText(), EasyVDF::SerializeException);
+    CHECK_THROWS_AS(a.SerializeAsBinary(), EasyVDF::SerializeException);
+
+    // Copies of it are empty too.
+    ValveDataObject copy(a);
+    CHECK(copy.Name().empty());
+    CHECK(copy.Type() == ObjectType::None);
+    ValveDataObject assigned("x", int32_t(1));
+    assigned = a;
+    CHECK(assigned.Name().empty());
+    CHECK(assigned.Type() == ObjectType::None);
+
+    SECTION("assign a value") { a = int32_t(3); CHECK(a.Int32() == 3); CHECK(a.Name().empty()); }
+    SECTION("assign a string") { a = std::string("S"); CHECK(a.String() == "S"); }
+    SECTION("assign nullptr") { a = nullptr; CHECK(a.Empty()); }
+    SECTION("rename") { a.Name("renamed"); CHECK(a.Name() == "renamed"); CHECK(a.Empty()); }
+    SECTION("assign an object")
+    {
+        a = MakeABC();
+        CHECK(a.Name() == "Root");
+        CHECK(Dump(a.Collection()) == "a=A b=B c=C");
+    }
+    SECTION("assign through a reference wrapper")
+    {
+        EasyVDF::ValveDataObjectRef ref(&a);
+        ref = ValveDataObject("other", std::string("Other"));
+        CHECK(a.Name().empty());
+        CHECK(a.String() == "Other");
+    }
+    SECTION("move from it again")
+    {
+        ValveDataObject b(std::move(a));
+        CHECK(b.Empty());
+        a = std::move(b);
+        CHECK(a.Empty());
+    }
+    // a is destroyed at the end of each section.
+}
+
+TEST_CASE("A collection holding a moved-from element stays usable", "[object_model][moved_from]")
+{
+    ValveDataObject root = MakeABC();
+    ValveDataObject taken(std::move(root.Collection()[1]));
+    CHECK(taken.Name() == "b");
+
+    CHECK(root.Collection().size() == 3);
+    CHECK(root["a"].size() == 1);
+    CHECK(root["b"].empty());
+    CHECK(root[""].size() == 1);
+
+    ValveDataObject copy(root);
+    CHECK(copy.Collection()[1].Empty());
+    CHECK(copy.Collection()[1].Name().empty());
+
+    root.Collection()[1] = std::move(taken);
+    CHECK(Dump(root.Collection()) == "a=A b=B c=C");
 }

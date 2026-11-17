@@ -410,12 +410,41 @@ private:
             _NameHash(std::hash<std::string>()(_Name)),
             _Type(ObjectType::None)
         {}
+
+        explicit Data_t(std::string const& name) :
+            _Name(name),
+            _NameHash(std::hash<std::string>()(_Name)),
+            _Type(ObjectType::None)
+        {}
+
+        Data_t(std::string const& name, size_t name_hash) :
+            _Name(name),
+            _NameHash(name_hash),
+            _Type(ObjectType::None)
+        {}
     };
 
+    // Owned data. nullptr is the empty state left by a move: the object then
+    // behaves as an object with an empty name and no value (ObjectType::None).
+    // Every member function and the destructor accept it; mutators allocate
+    // the Data_t on demand (_Data()).
     Data_t *_Obj;
 
     template<typename T>
     friend class ValveDataObjectRefWrapper;
+
+    struct _Adopt_t {};
+
+    // Takes ownership of data (may be nullptr). Every other constructor
+    // delegates to this one, so as soon as it returns the object is fully
+    // constructed: if the rest of a constructor throws, the destructor runs
+    // and releases what was already allocated.
+    ValveDataObject(_Adopt_t, Data_t* data) noexcept;
+
+    // Returns the data, allocating it if the object is in the moved-from state.
+    Data_t& _Data();
+
+    static std::string const& _EmptyName();
 
     void _ResetValue();
 
@@ -437,13 +466,15 @@ public:
 
     ValveDataObject(ValveDataObject const& other);
 
+    // Never allocates. other is left empty: Name() == "", Type() == ObjectType::None.
+    // It can be assigned to, renamed or destroyed like any other object.
     ValveDataObject(ValveDataObject&& other) noexcept;
     
     ValveDataObject(std::string const& key);
     
     ValveDataObject(std::string const& key, ValveDataObject const& other);
 
-    ValveDataObject(std::string const& key, ValveDataObject&& other) noexcept;
+    ValveDataObject(std::string const& key, ValveDataObject&& other);
 
     ValveDataObject(std::string const& key, std::string const& value);
 
@@ -491,6 +522,7 @@ public:
     // a reference wrapper: `o["x"][0] = other;`.
     ValveDataObject& operator=(ValveDataObject const& other);
 
+    // Never allocates. other is left empty (see the move constructor).
     ValveDataObject& operator=(ValveDataObject&& other) noexcept;
 
     ValveDataObject& operator=(std::nullptr_t);
@@ -787,134 +819,108 @@ inline void ValveDataObjectRefWrapper<T>::SerializeAsBinary(std::ostream& os, in
 //                        ValveDataObject
 // 
 /////////////////////////////////////////////////////////////////////
+inline ValveDataObject::ValveDataObject(_Adopt_t, Data_t* data) noexcept :
+    _Obj(data)
+{}
+
 inline ValveDataObject::ValveDataObject() :
-    _Obj(new Data_t())
-{
-    _Obj->_Type = ObjectType::None;
-}
+    ValveDataObject(_Adopt_t(), new Data_t())
+{}
 
 inline ValveDataObject::ValveDataObject(ValveDataObject const& other):
-    _Obj(new Data_t())
+    ValveDataObject(_Adopt_t(), other._Obj == nullptr ? nullptr : new Data_t(other._Obj->_Name, other._Obj->_NameHash))
 {
-    _Obj->_Name = other._Obj->_Name;
-    _Obj->_NameHash = other._Obj->_NameHash;
-    _Obj->_Type = other._Obj->_Type;
-    switch (_Obj->_Type)
+    if (_Obj == nullptr)
+        return;
+
+    switch (other._Obj->_Type)
     {   // Copy pointers content
         case ObjectType::String: _Obj->_U._String = new std::string(*other._Obj->_U._String); break;
         case ObjectType::Object: _Obj->_U._Collection = new ValveCollection(*other._Obj->_U._Collection); break;
         // Copy biggest possible value
         default: _Obj->_U = other._Obj->_U;
     }
+    // Type set last: if a copy above throws, the destructor sees None and only frees the Data_t.
+    _Obj->_Type = other._Obj->_Type;
 }
 
 inline ValveDataObject::ValveDataObject(ValveDataObject && other) noexcept :
-    _Obj(new Data_t())
+    _Obj(other._Obj)
 {
-    // Copy object name on creation
-    _Obj->_Name = other._Obj->_Name;
-    _Obj->_NameHash = other._Obj->_NameHash;
-    // But move content
-    (*this) = std::move(other);
+    other._Obj = nullptr;
 }
 
 inline ValveDataObject::ValveDataObject(std::string const& key) :
-    _Obj(new Data_t())
+    ValveDataObject(_Adopt_t(), new Data_t(key))
 {
-    _Obj->_Name = key;
-    _Obj->_NameHash = std::hash<std::string>()(key);
-    _Obj->_Type = ObjectType::Object;
     _Obj->_U._Collection = new ValveCollection();
+    _Obj->_Type = ObjectType::Object;
 }
 
 inline ValveDataObject::ValveDataObject(std::string const& key, ValveDataObject const& other) :
-    _Obj(new Data_t())
+    ValveDataObject(key)
 {
-    _Obj->_Name = key;
-    _Obj->_NameHash = std::hash<std::string>()(key);
-    _Obj->_Type = ObjectType::Object;
-    _Obj->_U._Collection = new ValveCollection();
     _Obj->_U._Collection->emplace_back(other);
 }
 
-inline ValveDataObject::ValveDataObject(std::string const& key, ValveDataObject&& other) noexcept :
-    _Obj(new Data_t())
+inline ValveDataObject::ValveDataObject(std::string const& key, ValveDataObject&& other) :
+    ValveDataObject(key)
 {
-    _Obj->_Name = key;
-    _Obj->_NameHash = std::hash<std::string>()(key);
-    _Obj->_Type = ObjectType::Object;
-    _Obj->_U._Collection = new ValveCollection();
     _Obj->_U._Collection->emplace_back(std::move(other));
 }
 
 inline ValveDataObject::ValveDataObject(std::string const& key, std::string const& value) :
-    _Obj(new Data_t())
+    ValveDataObject(_Adopt_t(), new Data_t(key))
 {
-    _Obj->_Name = key;
-    _Obj->_NameHash = std::hash<std::string>()(key);
     _Obj->_U._String = new std::string(value);
     _Obj->_Type = ObjectType::String;
 }
 
 inline ValveDataObject::ValveDataObject(std::string const& key, std::string && value) :
-    _Obj(new Data_t())
+    ValveDataObject(_Adopt_t(), new Data_t(key))
 {
-    _Obj->_Name = key;
-    _Obj->_NameHash = std::hash<std::string>()(key);
     _Obj->_U._String = new std::string(std::move(value));
     _Obj->_Type = ObjectType::String;
 }
 
 inline ValveDataObject::ValveDataObject(std::string const& key, int32_t value) :
-    _Obj(new Data_t())
+    ValveDataObject(_Adopt_t(), new Data_t(key))
 {
-    _Obj->_Name = key;
-    _Obj->_NameHash = std::hash<std::string>()(key);
     _Obj->_U._Int32 = value;
     _Obj->_Type = ObjectType::Int32;
 }
 
 inline ValveDataObject::ValveDataObject(std::string const& key, float value) :
-    _Obj(new Data_t())
+    ValveDataObject(_Adopt_t(), new Data_t(key))
 {
-    _Obj->_Name = key;
-    _Obj->_NameHash = std::hash<std::string>()(key);
     _Obj->_U._Float = value;
     _Obj->_Type = ObjectType::Float;
 }
 
-inline ValveDataObject::ValveDataObject(std::string const& key, pointer_t value):
-    _Obj(new Data_t())
+inline ValveDataObject::ValveDataObject(std::string const& key, pointer_t value) :
+    ValveDataObject(_Adopt_t(), new Data_t(key))
 {
-    _Obj->_Name = key;
-    _Obj->_NameHash = std::hash<std::string>()(key);
     _Obj->_U._Pointer = value;
     _Obj->_Type = ObjectType::Pointer;
 }
 
 inline ValveDataObject::ValveDataObject(std::string const& key, color_t value) :
-    _Obj(new Data_t())
+    ValveDataObject(_Adopt_t(), new Data_t(key))
 {
-    _Obj->_Name = key;
-    _Obj->_NameHash = std::hash<std::string>()(key);
     _Obj->_U._Color = value;
     _Obj->_Type = ObjectType::Color;
 }
 
 inline ValveDataObject::ValveDataObject(std::string const& key, int64_t value) :
-    _Obj(new Data_t())
+    ValveDataObject(_Adopt_t(), new Data_t(key))
 {
-    _Obj->_Name = key;
-    _Obj->_NameHash = std::hash<std::string>()(key);
     _Obj->_U._Int64 = value;
     _Obj->_Type = ObjectType::Int64;
 }
 
 inline ValveDataObject::ValveDataObject(std::string const& key, uint64_t value) :
-    _Obj(new Data_t())
+    ValveDataObject(_Adopt_t(), new Data_t(key))
 {
-    _Obj->_Name = key;
-    _Obj->_NameHash = std::hash<std::string>()(key);
     _Obj->_U._UInt64 = value;
     _Obj->_Type = ObjectType::UInt64;
 }
@@ -925,36 +931,52 @@ inline ValveDataObject::~ValveDataObject()
     delete _Obj;
 }
 
+inline ValveDataObject::Data_t& ValveDataObject::_Data()
+{
+    if (_Obj == nullptr)
+        _Obj = new Data_t();
+
+    return *_Obj;
+}
+
+inline std::string const& ValveDataObject::_EmptyName()
+{
+    static const std::string empty_name;
+    return empty_name;
+}
+
 inline void ValveDataObject::Name(std::string const& value)
 {
-    _Obj->_NameHash = std::hash<std::string>()(value);
-    _Obj->_Name = value;
+    Data_t& data = _Data();
+    data._Name = value;
+    data._NameHash = std::hash<std::string>()(data._Name);
 }
 
 inline void ValveDataObject::Name(std::string&& value)
 {
-    _Obj->_NameHash = std::hash<std::string>()(value);
-    _Obj->_Name = std::move(value);
+    Data_t& data = _Data();
+    data._NameHash = std::hash<std::string>()(value);
+    data._Name = std::move(value);
 }
 
 inline std::string const& ValveDataObject::Name() const
 {
-    return _Obj->_Name;
+    return _Obj == nullptr ? _EmptyName() : _Obj->_Name;
 }
 
 inline ObjectType ValveDataObject::Type() const
 {
-    return _Obj->_Type;
+    return _Obj == nullptr ? ObjectType::None : _Obj->_Type;
 }
 
 inline bool ValveDataObject::Empty() const
 {
-    return _Obj->_Type == ObjectType::None;
+    return Type() == ObjectType::None;
 }
 
 inline std::string& ValveDataObject::String()
 {
-    if (_Obj->_Type != ObjectType::String)
+    if (Type() != ObjectType::String)
     {
         throw std::invalid_argument("Attempted to read a String from a non String type.");
     }
@@ -964,7 +986,7 @@ inline std::string& ValveDataObject::String()
 
 inline std::string const& ValveDataObject::String() const
 {
-    if (_Obj->_Type != ObjectType::String)
+    if (Type() != ObjectType::String)
     {
         throw std::invalid_argument("Attempted to read a String from a non String type.");
     }
@@ -974,7 +996,7 @@ inline std::string const& ValveDataObject::String() const
 
 inline ValveCollection& ValveDataObject::Collection()
 {
-    if (_Obj->_Type != ObjectType::Object)
+    if (Type() != ObjectType::Object)
     {
         throw std::invalid_argument("Attempted to get a Collection from non Collection type.");
     }
@@ -984,7 +1006,7 @@ inline ValveCollection& ValveDataObject::Collection()
 
 inline ValveCollection const& ValveDataObject::Collection() const
 {
-    if (_Obj->_Type != ObjectType::Object)
+    if (Type() != ObjectType::Object)
     {
         throw std::invalid_argument("Attempted to get a Collection from non Collection type.");
     }
@@ -1007,8 +1029,14 @@ inline ValveDataObject& ValveDataObject::operator=(ValveDataObject const& value)
 
 inline ValveDataObject& ValveDataObject::operator=(ValveDataObject&& value) noexcept
 {
-    // Name and value travel together.
-    std::swap(_Obj, value._Obj);
+    if (this != &value)
+    {
+        // Name and value travel together. Our previous data is released when
+        // old goes out of scope, after value's data was taken: value may live
+        // inside our collection.
+        ValveDataObject old(std::move(*this));
+        std::swap(_Obj, value._Obj);
+    }
     return *this;
 }
 
@@ -1020,81 +1048,89 @@ inline ValveDataObject& ValveDataObject::operator=(std::nullptr_t)
 
 inline ValveDataObject& ValveDataObject::operator=(std::string const& value)
 {
+    Data_t& data = _Data();
     std::string* v = new std::string(value);
     _ResetValue();
-    _Obj->_U._String = v;
-    _Obj->_Type = ObjectType::String;
+    data._U._String = v;
+    data._Type = ObjectType::String;
 
     return *this;
 }
 
 inline ValveDataObject& ValveDataObject::operator=(std::string&& value)
 {
+    Data_t& data = _Data();
     std::string* v = new std::string(std::move(value));
     _ResetValue();
-    _Obj->_U._String = v;
-    _Obj->_Type = ObjectType::String;
+    data._U._String = v;
+    data._Type = ObjectType::String;
 
     return *this;
 }
 
 inline ValveDataObject& ValveDataObject::operator=(int32_t value)
 {
+    Data_t& data = _Data();
     _ResetValue();
-    _Obj->_U._Int32 = value;
-    _Obj->_Type = ObjectType::Int32;
+    data._U._Int32 = value;
+    data._Type = ObjectType::Int32;
 
     return *this;
 }
 
 inline ValveDataObject& ValveDataObject::operator=(pointer_t value)
 {
+    Data_t& data = _Data();
     _ResetValue();
-    _Obj->_U._Pointer = value;
-    _Obj->_Type = ObjectType::Pointer;
+    data._U._Pointer = value;
+    data._Type = ObjectType::Pointer;
 
     return *this;
 }
 
 inline ValveDataObject& ValveDataObject::operator=(color_t value)
 {
+    Data_t& data = _Data();
     _ResetValue();
-    _Obj->_U._Color = value;
-    _Obj->_Type = ObjectType::Color;
+    data._U._Color = value;
+    data._Type = ObjectType::Color;
 
     return *this;
 }
 
 inline ValveDataObject& ValveDataObject::operator=(float value)
 {
+    Data_t& data = _Data();
     _ResetValue();
-    _Obj->_U._Float = value;
-    _Obj->_Type = ObjectType::Float;
+    data._U._Float = value;
+    data._Type = ObjectType::Float;
 
     return *this;
 }
 
 inline ValveDataObject& ValveDataObject::operator=(int64_t value)
 {
+    Data_t& data = _Data();
     _ResetValue();
-    _Obj->_U._Int64 = value;
-    _Obj->_Type = ObjectType::Int64;
+    data._U._Int64 = value;
+    data._Type = ObjectType::Int64;
 
     return *this;
 }
 
 inline ValveDataObject& ValveDataObject::operator=(uint64_t value)
 {
+    Data_t& data = _Data();
     _ResetValue();
-    _Obj->_U._UInt64 = value;
-    _Obj->_Type = ObjectType::UInt64;
+    data._U._UInt64 = value;
+    data._Type = ObjectType::UInt64;
 
     return *this;
 }
 
 inline int32_t ValveDataObject::Int32() const
 {
-    if (_Obj->_Type != ObjectType::Int32)
+    if (Type() != ObjectType::Int32)
     {
         throw std::invalid_argument("Attempted to get an Int32 from non Int32 type.");
     }
@@ -1104,7 +1140,7 @@ inline int32_t ValveDataObject::Int32() const
 
 inline float ValveDataObject::Float() const
 {
-    if (_Obj->_Type != ObjectType::Float)
+    if (Type() != ObjectType::Float)
     {
         throw std::invalid_argument("Attempted to get a Float from non Float type.");
     }
@@ -1114,7 +1150,7 @@ inline float ValveDataObject::Float() const
 
 inline pointer_t ValveDataObject::Pointer() const
 {
-    if (_Obj->_Type != ObjectType::Pointer)
+    if (Type() != ObjectType::Pointer)
     {
         throw std::invalid_argument("Attempted to get a Pointer from non Pointer type.");
     }
@@ -1124,7 +1160,7 @@ inline pointer_t ValveDataObject::Pointer() const
 
 inline color_t ValveDataObject::Color() const
 {
-    if (_Obj->_Type != ObjectType::Color)
+    if (Type() != ObjectType::Color)
     {
         throw std::invalid_argument("Attempted to get a Pointer from non Pointer type.");
     }
@@ -1134,7 +1170,7 @@ inline color_t ValveDataObject::Color() const
 
 inline int64_t ValveDataObject::Int64() const
 {
-    if (_Obj->_Type != ObjectType::Int64)
+    if (Type() != ObjectType::Int64)
     {
         throw std::invalid_argument("Attempted to get an Int64 from non Int64 type.");
     }
@@ -1144,7 +1180,7 @@ inline int64_t ValveDataObject::Int64() const
 
 inline uint64_t ValveDataObject::UInt64() const
 {
-    if (_Obj->_Type != ObjectType::UInt64)
+    if (Type() != ObjectType::UInt64)
     {
         throw std::invalid_argument("Attempted to get an UInt64 from non UInt64 type.");
     }
@@ -1167,8 +1203,8 @@ inline ValveCollectionRef ValveDataObject::operator[](std::string const& key)
     for (auto& item : c)
     {
         // The hash is only a fast reject: compare the key itself, two
-        // different keys can share a hash.
-        if (item._Obj->_NameHash == key_hash && item._Obj->_Name == key)
+        // different keys can share a hash. A moved-from item has an empty name.
+        if (item._Obj == nullptr ? key.empty() : (item._Obj->_NameHash == key_hash && item._Obj->_Name == key))
             r.emplace_back(ValveDataObjectRef(&item));
     }
 
@@ -1190,8 +1226,8 @@ inline ValveCollectionConstRef ValveDataObject::operator[](std::string const& ke
     for (auto& item : c)
     {
         // The hash is only a fast reject: compare the key itself, two
-        // different keys can share a hash.
-        if (item._Obj->_NameHash == key_hash && item._Obj->_Name == key)
+        // different keys can share a hash. A moved-from item has an empty name.
+        if (item._Obj == nullptr ? key.empty() : (item._Obj->_NameHash == key_hash && item._Obj->_Name == key))
             r.emplace_back(ValveDataObjectConstRef(&item));
     }
 
@@ -1213,14 +1249,23 @@ inline void ValveDataObject::_AssignValue(ValveDataObject&& other)
     if (this == &other)
         return;
 
+    if (other._Obj == nullptr)
+    {// Moved-from source: no value.
+        _ResetValue();
+        return;
+    }
+
+    // Allocate first (moved-from destination): nothing is modified if it throws.
+    Data_t& data = _Data();
+
     // Detach other's value before releasing ours: other may live inside our collection.
     auto type = other._Obj->_Type;
     auto value = other._Obj->_U;
     other._Obj->_Type = ObjectType::None;
 
     _ResetValue();
-    _Obj->_U = value;
-    _Obj->_Type = type;
+    data._U = value;
+    data._Type = type;
 }
 
 inline void ValveDataObject::_ResetValue()
@@ -1491,8 +1536,8 @@ inline void ValveDataObject::_SerializeAsText(std::ostream& os, size_t depth) co
 {
     std::string indent(depth, '\t');
 
-    os << indent << '"' << _Obj->_Name << '"';
-    switch (_Obj->_Type)
+    os << indent << '"' << Name() << '"';
+    switch (Type())
     {
         case ObjectType::Object:
             os << '\n' << indent << "{\n";
@@ -1520,10 +1565,11 @@ inline void ValveDataObject::_SerializeAsText(std::ostream& os, size_t depth) co
 
 inline void ValveDataObject::_SerializeAsBinary(std::ostream& os, BinaryNodeType object_end, uint32_t crc) const
 {
-    os.write((const char*)&_Obj->_Type, 1);
-    os.write(_Obj->_Name.c_str(), _Obj->_Name.length() + 1);
+    ObjectType type = Type();
+    os.write((const char*)&type, 1);
+    os.write(Name().c_str(), Name().length() + 1);
 
-    switch (_Obj->_Type)
+    switch (type)
     {
         case ObjectType::Object:
             for (auto const& item : *_Obj->_U._Collection)
@@ -1557,7 +1603,7 @@ inline std::string ValveDataObject::SerializeAsBinary(int version) const
 
 inline void ValveDataObject::SerializeAsBinary(std::ostream& os, int version) const
 {
-    if (_Obj->_Type != ObjectType::Object)
+    if (Type() != ObjectType::Object)
         throw SerializeException("Can't serialize ValveDataObject, it needs to be an Object type.");
 
     uint32_t crc = 0x00000000;
@@ -1589,7 +1635,7 @@ inline std::string ValveDataObject::SerializeAsText() const
 
 inline void ValveDataObject::SerializeAsText(std::ostream& os) const
 {
-    if (_Obj->_Type != ObjectType::Object)
+    if (Type() != ObjectType::Object)
         throw SerializeException("Can't serialize ValveDataObject, it needs to be an Object type.");
 
     _SerializeAsText(os, 0);
