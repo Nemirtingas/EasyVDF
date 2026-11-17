@@ -184,3 +184,24 @@ TEST_CASE("Binary parser: binary.vdf with every chunk size", "[binary_parser][ch
         CHECK(diff == "");
     }
 }
+
+TEST_CASE("Binary parser: unknown node type throws ParserException", "[binary_parser][errors]")
+{
+    for (unsigned char type : {5, 9, 12, 0x42, 0x7F, 0x80, 0xFF})
+    {
+        INFO("node type " << (int)type);
+        std::string blob("\x00Root\x00", 6);
+        blob += static_cast<char>(type);
+        blob += std::string("key\x00value\x00\x08", 11);
+
+        try
+        {
+            ParseBinary(blob, 1024);
+            FAIL("no exception thrown");
+        }
+        catch (EasyVDF::ParserException const& e)
+        {
+            CHECK_THAT(e.what(), Catch::Matchers::Contains(std::to_string((int)type)));
+        }
+    }
+}

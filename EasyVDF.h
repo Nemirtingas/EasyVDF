@@ -1385,8 +1385,7 @@ inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& n
                             break;
 
                         default:
-                            //SPDLOG_DEBUG("Unhandled item type {:02x}", (uint32_t)state);
-                            throw std::runtime_error("Unhandled VDF type");
+                            throw ParserException("Unhandled binary VDF node type " + std::to_string(static_cast<unsigned int>(static_cast<uint8_t>(state))) + " for key \"" + item_key + "\"");
                     }
 
                     if (clear)
