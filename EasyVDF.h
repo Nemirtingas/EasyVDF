@@ -156,6 +156,53 @@ inline int ParseBinaryString(const char*& b, const char* e, std::string& str)
 }
 
 /// <summary>
+/// Makes sure [b, e) is not empty: when it is, reads the next chunk of is into buffer
+/// (buffer must not be empty). Returns false on end of stream.
+/// </summary>
+inline bool FillBinaryBuffer(std::istream& is, std::string& buffer, const char*& b, const char*& e)
+{
+    if (b != e)
+        return true;
+
+    is.read(&buffer[0], static_cast<std::streamsize>(buffer.length()));
+    b = buffer.data();
+    e = b + is.gcount();
+    return b != e;
+}
+
+/// <summary>
+/// Reads a whole null terminated binary string into str, reading more chunks as needed.
+/// Returns false if the stream ended before the null terminator.
+/// </summary>
+inline bool ReadFullBinaryString(std::istream& is, std::string& buffer, const char*& b, const char*& e, std::string& str)
+{
+    str.clear();
+    while (FillBinaryBuffer(is, buffer, b, e))
+    {
+        if (ParseBinaryString(b, e, str) == 0)
+            return true;
+    }
+    return false;
+}
+
+/// <summary>
+/// Reads exactly count bytes into out, reading more chunks as needed.
+/// Returns false if the stream ended before count bytes were read.
+/// </summary>
+inline bool ReadFullBinaryBytes(std::istream& is, std::string& buffer, const char*& b, const char*& e, std::string& out, size_t count)
+{
+    out.clear();
+    while (out.length() < count)
+    {
+        if (!FillBinaryBuffer(is, buffer, b, e))
+            return false;
+
+        ReadBinaryBytes(b, e, out, count);
+    }
+    return true;
+}
+
+/// <summary>
 /// Parses a double quoted text string.
 /// Returns  0 when the string was read up to its closing quote
 /// Returns -1 when no opening quote was found
@@ -1256,152 +1303,80 @@ inline void ValveDataObject::_ParseTextObject(std::istream& is, std::string& nam
 
 inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& name, BinaryNodeType object_end, std::string& buffer, const char*& buffer_start, const char*& buffer_end, ValveDataObject& o)
 {
-    int error;
-    std::string tmp1, item_key;
-
-    BinaryNodeType state = BinaryNodeType::Object;
-    bool parsed_item_key = false;
-    bool type_read = false;
-
+    // Release any previous value first, so parsing into an existing object can never leak.
+    o._ResetValue();
     o._Obj->_NameHash = std::hash<std::string>()(name);
     o._Obj->_Name = std::move(name);
     o._Obj->_U._Collection = new ValveCollection();
     o._Obj->_Type = ObjectType::Object;
 
-    while (is || buffer_start != buffer_end)
+    // Items are parsed into the collection owned by o: if an exception is thrown,
+    // everything parsed so far is released with o.
+    ValveCollection& collection = *o._Obj->_U._Collection;
+    std::string tmp1, item_key;
+
+    for (;;)
     {
-        while (buffer_start != buffer_end)
+        if (!Details::FillBinaryBuffer(is, buffer, buffer_start, buffer_end))
+            throw ParserException("Premature end of file: missing end marker of binary object \"" + o._Obj->_Name + "\"");
+
+        BinaryNodeType state = static_cast<BinaryNodeType>(*buffer_start++);
+        switch (state)
         {
-            if (!type_read)
+            case BinaryNodeType::ObjectEnd:
+            case BinaryNodeType::AlternativeEnd:
+                // Both end markers are accepted whatever object_end is, as before.
+                return;
+
+            case BinaryNodeType::Object:
+            case BinaryNodeType::String:
+            case BinaryNodeType::Int32:
+            case BinaryNodeType::Float:
+            case BinaryNodeType::Pointer:
+            case BinaryNodeType::Color:
+            case BinaryNodeType::UInt64:
+            case BinaryNodeType::Int64:
+                break;
+
+            default:
+                throw ParserException("Unhandled binary VDF node type " + std::to_string(static_cast<unsigned int>(static_cast<uint8_t>(state))) + " in binary object \"" + o._Obj->_Name + "\"");
+        }
+
+        if (!Details::ReadFullBinaryString(is, buffer, buffer_start, buffer_end, item_key))
+            throw ParserException("Premature end of file while parsing a key of binary object \"" + o._Obj->_Name + "\"");
+
+        switch (state)
+        {
+            case BinaryNodeType::Object:
+                collection.emplace_back();
+                _ParseBinaryObject(is, item_key, object_end, buffer, buffer_start, buffer_end, collection.back());
+                break;
+
+            case BinaryNodeType::String:
+                if (!Details::ReadFullBinaryString(is, buffer, buffer_start, buffer_end, tmp1))
+                    throw ParserException("Premature end of file while parsing the value of key \"" + item_key + "\"");
+
+                collection.emplace_back(std::move(item_key), std::move(tmp1));
+                break;
+
+            default:
             {
-                state = (BinaryNodeType)buffer_start[0];
-                ++buffer_start;
-                item_key.clear();
-                type_read = true;
-            }
-            else
-            {
-                if (state == BinaryNodeType::ObjectEnd || state == BinaryNodeType::AlternativeEnd)
+                const size_t value_size = (state == BinaryNodeType::Int64 || state == BinaryNodeType::UInt64) ? 8 : 4;
+                if (!Details::ReadFullBinaryBytes(is, buffer, buffer_start, buffer_end, tmp1, value_size))
+                    throw ParserException("Premature end of file while parsing the value of key \"" + item_key + "\"");
+
+                switch (state)
                 {
-                    if (state != object_end)
-                    {
-                        // Got object end but I didn't expected this value
-                        //SPDLOG_DEBUG("Got object end {:02x} but expected {:02x}", (uint32_t)state, (uint32_t)object_end);
-                    }
-                    
-                    return;
-                }
-
-                if (!parsed_item_key)
-                {
-                    error = Details::ParseBinaryString(buffer_start, buffer_end, item_key);
-                    if (error == -2)
-                    {
-                        throw ParserException("Invalid codepoint while parsing binary string");
-                    }
-                    if (error == 0)
-                    {
-                        parsed_item_key = true;
-                    }
-                }
-                else
-                {
-                    bool clear = false;
-
-                    switch (state)
-                    {
-                        case BinaryNodeType::Object:
-                            o._Obj->_U._Collection->emplace_back();
-                            _ParseBinaryObject(is, item_key, object_end, buffer, buffer_start, buffer_end, *o._Obj->_U._Collection->rbegin());
-                            clear = true;
-                            break;
-
-                        case BinaryNodeType::String:
-                            error = Details::ParseBinaryString(buffer_start, buffer_end, tmp1);
-                            if (error == -2)
-                            {
-                                throw ParserException("Invalid codepoint while parsing binary string");
-                            }
-                            if(error == 0)
-                            {// String was fully read
-                                o._Obj->_U._Collection->emplace_back(std::move(item_key), std::move(tmp1));
-
-                                clear = true;
-                            }
-                            break;
-
-                        case BinaryNodeType::Int32:
-                            Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 4);
-                            if (tmp1.length() == 4)
-                            {
-                                o._Obj->_U._Collection->emplace_back(std::move(item_key), *reinterpret_cast<const int32_t*>(tmp1.data()));
-                                clear = true;
-                            }
-                            break;
-
-                        case BinaryNodeType::Float:
-                            Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 4);
-                            if (tmp1.length() == 4)
-                            {
-                                o._Obj->_U._Collection->emplace_back(std::move(item_key), *reinterpret_cast<const float*>(tmp1.data()));
-                                clear = true;
-                            }
-                            break;
-
-                        case BinaryNodeType::Pointer:
-                            Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 4);
-                            if (tmp1.length() == 4)
-                            {
-                                o._Obj->_U._Collection->emplace_back(std::move(item_key), *reinterpret_cast<const pointer_t*>(tmp1.data()));
-                                clear = true;
-                            }
-                            break;
-
-                        case BinaryNodeType::Color:
-                            Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 4);
-                            if (tmp1.length() == 4)
-                            {
-                                o._Obj->_U._Collection->emplace_back(std::move(item_key), *reinterpret_cast<const color_t*>(tmp1.data()));
-                                clear = true;
-                            }
-                            break;
-
-                        case BinaryNodeType::Int64:
-                            Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 8);
-                            if (tmp1.length() == 8)
-                            {
-                                o._Obj->_U._Collection->emplace_back(std::move(item_key), *reinterpret_cast<const int64_t*>(tmp1.data()));
-                                clear = true;
-                            }
-                            break;
-
-                        case BinaryNodeType::UInt64:
-                            Details::ReadBinaryBytes(buffer_start, buffer_end, tmp1, 8);
-                            if (tmp1.length() == 8)
-                            {
-                                o._Obj->_U._Collection->emplace_back(std::move(item_key), *reinterpret_cast<const uint64_t*>(tmp1.data()));
-                                clear = true;
-                            }
-                            break;
-
-                        default:
-                            throw ParserException("Unhandled binary VDF node type " + std::to_string(static_cast<unsigned int>(static_cast<uint8_t>(state))) + " for key \"" + item_key + "\"");
-                    }
-
-                    if (clear)
-                    {
-                        item_key.clear();
-                        tmp1.clear();
-                        parsed_item_key = false;
-                        type_read = false;
-                    }
+                    case BinaryNodeType::Int32  : collection.emplace_back(std::move(item_key), *reinterpret_cast<const int32_t*>(tmp1.data())); break;
+                    case BinaryNodeType::Float  : collection.emplace_back(std::move(item_key), *reinterpret_cast<const float*>(tmp1.data())); break;
+                    case BinaryNodeType::Pointer: collection.emplace_back(std::move(item_key), *reinterpret_cast<const pointer_t*>(tmp1.data())); break;
+                    case BinaryNodeType::Color  : collection.emplace_back(std::move(item_key), *reinterpret_cast<const color_t*>(tmp1.data())); break;
+                    case BinaryNodeType::Int64  : collection.emplace_back(std::move(item_key), *reinterpret_cast<const int64_t*>(tmp1.data())); break;
+                    case BinaryNodeType::UInt64 : collection.emplace_back(std::move(item_key), *reinterpret_cast<const uint64_t*>(tmp1.data())); break;
+                    default: break; // Not reachable, filtered above.
                 }
             }
         }
-
-        is.read(&buffer[0], buffer.length());
-        buffer_start = &buffer[0];
-        buffer_end = buffer_start + is.gcount();
     }
 }
 
@@ -1600,28 +1575,35 @@ inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chu
     }
     else
     {// Parse as binary VDF
-        if (!is.read(&buffer[0], 1) || is.gcount() != 1)
+        if (buffer.empty())
+            buffer.resize(1);
+
+        buffer_start = buffer_end = buffer.data();
+        if (!Details::FillBinaryBuffer(is, buffer, buffer_start, buffer_end))
         {
             throw ParserException("Premature end of file while parsing root binary object");
         }
-        if (buffer[0] != (int8_t)BinaryNodeType::Object)
+        if (*buffer_start++ != static_cast<char>(BinaryNodeType::Object))
         {
             throw ParserException("Binary root item type is not an object");
         }
-
-        while (is.read(&buffer[0], chunk_size) || is.gcount() != 0)
+        if (!Details::ReadFullBinaryString(is, buffer, buffer_start, buffer_end, object_name))
         {
-            buffer_start = &buffer[0];
-            buffer_end = buffer_start + is.gcount();
+            throw ParserException("Premature end of file while parsing root binary object name");
+        }
 
-            error = Details::ParseBinaryString(buffer_start, buffer_end, object_name);
-            if (error == -2)
+        _ParseBinaryObject(is, object_name, binary_root_end, buffer, buffer_start, buffer_end, parsed_object);
+
+        // Only one root object is allowed. Valve binary files commonly end with one extra
+        // end marker after the root object end (0x08, or the root end marker itself):
+        // accept a single one, reject anything else.
+        if (Details::FillBinaryBuffer(is, buffer, buffer_start, buffer_end))
+        {
+            const char trailing = *buffer_start++;
+            if ((trailing != static_cast<char>(BinaryNodeType::ObjectEnd) && trailing != static_cast<char>(binary_root_end)) ||
+                Details::FillBinaryBuffer(is, buffer, buffer_start, buffer_end))
             {
-                throw ParserException("Invalid codepoint while parsing binary string");
-            }
-            if (error == 0)
-            {
-                _ParseBinaryObject(is, object_name, binary_root_end, buffer, buffer_start, buffer_end, parsed_object);
+                throw ParserException("Unexpected data after the binary root object");
             }
         }
     }

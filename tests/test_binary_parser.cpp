@@ -205,3 +205,79 @@ TEST_CASE("Binary parser: unknown node type throws ParserException", "[binary_pa
         }
     }
 }
+
+namespace {
+
+// Returns "ParserException", "OK" or the type of the other exception, to report the outcome in a single CHECK.
+std::string ParseOutcome(std::string const& blob, size_t chunk_size)
+{
+    try
+    {
+        ParseBinary(blob, chunk_size);
+        return "OK";
+    }
+    catch (EasyVDF::ParserException const&)
+    {
+        return "ParserException";
+    }
+    catch (std::exception const& e)
+    {
+        return std::string("other exception: ") + e.what();
+    }
+}
+
+}
+
+TEST_CASE("Binary parser: truncated input throws ParserException", "[binary_parser][errors]")
+{
+    std::ifstream f("binary.vdf", std::ios::binary | std::ios::in);
+    REQUIRE(f);
+    std::string file_blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    auto sample = MakeSample();
+    for (std::string const& blob : {sample.SerializeAsBinary(1), sample.SerializeAsBinary(2), file_blob})
+    {
+        // Every strict prefix is truncated: in the root header, a key, a value, or a missing end marker.
+        for (size_t length = 0; length < blob.size(); ++length)
+        {
+            for (size_t chunk_size : {size_t(1), size_t(3), size_t(7), size_t(64), size_t(10 * 1024)})
+            {
+                INFO("prefix length " << length << " of " << blob.size() << ", chunk size " << chunk_size);
+                CHECK(ParseOutcome(blob.substr(0, length), chunk_size) == "ParserException");
+            }
+        }
+    }
+
+    // Nested object closed but root end marker missing.
+    CHECK(ParseOutcome(std::string("\x00Root\x00\x00Sub\x00\x01k\x00v\x00\x08", 17), 1024) == "ParserException");
+}
+
+TEST_CASE("Binary parser: data after the root object", "[binary_parser][trailing]")
+{
+    auto sample = MakeSample();
+    const std::string v1 = sample.SerializeAsBinary(1);
+    const std::string v2 = sample.SerializeAsBinary(2);
+
+    for (size_t chunk_size : {size_t(1), size_t(2), size_t(5), size_t(16), v1.size(), v1.size() + 1, v2.size(), v2.size() + 1, size_t(10 * 1024)})
+    {
+        INFO("chunk size " << chunk_size);
+
+        // Accepted: a single extra end marker, 0x08 or the root end marker itself.
+        CHECK(ParseOutcome(v1 + "\x08", chunk_size) == "OK");
+        CHECK(ParseOutcome(v2 + "\x08", chunk_size) == "OK");
+        CHECK(ParseOutcome(v2 + "\x0b", chunk_size) == "OK");
+        CHECK(Compare(sample, ParseBinary(v1 + "\x08", chunk_size)) == "");
+        CHECK(Compare(sample, ParseBinary(v2 + "\x0b", chunk_size)) == "");
+
+        // Rejected: anything else.
+        CHECK(ParseOutcome(v1 + "\x0b", chunk_size) == "ParserException");
+        CHECK(ParseOutcome(v1 + "\x08\x08", chunk_size) == "ParserException");
+        CHECK(ParseOutcome(v2 + "\x0b\x0b", chunk_size) == "ParserException");
+        CHECK(ParseOutcome(v1 + std::string(1, '\0'), chunk_size) == "ParserException");
+        CHECK(ParseOutcome(v2 + "garbage", chunk_size) == "ParserException");
+        CHECK(ParseOutcome(v2 + "\x08garbage", chunk_size) == "ParserException");
+        // A second root object (used to be parsed into the same object, leaking the first one).
+        CHECK(ParseOutcome(v1 + v1, chunk_size) == "ParserException");
+        CHECK(ParseOutcome(v2 + v2.substr(8), chunk_size) == "ParserException");
+    }
+}
