@@ -1,5 +1,6 @@
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "../EasyVDF.h"
 #include "catch.hpp"
@@ -114,4 +115,43 @@ TEST_CASE("Text parser ignores trailing spaces and tabs", "[text_parser][blank_l
     SECTION("LF")   { CheckSimpleRoot(ParseText(text)); }
     SECTION("CRLF") { CheckSimpleRoot(ParseText(WithEol(text, "\r\n"))); }
     SECTION("CR")   { CheckSimpleRoot(ParseText(WithEol(text, "\r"))); }
+}
+
+TEST_CASE("getline returns the last line when there is no trailing EOL", "[text_parser][getline]")
+{
+    auto lines_of = [](std::string const& text) {
+        std::stringstream ss(text, std::ios::in | std::ios::binary);
+        std::vector<std::string> lines;
+        std::string line;
+        while (EasyVDF::Details::getline(ss, line))
+            lines.push_back(line);
+        return lines;
+    };
+
+    CHECK(lines_of("") == std::vector<std::string>{});
+    CHECK(lines_of("a") == std::vector<std::string>{ "a" });
+    CHECK(lines_of("a\nb") == (std::vector<std::string>{ "a\n", "b" }));
+    CHECK(lines_of("a\r\nb") == (std::vector<std::string>{ "a\r\n", "b" }));
+    CHECK(lines_of("a\rb") == (std::vector<std::string>{ "a\r", "b" }));
+    CHECK(lines_of("a\nb\n") == (std::vector<std::string>{ "a\n", "b\n" }));
+    CHECK(lines_of("a\r") == std::vector<std::string>{ "a\r" });
+    CHECK(lines_of("a\n\n") == (std::vector<std::string>{ "a\n", "\n" }));
+}
+
+TEST_CASE("Text parser handles a file without trailing EOL", "[text_parser][getline]")
+{
+    const std::string text =
+        "\"root\"\n"
+        "{\n"
+        "\t\"k\"\t\"v\"\n"
+        "\t\"sub\"\n"
+        "\t{\n"
+        "\t\t\"k2\"\t\"v2\"\n"
+        "\t}\n"
+        "}";
+
+    SECTION("LF")   { CheckSimpleRoot(ParseText(text)); }
+    SECTION("CRLF") { CheckSimpleRoot(ParseText(WithEol(text, "\r\n"))); }
+    SECTION("CR")   { CheckSimpleRoot(ParseText(WithEol(text, "\r"))); }
+    SECTION("Trailing blanks") { CheckSimpleRoot(ParseText(text + "\n \t")); }
 }

@@ -95,7 +95,12 @@ static std::basic_istream<CharT, Traits>& getline(std::basic_istream<CharT, Trai
             break;
         }
     }
-    
+
+    // Like std::getline: reaching EOF after extracting at least one character
+    // is a success, the last line is valid even without a trailing EOL.
+    if (!buffer.empty() && is.eof() && !is.bad())
+        is.clear(std::ios_base::eofbit);
+
     return is;
 }
 
