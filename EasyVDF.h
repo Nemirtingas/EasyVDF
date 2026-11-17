@@ -176,6 +176,14 @@ inline int ParseBinaryString(const char*& b, const char* e, std::string& str)
     return -1;
 }
 
+/// <summary>
+/// Parses a double quoted text string.
+/// Returns  0 when the string was read up to its closing quote
+/// Returns -1 when no opening quote was found
+/// Returns -2 when no closing quote was found
+/// Returns -3 is reserved for invalid codepoints, it is never returned since
+///            strings are not UTF-8 validated (see below).
+/// </summary>
 inline int ParseString(const char*& b, const char* e, std::string& str)
 {
     bool has_escape = false;
@@ -197,47 +205,26 @@ inline int ParseString(const char*& b, const char* e, std::string& str)
             break;
         }
     }
+    // Strings are opaque byte sequences: UTF-8 is not validated. Only the ASCII
+    // bytes '"' and '\\' are significant, and they can never appear inside a
+    // multi-byte UTF-8 sequence, so scanning byte by byte is always safe.
     while (b != e)
     {
-        unsigned char c = *b++;
-        if (c < 0x80u)
+        char c = *b++;
+        if (c == '\\')
         {
-            if (c == '\\')
-            {
-                has_escape = true;
-                continue;
-            }
-            if (has_escape)
-            {
-                has_escape = false;
-                continue;
-            }
-            if (c == '"')
-            {
-                str.assign(string_start, b - 1);
-                return 0;
-            }
+            has_escape = true;
+            continue;
         }
-        else if ((c >> 5) == 0x6)
-        {// 2 bytes utf8
-            if (b == e)
-                return -3;
-
-            ++b;
+        if (has_escape)
+        {
+            has_escape = false;
+            continue;
         }
-        else if ((c >> 4) == 0xe)
-        {// 3 bytes utf8
-            if (b == (e - 1))
-                return -3;
-
-            b += 2;
-        }
-        else if ((c >> 3) == 0x1e)
-        {// 4 bytes utf8
-            if (b == (e - 2))
-                return -3;
-
-            b += 3;
+        if (c == '"')
+        {
+            str.assign(string_start, b - 1);
+            return 0;
         }
     }
     if (string_start == nullptr)
