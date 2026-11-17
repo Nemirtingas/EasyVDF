@@ -46,41 +46,36 @@ int main(int argc, char* argv[])
     }
     const std::string language = argc > 2 ? argv[2] : "english";
 
-    try
+    // The root key is the appid; the format (text or binary) is detected.
+    const EasyVDF::Result<EasyVDF::KeyValue> loaded = EasyVDF::load(argv[1]);
+    if (!loaded)
     {
-        // The root key is the appid; the format (text or binary) is detected.
-        const EasyVDF::KeyValue schema = EasyVDF::load(argv[1]);
+        // "Io: EasyVDF: can't open ...", "UnexpectedEof: Premature end of file ...", ...
+        std::cerr << argv[1] << ": " << loaded.error() << '\n';
+        return 1;
+    }
+    const EasyVDF::KeyValue& schema = *loaded;
 
-        std::cout << schema["gamename"].value_or("Unknown game") << " (appid " << schema.key()
-                  << ", schema version " << schema["version"].value_or(0) << ")\n";
+    std::cout << schema["gamename"].value_or("Unknown game") << " (appid " << schema.key()
+              << ", schema version " << schema["version"].value_or(0) << ")\n";
 
-        // Each entry of "stats" is either a block of achievements (type "ACHIEVEMENTS",
-        // each bit of the stat is an achievement) or a single stat (type 1 = int, 2 = float, 3 = average rate).
-        for (const auto& [id, stat] : schema["stats"])
+    // Each entry of "stats" is either a block of achievements (type "ACHIEVEMENTS",
+    // each bit of the stat is an achievement) or a single stat (type 1 = int, 2 = float, 3 = average rate).
+    for (const auto& [id, stat] : schema["stats"])
+    {
+        const std::string type = stat["type"].value_or("");
+        if (type == "ACHIEVEMENTS" || type == "4")
         {
-            const std::string type = stat["type"].value_or("");
-            if (type == "ACHIEVEMENTS" || type == "4")
-            {
-                std::cout << "\nAchievements (stat " << id << "):\n";
-                PrintAchievements(stat["bits"], language);
-            }
-            else
-            {
-                const char* kind = type == "1" ? "int" : type == "2" ? "float" : type == "3" ? "avgrate" : "?";
-                std::cout << "\nStat " << id << ": " << stat["name"].value_or("?") << " (" << kind << ")"
-                          << ", \"" << Localized(stat["display"]["name"], language) << "\""
-                          << ", default " << stat["default"].value_or("0") << '\n';
-            }
+            std::cout << "\nAchievements (stat " << id << "):\n";
+            PrintAchievements(stat["bits"], language);
         }
-        return 0;
+        else
+        {
+            const char* kind = type == "1" ? "int" : type == "2" ? "float" : type == "3" ? "avgrate" : "?";
+            std::cout << "\nStat " << id << ": " << stat["name"].value_or("?") << " (" << kind << ")"
+                      << ", \"" << Localized(stat["display"]["name"], language) << "\""
+                      << ", default " << stat["default"].value_or("0") << '\n';
+        }
     }
-    catch (const EasyVDF::ParseError& e)
-    {
-        std::cerr << argv[1] << ": invalid VDF: " << e.what() << '\n';
-    }
-    catch (const EasyVDF::Error& e)
-    {
-        std::cerr << argv[1] << ": " << e.what() << '\n';
-    }
-    return 1;
+    return 0;
 }

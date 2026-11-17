@@ -1,4 +1,4 @@
-// Result, ErrorInfo, the try_* functions, and their agreement with the throwing API.
+// Result, ErrorInfo, and the errors of every operation that can fail: code, message, position.
 
 #include <cstdio>
 #include <fstream>
@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "../EasyVDF.h"
-#include "catch.hpp"
+#include "helpers.h"
 
 using Catch::Matchers::Contains;
 using EasyVDF::ErrorCode;
@@ -24,43 +24,11 @@ using EasyVDF::Result;
 
 namespace {
 
-// The error thrown by f, as an ErrorInfo; nullopt if nothing was thrown.
-template<typename F>
-std::optional<ErrorInfo> Thrown(F&& f)
-{
-    try
-    {
-        f();
-    }
-    catch (EasyVDF::Error const& e)
-    {
-        return e.info();
-    }
-    return std::nullopt;
-}
-
-// The exception class that matches a code.
-template<typename F>
-std::string ThrownClass(F&& f)
-{
-    try
-    {
-        f();
-    }
-    catch (EasyVDF::ParseError const&) { return "ParseError"; }
-    catch (EasyVDF::IoError const&) { return "IoError"; }
-    catch (EasyVDF::WriteError const&) { return "WriteError"; }
-    catch (EasyVDF::TypeError const&) { return "TypeError"; }
-    catch (EasyVDF::KeyError const&) { return "KeyError"; }
-    catch (std::exception const& e) { return std::string("other: ") + e.what(); }
-    return "nothing";
-}
-
-// The error of try_parse() on data, which must be the same from memory, from a stream
-// read by blocks of any size, through try_parse_all(), and thrown by parse().
+// The error of parse() on data, which must be the same from memory, from a stream
+// read by blocks of any size.
 ErrorInfo ParseErrorOf(std::string const& data, EasyVDF::ReadOptions options = {})
 {
-    Result<KeyValue> from_memory = EasyVDF::try_parse(data, options);
+    Result<KeyValue> from_memory = EasyVDF::parse(data, options);
     REQUIRE_FALSE(from_memory.has_value());
     ErrorInfo const& error = from_memory.error();
 
@@ -69,15 +37,12 @@ ErrorInfo ParseErrorOf(std::string const& data, EasyVDF::ReadOptions options = {
         INFO("chunk size " << chunk_size);
         std::istringstream is(data);
         options.chunk_size = chunk_size;
-        Result<KeyValue> from_stream = EasyVDF::try_parse(is, options);
+        Result<KeyValue> from_stream = EasyVDF::parse(is, options);
         REQUIRE_FALSE(from_stream.has_value());
         CHECK(from_stream.error() == error);
     }
 
-    const std::optional<ErrorInfo> thrown = Thrown([&] { EasyVDF::parse(data, options); });
-    REQUIRE(thrown);
-    CHECK(*thrown == error);
-    CHECK(ThrownClass([&] { EasyVDF::parse(data, options); }) == "ParseError");
+    CHECK(EasyVDF::is_parse_error(error.code));
     return error;
 }
 
@@ -173,57 +138,6 @@ TEST_CASE("ErrorInfo", "[result][error_info]")
     CHECK(os.str() == "Syntax: bad token at line 3, column 4");
 }
 
-TEST_CASE("Exceptions carry the ErrorInfo", "[result][exceptions]")
-{
-    SECTION("from an ErrorInfo")
-    {
-        const ErrorInfo error(ErrorCode::DepthExceeded, "too deep at line 2, column 1", 2, 1);
-        EasyVDF::ParseError e(error);
-        CHECK(e.code() == ErrorCode::DepthExceeded);
-        CHECK(std::string(e.what()) == error.message);
-        CHECK(e.line() == 2);
-        CHECK(e.column() == 1);
-        CHECK(e.info() == error);
-    }
-
-    SECTION("the historical constructors give the code of their class")
-    {
-        CHECK(EasyVDF::ParseError("m", 1, 2).info() == ErrorInfo(ErrorCode::Syntax, "m", 1, 2));
-        CHECK(EasyVDF::ParseError("m").info() == ErrorInfo(ErrorCode::Syntax, "m"));
-        CHECK(EasyVDF::TypeError("m").info() == ErrorInfo(ErrorCode::Type, "m"));
-        CHECK(EasyVDF::KeyError(std::string("m")).info() == ErrorInfo(ErrorCode::Key, "m"));
-        CHECK(EasyVDF::WriteError("m").info() == ErrorInfo(ErrorCode::Write, "m"));
-        CHECK(EasyVDF::IoError(std::string("m")).info() == ErrorInfo(ErrorCode::Io, "m"));
-    }
-
-    SECTION("they are still std::runtime_error")
-    {
-        static_assert(std::is_base_of_v<std::runtime_error, EasyVDF::Error>);
-        static_assert(std::is_base_of_v<EasyVDF::Error, EasyVDF::ParseError>);
-        static_assert(std::is_base_of_v<EasyVDF::Error, EasyVDF::IoError>);
-        static_assert(std::is_nothrow_copy_constructible_v<EasyVDF::ParseError>);
-    }
-
-    SECTION("value() throws the class that matches the code")
-    {
-        auto thrown_by = [](ErrorCode code) { return ThrownClass([&] { Result<int>(ErrorInfo(code, "m")).value(); }); };
-        for (ErrorCode code : {ErrorCode::Syntax, ErrorCode::UnexpectedEof, ErrorCode::EmptyInput, ErrorCode::TrailingData,
-                               ErrorCode::InvalidRoot, ErrorCode::UnknownNodeType, ErrorCode::UnsupportedNodeType,
-                               ErrorCode::UnsupportedEncoding, ErrorCode::ChecksumMismatch, ErrorCode::DepthExceeded})
-        {
-            CHECK(thrown_by(code) == "ParseError");
-        }
-        CHECK(thrown_by(ErrorCode::Io) == "IoError");
-        CHECK(thrown_by(ErrorCode::Write) == "WriteError");
-        CHECK(thrown_by(ErrorCode::Type) == "TypeError");
-        CHECK(thrown_by(ErrorCode::Key) == "KeyError");
-
-        // The thrown exception holds the whole ErrorInfo.
-        const ErrorInfo error(ErrorCode::TrailingData, "after root at line 7, column 2", 7, 2);
-        CHECK(Thrown([&] { Result<int>(error).value(); }) == error);
-    }
-}
-
 /////////////////////////////////////////////////////////////////////
 // Result<T>
 /////////////////////////////////////////////////////////////////////
@@ -259,7 +173,6 @@ TEST_CASE("Result<T> holds a value or an error", "[result]")
         CHECK(r.error() == ErrorInfo(ErrorCode::Io, "can't open"));
         CHECK(r.value_or("default") == "default");
         CHECK(std::move(r).value_or("moved default") == "moved default");
-        CHECK_THROWS_AS(Result<std::string>(ErrorInfo(ErrorCode::Io, "x")).value(), EasyVDF::IoError);
 
         // The error can be changed in place.
         r.error().message += " (detail)";
@@ -373,10 +286,10 @@ TEST_CASE("Result<T> combinators", "[result][combinators]")
 
         // Chaining on references.
         KeyValue doc("Root", { {"a", { {"b", "x"} }} });
-        Result<Node const&> b = std::as_const(doc).try_at("a").and_then([](Node const& a) { return a.try_at("b"); });
+        Result<Node const&> b = std::as_const(doc).at("a").and_then([](Node const& a) { return a.at("b"); });
         REQUIRE(b);
         CHECK(&*b == &doc["a"]["b"]);
-        Result<Node const&> missing = std::as_const(doc).try_at("a").and_then([](Node const& a) { return a.try_at("c"); });
+        Result<Node const&> missing = std::as_const(doc).at("a").and_then([](Node const& a) { return a.at("c"); });
         CHECK(missing.error().message == "EasyVDF: key \"c\" not found");
     }
 
@@ -419,7 +332,7 @@ TEST_CASE("Result<T&> refers to a node", "[result][reference]")
 
     SECTION("found")
     {
-        Result<Node&> appid = doc.try_at("appid");
+        Result<Node&> appid = doc.at("appid");
         REQUIRE(appid);
         CHECK(&*appid == &doc["appid"]);
         CHECK(appid->value_or(0) == 440);
@@ -439,55 +352,50 @@ TEST_CASE("Result<T&> refers to a node", "[result][reference]")
 
     SECTION("missing")
     {
-        Result<Node&> missing = doc.try_at("missing");
+        Result<Node&> missing = doc.at("missing");
         REQUIRE_FALSE(missing);
         CHECK(missing.error() == ErrorInfo(ErrorCode::Key, "EasyVDF: key \"missing\" not found"));
         CHECK(missing.value_or(5).value_or(0) == 5);
-        CHECK(Thrown([&] { missing.value(); }) == missing.error());
-        CHECK(ThrownClass([&] { missing.value(); }) == "KeyError");
     }
 
     SECTION("same error as at()")
     {
-        CHECK(Thrown([&] { doc.at("nope"); }) == doc.try_at("nope").error());
-        CHECK(Thrown([&] { std::as_const(doc).at("nope"); }) == std::as_const(doc).try_at("nope").error());
-        CHECK(Thrown([&] { doc["appid"].at("x"); }) == doc["appid"].try_at("x").error());
-        CHECK(&doc.at("sub") == &*doc.try_at("sub"));
+        CHECK(&*doc.at("sub") == &doc["sub"]);
     }
 
     SECTION("const and conversions")
     {
-        Result<Node const&> const_sub = std::as_const(doc).try_at("sub");
+        Result<Node const&> const_sub = std::as_const(doc).at("sub");
         static_assert(std::is_same_v<decltype(*const_sub), Node const&>);
         CHECK(const_sub->size() == 1);
 
         // Node& converts to Node const&, with the value or the error.
-        Result<Node const&> converted = doc.try_at("sub");
+        Result<Node const&> converted = doc.at("sub");
         CHECK(&*converted == &doc["sub"]);
-        Result<Node const&> converted_error = doc.try_at("x");
+        Result<Node const&> converted_error = doc.at("x");
         CHECK(converted_error.error().code == ErrorCode::Key);
 
         // Assignment rebinds, like a pointer.
-        Result<Node const&> r = std::as_const(doc).try_at("appid");
-        r = std::as_const(doc).try_at("sub");
+        Result<Node const&> r = std::as_const(doc).at("appid");
+        r = std::as_const(doc).at("sub");
         CHECK(&*r == &doc["sub"]);
         CHECK(doc["appid"].value_or(0) == 440);
     }
 
     SECTION("combinators")
     {
-        Result<int> appid = doc.try_at("appid").map([](Node const& n) { return n.value_or(0); });
+        Result<int> appid = doc.at("appid").map([](Node const& n) { return n.value_or(0); });
         CHECK(*appid == 440);
 
-        Result<std::string> k = doc.try_at("sub")
-            .and_then([](Node& sub) { return sub.try_at("k"); })
+        Result<std::string> k = doc.at("sub")
+            .and_then([](Node& sub) { return sub.at("k"); })
             .map([](Node const& n) { return n.value_or(std::string()); });
         CHECK(*k == "v");
 
-        Result<Node&> fallback = doc.try_at("missing").or_else([&](ErrorInfo const&) { return doc.try_at("appid"); });
+        Result<Node&> fallback = doc.at("missing").or_else([&](ErrorInfo const&) { return doc.at("appid"); });
         CHECK(&*fallback == &doc["appid"]);
 
-        Result<Node&> with_context = doc.try_at("missing").map_error([](ErrorInfo e) { e.message += "!"; return e; });
+        Result<Node&> with_context = doc.at("missing").map_error([](ErrorInfo e) { e.message += "!"; return e; });
         CHECK(with_context.error().message == "EasyVDF: key \"missing\" not found!");
     }
 }
@@ -499,10 +407,8 @@ TEST_CASE("Result<void> is a success or an error", "[result][void]")
 
     CHECK(ok.has_value());
     CHECK(static_cast<bool>(ok));
-    CHECK_NOTHROW(ok.value());
     CHECK_FALSE(failed.has_value());
     CHECK(failed.error().code == ErrorCode::Write);
-    CHECK_THROWS_AS(failed.value(), EasyVDF::WriteError);
 
     CHECK(*ok.map([] { return 3; }) == 3);
     CHECK(failed.map([] { return 3; }).error() == failed.error());
@@ -522,37 +428,37 @@ TEST_CASE("Result<void> is a success or an error", "[result][void]")
 }
 
 /////////////////////////////////////////////////////////////////////
-// try_parse, try_parse_all
+// parse, parse_all
 /////////////////////////////////////////////////////////////////////
 
-TEST_CASE("try_parse succeeds like parse", "[result][try_parse]")
+TEST_CASE("parse and parse_all succeed", "[result][parse]")
 {
     const std::string text = "\"root\"\n{\n\t\"k\"\t\"v\"\n}\n";
-    Result<KeyValue> doc = EasyVDF::try_parse(text);
+    Result<KeyValue> doc = EasyVDF::parse(text);
     REQUIRE(doc);
     CHECK(*doc == EasyVDF::parse(text));
     CHECK((*doc)["k"].value_or("") == "v");
 
     std::istringstream is(text);
-    CHECK(EasyVDF::try_parse(is).value() == *doc);
+    CHECK(EasyVDF::parse(is).value() == *doc);
 
     const KeyValue sample = Sample();
     for (Format format : {Format::Binary, Format::Vbkv})
     {
-        CHECK(EasyVDF::try_parse(sample.to_binary(format)).value() == sample);
-        std::istringstream binary(sample.to_binary(format));
-        CHECK(EasyVDF::try_parse(binary).value() == sample);
+        CHECK(EasyVDF::parse(sample.to_binary(format).value()).value() == sample);
+        std::istringstream binary(sample.to_binary(format).value());
+        CHECK(EasyVDF::parse(binary).value() == sample);
     }
 
-    Result<std::vector<KeyValue>> roots = EasyVDF::try_parse_all("a { k 1 }\nb { k 2 }\n");
+    Result<std::vector<KeyValue>> roots = EasyVDF::parse_all("a { k 1 }\nb { k 2 }\n");
     REQUIRE(roots);
     REQUIRE(roots->size() == 2);
     CHECK((*roots)[1].key() == "b");
     std::istringstream all("a { }");
-    CHECK(EasyVDF::try_parse_all(all).value().size() == 1);
+    CHECK(EasyVDF::parse_all(all).value().size() == 1);
 }
 
-TEST_CASE("try_parse: text errors have a code and a position", "[result][try_parse][text]")
+TEST_CASE("parse: text errors have a code and a position", "[result][parse][text]")
 {
     EasyVDF::ReadOptions text;
     text.format = Format::Text;
@@ -597,7 +503,7 @@ TEST_CASE("try_parse: text errors have a code and a position", "[result][try_par
     CHECK(ParseErrorOf("\"root\"\n{\n\t\"k\"\n}\n").message == "Expected a value or an object start ('{') after key \"k\" at line 4, column 1");
 }
 
-TEST_CASE("try_parse: depth limit", "[result][try_parse][depth]")
+TEST_CASE("parse: depth limit", "[result][parse][depth]")
 {
     auto nested_text = [](std::size_t depth) {
         std::string text = "\"root\"\n";
@@ -607,7 +513,7 @@ TEST_CASE("try_parse: depth limit", "[result][try_parse][depth]")
         return text + std::string(depth, '}');
     };
     EasyVDF::ReadOptions options;
-    CHECK(EasyVDF::try_parse(nested_text(options.max_depth)).has_value());
+    CHECK(EasyVDF::parse(nested_text(options.max_depth)).has_value());
     const ErrorInfo text = ParseErrorOf(nested_text(options.max_depth + 1));
     CHECK(Where(text) == "DepthExceeded " + std::to_string(2 * (options.max_depth + 1)) + ":1");
 
@@ -617,7 +523,7 @@ TEST_CASE("try_parse: depth limit", "[result][try_parse][depth]")
             blob += std::string("\x00o\x00", 3);
         return blob + std::string(depth, '\x08');
     };
-    CHECK(EasyVDF::try_parse(nested_binary(options.max_depth)).has_value());
+    CHECK(EasyVDF::parse(nested_binary(options.max_depth)).has_value());
     CHECK(Where(ParseErrorOf(nested_binary(options.max_depth + 1))) == "DepthExceeded 0:0");
     CHECK(Where(ParseErrorOf(Vbkv(nested_binary(100000)))) == "DepthExceeded 0:0");
 
@@ -626,7 +532,7 @@ TEST_CASE("try_parse: depth limit", "[result][try_parse][depth]")
     CHECK(ParseErrorOf(nested_text(3), options).code == ErrorCode::DepthExceeded);
 }
 
-TEST_CASE("try_parse: binary errors", "[result][try_parse][binary]")
+TEST_CASE("parse: binary errors", "[result][parse][binary]")
 {
     const KeyValue sample = Sample();
 
@@ -634,7 +540,7 @@ TEST_CASE("try_parse: binary errors", "[result][try_parse][binary]")
     {
         for (Format format : {Format::Binary, Format::Vbkv})
         {
-            const std::string blob = sample.to_binary(format);
+            const std::string blob = sample.to_binary(format).value();
             CHECK(ParseErrorOf(blob.substr(0, 0)).code == ErrorCode::EmptyInput);
             // The last byte is the optional list terminator: the prefix without it is complete.
             for (std::size_t length = 1; length + 1 < blob.size(); ++length)
@@ -670,8 +576,8 @@ TEST_CASE("try_parse: binary errors", "[result][try_parse][binary]")
 
     SECTION("trailing data")
     {
-        std::string v1 = sample.to_binary(Format::Binary);
-        std::string payload = sample.to_binary(Format::Vbkv).substr(8);
+        std::string v1 = sample.to_binary(Format::Binary).value();
+        std::string payload = sample.to_binary(Format::Vbkv).value().substr(8);
         v1.pop_back();
         payload.pop_back();
         CHECK(Where(ParseErrorOf(v1 + "\x08\x08")) == "TrailingData 0:0");
@@ -683,57 +589,56 @@ TEST_CASE("try_parse: binary errors", "[result][try_parse][binary]")
 
     SECTION("checksum")
     {
-        std::string blob = sample.to_binary(Format::Vbkv);
+        std::string blob = sample.to_binary(Format::Vbkv).value();
         blob[4] ^= 0x01;
         const ErrorInfo error = ParseErrorOf(blob);
         CHECK(Where(error) == "ChecksumMismatch 0:0");
         CHECK_THAT(error.message, Contains("checksum mismatch"));
 
         // Corrupting the payload gives a checksum error or a structural one, never a document.
-        const std::string good = sample.to_binary(Format::Vbkv);
+        const std::string good = sample.to_binary(Format::Vbkv).value();
         for (std::size_t position = 8; position < good.size(); ++position)
         {
             std::string corrupted = good;
             corrupted[position] ^= 0x20;
-            CHECK_FALSE(EasyVDF::try_parse(corrupted).has_value());
+            CHECK_FALSE(EasyVDF::parse(corrupted).has_value());
         }
 
         // Without verification, a wrong checksum is accepted.
         EasyVDF::ReadOptions options;
         options.verify_crc = false;
-        CHECK(EasyVDF::try_parse(blob, options).value() == sample);
+        CHECK(EasyVDF::parse(blob, options).value() == sample);
     }
 
     SECTION("the root must be an object")
     {
         EasyVDF::ReadOptions options;
         options.format = Format::Binary;
-        CHECK(Where(ParseErrorOf(sample.to_text(), options)) == "InvalidRoot 0:0");
+        CHECK(Where(ParseErrorOf(sample.to_text().value(), options)) == "InvalidRoot 0:0");
         CHECK(Where(ParseErrorOf(std::string("\x01k\x00v\x00", 5), options)) == "InvalidRoot 0:0");
     }
 }
 
-TEST_CASE("try_parse_all reports the same errors as parse_all", "[result][try_parse]")
+TEST_CASE("parse_all: errors from memory and from streams", "[result][parse]")
 {
     for (const char* text : {"", "  \n", "a { } b", "a { } b {", "a { } }", "a { }\nb c\n", "a { \"k\" }"})
     {
         INFO(text);
-        Result<std::vector<KeyValue>> roots = EasyVDF::try_parse_all(text);
+        Result<std::vector<KeyValue>> roots = EasyVDF::parse_all(text);
         REQUIRE_FALSE(roots);
-        CHECK(Thrown([&] { EasyVDF::parse_all(text); }) == roots.error());
 
         std::istringstream is(text);
-        CHECK(EasyVDF::try_parse_all(is).error() == roots.error());
+        CHECK(EasyVDF::parse_all(is).error() == roots.error());
     }
-    CHECK(Where(EasyVDF::try_parse_all("a { }\nb c\n").error()) == "Syntax 2:3");
-    CHECK(Where(EasyVDF::try_parse_all("a { } b").error()) == "UnexpectedEof 1:0");
-    CHECK(Where(EasyVDF::try_parse_all("a { } }").error()) == "Syntax 1:7");
+    CHECK(Where(EasyVDF::parse_all("a { }\nb c\n").error()) == "Syntax 2:3");
+    CHECK(Where(EasyVDF::parse_all("a { } b").error()) == "UnexpectedEof 1:0");
+    CHECK(Where(EasyVDF::parse_all("a { } }").error()) == "Syntax 1:7");
 
     const KeyValue doc("Root", { {"k", "v"} });
-    CHECK(Where(EasyVDF::try_parse_all(doc.to_binary() + doc.to_binary()).error()) == "TrailingData 0:0");
+    CHECK(Where(EasyVDF::parse_all(doc.to_binary().value() + doc.to_binary().value()).error()) == "TrailingData 0:0");
 }
 
-TEST_CASE("try_parse: a stream read error is an Io error", "[result][try_parse][io]")
+TEST_CASE("parse: a stream read error is an Io error", "[result][parse][io]")
 {
     struct FailingBuffer : std::streambuf
     {
@@ -766,52 +671,48 @@ TEST_CASE("try_parse: a stream read error is an Io error", "[result][try_parse][
 
             FailingBuffer buffer(data);
             std::istream is(&buffer);
-            Result<KeyValue> doc = EasyVDF::try_parse(is, options);
+            Result<KeyValue> doc = EasyVDF::parse(is, options);
             REQUIRE_FALSE(doc);
             CHECK(doc.error() == ErrorInfo(ErrorCode::Io, "EasyVDF: failed to read the input stream"));
 
             FailingBuffer buffer_all(data);
             std::istream is_all(&buffer_all);
-            CHECK(EasyVDF::try_parse_all(is_all, options).error().code == ErrorCode::Io);
+            CHECK(EasyVDF::parse_all(is_all, options).error().code == ErrorCode::Io);
 
             FailingBuffer buffer_throw(data);
             std::istream is_throw(&buffer_throw);
-            CHECK(Thrown([&] { EasyVDF::parse(is_throw, options); }) == doc.error());
         }
     }
 
     // A binary document too.
-    const std::string blob = Sample().to_binary();
+    const std::string blob = Sample().to_binary().value();
     FailingBuffer buffer(blob);
     std::istream is(&buffer);
-    CHECK(EasyVDF::try_parse(is).error().code == ErrorCode::Io);
+    CHECK(EasyVDF::parse(is).error().code == ErrorCode::Io);
 }
 
 /////////////////////////////////////////////////////////////////////
-// try_load, try_load_all
+// load, load_all
 /////////////////////////////////////////////////////////////////////
 
-TEST_CASE("try_load and try_load_all", "[result][try_load]")
+TEST_CASE("load and load_all", "[result][load]")
 {
     SECTION("files")
     {
-        Result<KeyValue> doc = EasyVDF::try_load("binary.vdf");
+        Result<KeyValue> doc = EasyVDF::load("binary.vdf");
         REQUIRE(doc);
         CHECK(*doc == EasyVDF::load("binary.vdf"));
-        CHECK(EasyVDF::try_load_all("linux_eol.vdf").value() == EasyVDF::load_all("linux_eol.vdf"));
+        CHECK(EasyVDF::load_all("linux_eol.vdf").value() == EasyVDF::load_all("linux_eol.vdf"));
     }
 
     SECTION("missing file")
     {
-        Result<KeyValue> doc = EasyVDF::try_load("no_such_file.vdf");
+        Result<KeyValue> doc = EasyVDF::load("no_such_file.vdf");
         REQUIRE_FALSE(doc);
         CHECK(doc.error() == ErrorInfo(ErrorCode::Io, "EasyVDF: can't open \"no_such_file.vdf\" for reading"));
-        CHECK(Thrown([] { EasyVDF::load("no_such_file.vdf"); }) == doc.error());
-        CHECK(ThrownClass([] { EasyVDF::load("no_such_file.vdf"); }) == "IoError");
 
-        Result<std::vector<KeyValue>> all = EasyVDF::try_load_all("no_such_file.vdf");
+        Result<std::vector<KeyValue>> all = EasyVDF::load_all("no_such_file.vdf");
         CHECK(all.error() == doc.error());
-        CHECK(Thrown([] { EasyVDF::load_all("no_such_file.vdf"); }) == doc.error());
     }
 
     SECTION("malformed file")
@@ -821,37 +722,36 @@ TEST_CASE("try_load and try_load_all", "[result][try_load]")
             std::ofstream f(path, std::ios::binary);
             f << "\"root\"\n{\n\t\"k\"\n}\n";
         }
-        CHECK(Where(EasyVDF::try_load(path).error()) == "Syntax 4:1");
-        CHECK(Where(EasyVDF::try_load_all(path).error()) == "Syntax 4:1");
-        CHECK(Thrown([&] { EasyVDF::load(path); }) == EasyVDF::try_load(path).error());
+        CHECK(Where(EasyVDF::load(path).error()) == "Syntax 4:1");
+        CHECK(Where(EasyVDF::load_all(path).error()) == "Syntax 4:1");
         std::remove(path);
     }
 }
 
 /////////////////////////////////////////////////////////////////////
-// try_dump, try_to_text, try_to_binary, try_write, try_save
+// dump, to_text, to_binary, write, save
 /////////////////////////////////////////////////////////////////////
 
-TEST_CASE("try_dump and friends succeed like dump", "[result][try_dump]")
+TEST_CASE("dump, to_text, to_binary, write and save succeed", "[result][dump]")
 {
     const KeyValue sample = Sample();
-    CHECK(sample.try_dump().value() == sample.dump());
-    CHECK(sample.try_to_text().value() == sample.to_text());
-    CHECK(sample.try_to_binary().value() == sample.to_binary());
-    CHECK(sample.try_to_binary(Format::Vbkv).value() == sample.to_binary(Format::Vbkv));
-    CHECK(sample.try_dump(Format::Vbkv).value() == sample.dump(Format::Vbkv));
+    CHECK(sample.dump() == sample.to_text());
+    CHECK(sample.dump(Format::Binary) == sample.to_binary());
+    CHECK(sample.dump(Format::Vbkv) == sample.to_binary(Format::Vbkv));
+    CHECK(EasyVDF::parse(sample.to_text().value()).value().to_text() == sample.to_text());
+    CHECK(EasyVDF::parse(sample.to_binary(Format::Vbkv).value()) == sample);
 
     std::ostringstream os;
-    CHECK(sample.try_write(os, Format::Binary).has_value());
-    CHECK(os.str() == sample.to_binary());
+    CHECK(sample.write(os, Format::Binary).has_value());
+    CHECK(os.str() == sample.to_binary().value());
 
     const char* path = "test_result_save.tmp";
-    REQUIRE(sample.try_save(path, Format::Vbkv).has_value());
-    CHECK(EasyVDF::try_load(path).value() == sample);
+    REQUIRE(sample.save(path, Format::Vbkv).has_value());
+    CHECK(EasyVDF::load(path).value() == sample);
     std::remove(path);
 }
 
-TEST_CASE("try_dump and friends: write errors", "[result][try_dump][errors]")
+TEST_CASE("dump, to_text, to_binary, write and save: write errors", "[result][dump][errors]")
 {
     KeyValue with_null("root");
     with_null.add("k", std::string("a\0b", 3));
@@ -885,53 +785,88 @@ TEST_CASE("try_dump and friends: write errors", "[result][try_dump][errors]")
         INFO(c.message);
         const ErrorInfo expected(ErrorCode::Write, c.message);
 
-        CHECK(c.doc.try_dump(c.options).error() == expected);
-        CHECK(Thrown([&] { c.doc.dump(c.options); }) == expected);
-        CHECK(ThrownClass([&] { c.doc.dump(c.options); }) == "WriteError");
+        CHECK(c.doc.dump(c.options).error() == expected);
 
         // Nothing is written to the stream.
         std::ostringstream os;
-        CHECK(c.doc.try_write(os, c.options).error() == expected);
+        CHECK(c.doc.write(os, c.options).error() == expected);
         CHECK(os.str().empty());
-        CHECK(Thrown([&] { c.doc.write(os, c.options); }) == expected);
 
         // No file is created.
         const char* path = "test_result_not_created.tmp";
-        CHECK(c.doc.try_save(path, c.options).error() == expected);
+        CHECK(c.doc.save(path, c.options).error() == expected);
         CHECK_FALSE(FileExists(path));
-        CHECK(Thrown([&] { c.doc.save(path, c.options); }) == expected);
         CHECK_FALSE(FileExists(path));
     }
 
-    CHECK(none.try_to_text().error().code == ErrorCode::Write);
-    CHECK(scalar.try_to_binary(Format::Vbkv).error().code == ErrorCode::Write);
+    CHECK(none.to_text().error().code == ErrorCode::Write);
+    CHECK(scalar.to_binary(Format::Vbkv).error().code == ErrorCode::Write);
 }
 
-TEST_CASE("try_save: I/O errors", "[result][try_save][io]")
+TEST_CASE("save: I/O errors", "[result][save][io]")
 {
     const KeyValue doc("root");
-    Result<void> saved = doc.try_save("no_such_directory/file.vdf");
+    Result<void> saved = doc.save("no_such_directory/file.vdf");
     REQUIRE_FALSE(saved);
     CHECK(saved.error() == ErrorInfo(ErrorCode::Io, "EasyVDF: can't open \"no_such_directory/file.vdf\" for writing"));
-    CHECK(Thrown([&] { doc.save("no_such_directory/file.vdf"); }) == saved.error());
-    CHECK(ThrownClass([&] { doc.save("no_such_directory/file.vdf"); }) == "IoError");
 }
 
 /////////////////////////////////////////////////////////////////////
 // The other errors of the throwing API
 /////////////////////////////////////////////////////////////////////
 
-TEST_CASE("Type errors have the Type code", "[result][type]")
+TEST_CASE("as<T>() errors have the Type code", "[result][type]")
 {
-    KeyValue doc("root", { {"appid", 440} });
-    const auto as_int = Thrown([&] { doc["missing"].as<int>(); });
-    REQUIRE(as_int);
-    CHECK(as_int->code == ErrorCode::Type);
-    CHECK(as_int->message == "EasyVDF: can't convert a missing value (Type::None) to an integer");
+    KeyValue doc("root", { {"appid", 440}, {"name", "x"} });
 
-    const auto scalar_child = Thrown([&] { doc["appid"]["x"]; });
-    REQUIRE(scalar_child);
-    CHECK(*scalar_child == ErrorInfo(ErrorCode::Type, "EasyVDF: a Int32 value has no children"));
-    CHECK(Thrown([&] { doc["appid"].add("x", 1); }) == scalar_child);
-    CHECK(Thrown([&] { doc["appid"].insert(doc["appid"].end(), KeyValue("x", 1)); }) == scalar_child);
+    Result<int> missing = doc["missing"].as<int>();
+    REQUIRE_FALSE(missing);
+    CHECK(missing.error() == ErrorInfo(ErrorCode::Type, "EasyVDF: can't convert a missing value (Type::None) to an integer"));
+
+    Result<int> not_a_number = doc["name"].as<int>();
+    CHECK(not_a_number.error() == ErrorInfo(ErrorCode::Type, "EasyVDF: can't convert a String value to an integer"));
+
+    CHECK(doc["appid"].as<int>() == 440);
+    CHECK(doc["appid"].as<std::string>() == "440");
+    CHECK(doc["appid"].as<uint8_t>().error().code == ErrorCode::Type);
+
+    // A scalar used as an object (doc["appid"]["x"] = 1) has no error value: it aborts,
+    // see the no_exceptions_scalar_aborts CTest test.
+}
+
+TEST_CASE("Result comparisons", "[result][comparison]")
+{
+    const Result<int> five = 5;
+    const Result<int> other_five = 5;
+    const Result<int> six = 6;
+    const Result<int> failed = ErrorInfo(ErrorCode::Type, "m");
+    const Result<int> same_failure = ErrorInfo(ErrorCode::Type, "m");
+    const Result<int> other_failure = ErrorInfo(ErrorCode::Key, "m");
+
+    // With a value: equal when the Result holds an equal value.
+    CHECK(five == 5);
+    CHECK(5 == five);
+    CHECK(five != 6);
+    CHECK(6 != five);
+    CHECK_FALSE(failed == 0);
+    CHECK(failed != 0);
+    CHECK(Node("440").as<uint32_t>() == 440u);
+    CHECK(Node("x").as<std::string>() == "x");
+
+    // Between Results: same values, or same errors.
+    CHECK(five == other_five);
+    CHECK(five != six);
+    CHECK(five != failed);
+    CHECK(failed == same_failure);
+    CHECK(failed != other_failure);
+
+    // Result<void>: both successes, or the same error.
+    CHECK(Result<void>() == Result<void>());
+    CHECK(Result<void>() != Result<void>(ErrorInfo(ErrorCode::Io, "m")));
+    CHECK(Result<void>(ErrorInfo(ErrorCode::Io, "m")) == Result<void>(ErrorInfo(ErrorCode::Io, "m")));
+
+    // References compare the nodes they refer to.
+    KeyValue doc("root", { {"k", "v"} });
+    CHECK(doc.at("k") == Node("v"));
+    CHECK_FALSE(doc.at("missing") == Node());
 }

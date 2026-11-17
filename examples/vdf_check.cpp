@@ -1,9 +1,9 @@
 // Checks VDF files and prints a summary of each one, or its error the way a compiler
-// prints a diagnostic. Built with exceptions disabled (-fno-exceptions, /EHs-c-):
-// errors are values (EasyVDF::Result), nothing is ever thrown.
+// prints a diagnostic. Errors are values (EasyVDF::Result): like every example, it is
+// built with exceptions disabled (-fno-exceptions, /EHs-c-).
 //
-// Usage: no_exceptions <file>...
-//   no_exceptions appmanifest_440.acf broken.vdf
+// Usage: vdf_check <file>...
+//   vdf_check appmanifest_440.acf broken.vdf
 //   appmanifest_440.acf: "AppState", 12 keys, name "Team Fortress 2", language english, appid 440
 //   broken.vdf:7:5: error [Syntax]: Expected a key or an object end ('}') at line 7, column 5
 //
@@ -34,15 +34,15 @@ void PrintSummary(std::string const& path, EasyVDF::KeyValue const& root)
 {
     std::cout << path << ": \"" << root.key() << "\", " << root.size() << " keys";
 
-    // try_at() returns a Result: a missing key is a value to test, not an exception.
+    // at() returns a Result: a missing key is a value to test, not an exception.
     // map() turns the node into what we want when it is there.
-    EasyVDF::Result<std::string> name = root.try_at("name").map([](EasyVDF::Node const& n) { return n.value_or(std::string()); });
+    EasyVDF::Result<std::string> name = root.at("name").map([](EasyVDF::Node const& n) { return n.value_or(std::string()); });
     if (name)
         std::cout << ", name \"" << *name << '"';
 
     // and_then() chains lookups that can each fail; the first error is kept.
-    EasyVDF::Result<std::string> language = root.try_at("UserConfig")
-        .and_then([](EasyVDF::Node const& config) { return config.try_at("language"); })
+    EasyVDF::Result<std::string> language = root.at("UserConfig")
+        .and_then([](EasyVDF::Node const& config) { return config.at("language"); })
         .map([](EasyVDF::Node const& n) { return n.value_or(std::string()); });
     if (language)
         std::cout << ", language " << *language;
@@ -67,7 +67,7 @@ int main(int argc, char* argv[])
         const std::string path = argv[i];
 
         // load_all() accepts the files that hold several root objects (signed Steam files).
-        EasyVDF::Result<std::vector<EasyVDF::KeyValue>> roots = EasyVDF::try_load_all(path);
+        EasyVDF::Result<std::vector<EasyVDF::KeyValue>> roots = EasyVDF::load_all(path);
         if (!roots)
         {
             PrintError(path, roots.error());
@@ -81,7 +81,7 @@ int main(int argc, char* argv[])
 
     // Writing reports its errors the same way: a document must be an object.
     EasyVDF::KeyValue not_a_document("key", 42);
-    if (EasyVDF::Result<std::string> text = not_a_document.try_to_text(); !text)
+    if (EasyVDF::Result<std::string> text = not_a_document.to_text(); !text)
         std::cout << "as expected, " << text.error() << '\n';
 
     return status;

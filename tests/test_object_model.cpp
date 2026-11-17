@@ -9,7 +9,7 @@
 #include <string>
 #include <type_traits>
 
-#include "catch.hpp"
+#include "helpers.h"
 
 using EasyVDF::KeyValue;
 using EasyVDF::Node;
@@ -128,7 +128,7 @@ std::string Dump(Node const& object)
     {
         if (!r.empty())
             r += ' ';
-        r += key + '=' + (value.type() == Type::String ? value.as<std::string>() : std::string("?"));
+        r += key + '=' + (value.type() == Type::String ? value.as<std::string>().value() : std::string("?"));
     }
     return r;
 }
@@ -163,10 +163,10 @@ TEST_CASE("Typed assignment sets the matching type", "[object_model][assignment]
     {
         o = EasyVDF::Pointer{0x90807060};
         REQUIRE(o.type() == Type::Pointer);
-        CHECK(o.as<EasyVDF::Pointer>().value == 0x90807060u);
+        CHECK(o.as<EasyVDF::Pointer>()->value == 0x90807060u);
         CHECK(o.as<uint32_t>() == 0x90807060u);
-        CHECK_THROWS_AS(o.as<int32_t>(), EasyVDF::TypeError);
-        CHECK_THROWS_AS(o.as<EasyVDF::Color>(), EasyVDF::TypeError);
+        CHECK(Outcome(o.as<int32_t>()) == "Type");
+        CHECK(Outcome(o.as<EasyVDF::Color>()) == "Type");
     }
 
     SECTION("Color")
@@ -175,8 +175,8 @@ TEST_CASE("Typed assignment sets the matching type", "[object_model][assignment]
         REQUIRE(o.type() == Type::Color);
         CHECK(o.as<EasyVDF::Color>() == EasyVDF::Color{0x66, 0x77, 0x88, 0x99});
         CHECK(o.as<std::string>() == "102 119 136 153");
-        CHECK_THROWS_AS(o.as<int32_t>(), EasyVDF::TypeError);
-        CHECK_THROWS_AS(o.as<EasyVDF::Pointer>(), EasyVDF::TypeError);
+        CHECK(Outcome(o.as<int32_t>()) == "Type");
+        CHECK(Outcome(o.as<EasyVDF::Pointer>()) == "Type");
     }
 
     SECTION("Pointer and Color assigned to a child")
@@ -189,7 +189,7 @@ TEST_CASE("Typed assignment sets the matching type", "[object_model][assignment]
         root["ColorKey"] = EasyVDF::Color{0x55, 0x66, 0x77, 0x88};
 
         REQUIRE(root["PointerKey"].type() == Type::Pointer);
-        CHECK(root["PointerKey"].as<EasyVDF::Pointer>().value == 0x11223344u);
+        CHECK(root["PointerKey"].as<EasyVDF::Pointer>()->value == 0x11223344u);
         REQUIRE(root["ColorKey"].type() == Type::Color);
         CHECK(root["ColorKey"].as<EasyVDF::Color>() == EasyVDF::Color{0x55, 0x66, 0x77, 0x88});
         CHECK(root.size() == 2);
@@ -207,13 +207,13 @@ TEST_CASE("Assigned Pointer and Color survive a binary round trip", "[object_mod
     for (EasyVDF::Format format : {EasyVDF::Format::Binary, EasyVDF::Format::Vbkv})
     {
         CAPTURE((int)format);
-        KeyValue parsed = EasyVDF::parse(root.to_binary(format));
+        KeyValue parsed = EasyVDF::parse(root.to_binary(format).value()).value();
 
         REQUIRE(parsed.type() == Type::Object);
         CHECK(parsed.key() == "Root");
         REQUIRE(parsed.count("PointerKey") == 1);
         REQUIRE(parsed["PointerKey"].type() == Type::Pointer);
-        CHECK(parsed["PointerKey"].as<EasyVDF::Pointer>().value == 0x90807060u);
+        CHECK(parsed["PointerKey"].as<EasyVDF::Pointer>()->value == 0x90807060u);
         REQUIRE(parsed.count("ColorKey") == 1);
         REQUIRE(parsed["ColorKey"].type() == Type::Color);
         CHECK(parsed["ColorKey"].as<EasyVDF::Color>() == EasyVDF::Color{0x66, 0x77, 0x88, 0x99});
@@ -342,7 +342,7 @@ TEST_CASE("Children operations keep keys paired with values", "[object_model][as
         root.clear();
         CHECK(root.empty());
         CHECK(root.is_object());
-        CHECK(root.to_text() == "\"Root\"\n{\n}\n");
+        CHECK(root.to_text().value() == "\"Root\"\n{\n}\n");
     }
 }
 
@@ -497,7 +497,7 @@ TEST_CASE("Assigning a value keeps the key", "[object_model][assignment]")
 
     SECTION("an object receives a string owned by its own child")
     {
-        root["obj"] = root["obj"]["child"].as<std::string_view>();
+        root["obj"] = root["obj"]["child"].as<std::string_view>().value();
         CHECK(root["obj"].as<std::string>() == "Child");
     }
 
@@ -554,7 +554,7 @@ TEST_CASE("Moves do not allocate", "[object_model][exception_safety]")
         KeyValue const& tree = expected;
         total_before = g_total_allocations;
         bool found = tree[LongKey].has_value() && tree.contains(LongKey) && tree.find(LongKey) != nullptr
-            && tree.count(LongKey) == 3 && tree.at(LongKey).is_string() && !tree["missing"]["deeper"].has_value()
+            && tree.count(LongKey) == 3 && tree.at(LongKey)->is_string() && !tree["missing"]["deeper"].has_value()
             && tree[LongKey + "2"][LongKey][LongKey].value_or(0.f) == 1.5f && tree[LongKey].as<std::string_view>() == LongValue;
         long long allocations = g_total_allocations - total_before;
         CHECK(found);
@@ -667,23 +667,23 @@ TEST_CASE("Constructors and assignments do not leak when an allocation fails", "
     }
     SECTION("parsing text")
     {
-        const std::string text = tree.to_text();
-        CheckNoLeakOnAllocationFailure([&] { EasyVDF::parse(text); });
-        CheckNoLeakOnAllocationFailure([&] { std::istringstream is(text); EasyVDF::parse(is); });
-        CheckNoLeakOnAllocationFailure([&] { try { EasyVDF::parse(text.substr(0, text.size() - 3)); } catch (EasyVDF::ParseError const&) {} });
+        const std::string text = tree.to_text().value();
+        CheckNoLeakOnAllocationFailure([&] { static_cast<void>(EasyVDF::parse(text)); });
+        CheckNoLeakOnAllocationFailure([&] { std::istringstream is(text); static_cast<void>(EasyVDF::parse(is)); });
+        CheckNoLeakOnAllocationFailure([&] { static_cast<void>(EasyVDF::parse(text.substr(0, text.size() - 3))); });
     }
     SECTION("parsing binary")
     {
-        const std::string binary = tree.to_binary();
-        const std::string vbkv = tree.to_binary(EasyVDF::Format::Vbkv);
-        CheckNoLeakOnAllocationFailure([&] { EasyVDF::parse(binary); });
-        CheckNoLeakOnAllocationFailure([&] { std::istringstream is(vbkv); EasyVDF::parse(is); });
-        CheckNoLeakOnAllocationFailure([&] { try { EasyVDF::parse(std::string_view(binary).substr(0, binary.size() - 3)); } catch (EasyVDF::ParseError const&) {} });
+        const std::string binary = tree.to_binary().value();
+        const std::string vbkv = tree.to_binary(EasyVDF::Format::Vbkv).value();
+        CheckNoLeakOnAllocationFailure([&] { static_cast<void>(EasyVDF::parse(binary)); });
+        CheckNoLeakOnAllocationFailure([&] { std::istringstream is(vbkv); static_cast<void>(EasyVDF::parse(is)); });
+        CheckNoLeakOnAllocationFailure([&] { static_cast<void>(EasyVDF::parse(std::string_view(binary).substr(0, binary.size() - 3))); });
     }
     SECTION("writing")
     {
-        CheckNoLeakOnAllocationFailure([&] { tree.to_text(); });
-        CheckNoLeakOnAllocationFailure([&] { tree.to_binary(EasyVDF::Format::Vbkv); });
+        CheckNoLeakOnAllocationFailure([&] { tree.to_text().value(); });
+        CheckNoLeakOnAllocationFailure([&] { tree.to_binary(EasyVDF::Format::Vbkv).value(); });
     }
 }
 
@@ -717,12 +717,12 @@ TEST_CASE("A moved-from object is empty and usable", "[object_model][moved_from]
     CHECK_FALSE(static_cast<bool>(a));
     CHECK(a.empty());
     CHECK(a.begin() == a.end());
-    CHECK_THROWS_AS(a.as<std::string>(), EasyVDF::TypeError);
-    CHECK_THROWS_AS(a.as<int32_t>(), EasyVDF::TypeError);
-    CHECK_THROWS_AS(a.at("key"), EasyVDF::KeyError);
+    CHECK(Outcome(a.as<std::string>()) == "Type");
+    CHECK(Outcome(a.as<int32_t>()) == "Type");
+    CHECK(Outcome(a.at("key")) == "Key");
     CHECK(std::as_const(a)["key"].is_none());
-    CHECK_THROWS_AS(a.to_text(), EasyVDF::WriteError);
-    CHECK_THROWS_AS(a.to_binary(), EasyVDF::WriteError);
+    CHECK(Outcome(a.to_text()) == "Write");
+    CHECK(Outcome(a.to_binary()) == "Write");
     CHECK(a == KeyValue());
 
     // Copies of it are empty too.
@@ -774,7 +774,7 @@ TEST_CASE("An object holding a moved-from child stays usable", "[object_model][m
     CHECK(root.count("a") == 1);
     CHECK_FALSE(root.contains("b"));
     CHECK_FALSE(root.contains(""));
-    CHECK(root.to_text() == "\"Root\"\n{\n\t\"a\"\t\t\"A\"\n\t\"c\"\t\t\"C\"\n}\n");
+    CHECK(root.to_text().value() == "\"Root\"\n{\n\t\"a\"\t\t\"A\"\n\t\"c\"\t\t\"C\"\n}\n");
 
     KeyValue copy(root);
     CHECK(copy.size() == 2);
@@ -790,25 +790,25 @@ TEST_CASE("A node without value can't be written", "[object_model][serialize]")
     {
         KeyValue none;
         none.set_key("none");
-        CHECK_THROWS_AS(none.to_text(), EasyVDF::WriteError);
-        CHECK_THROWS_AS(none.to_binary(EasyVDF::Format::Binary), EasyVDF::WriteError);
-        CHECK_THROWS_AS(none.to_binary(EasyVDF::Format::Vbkv), EasyVDF::WriteError);
+        CHECK(Outcome(none.to_text()) == "Write");
+        CHECK(Outcome(none.to_binary(EasyVDF::Format::Binary)) == "Write");
+        CHECK(Outcome(none.to_binary(EasyVDF::Format::Vbkv)) == "Write");
 
         KeyValue reset = MakeABC();
         reset = nullptr;
-        CHECK_THROWS_AS(reset.to_text(), EasyVDF::WriteError);
-        CHECK_THROWS_AS(reset.to_binary(), EasyVDF::WriteError);
+        CHECK(Outcome(reset.to_text()) == "Write");
+        CHECK(Outcome(reset.to_binary()) == "Write");
 
         KeyValue moved = MakeABC();
         KeyValue taken(std::move(moved));
-        CHECK_THROWS_AS(moved.to_text(), EasyVDF::WriteError);
+        CHECK(Outcome(moved.to_text()) == "Write");
     }
 
     SECTION("a document that is not an object throws")
     {
-        CHECK_THROWS_AS(KeyValue("k", "v").to_text(), EasyVDF::WriteError);
-        CHECK_THROWS_AS(KeyValue("k", 5).to_binary(), EasyVDF::WriteError);
-        CHECK_THROWS_WITH(KeyValue("k", 5).to_binary(EasyVDF::Format::Vbkv), Catch::Contains("Int32") && Catch::Contains("object"));
+        CHECK(Outcome(KeyValue("k", "v").to_text()) == "Write");
+        CHECK(Outcome(KeyValue("k", 5).to_binary()) == "Write");
+        CHECK_THAT(Message(KeyValue("k", 5).to_binary(EasyVDF::Format::Vbkv)), Catch::Contains("Int32") && Catch::Contains("object"));
     }
 
     // VDF has no representation for a key without a value: such a child is
@@ -850,7 +850,7 @@ TEST_CASE("A node without value can't be written", "[object_model][serialize]")
     CHECK(Dump(root) == expected_dump);
     for (EasyVDF::Format format : {EasyVDF::Format::Text, EasyVDF::Format::Binary, EasyVDF::Format::Vbkv})
     {
-        KeyValue parsed = EasyVDF::parse(root.dump(format));
+        KeyValue parsed = EasyVDF::parse(root.dump(format).value()).value();
         CHECK(Dump(parsed) == expected_dump);
         CHECK(parsed == root);
     }
@@ -861,15 +861,15 @@ TEST_CASE("Serializing nodes with values still works", "[object_model][serialize
     SECTION("empty object")
     {
         KeyValue root("Root");
-        CHECK(root.to_text() == "\"Root\"\n{\n}\n");
-        CHECK(root.to_binary() == std::string("\x00Root\x00\x08\x08", 8));
+        CHECK(root.to_text().value() == "\"Root\"\n{\n}\n");
+        CHECK(root.to_binary().value() == std::string("\x00Root\x00\x08\x08", 8));
     }
 
     SECTION("text and binary")
     {
         KeyValue root = MakeABC();
 
-        CHECK(root.to_text() ==
+        CHECK(root.to_text().value() ==
             "\"Root\"\n"
             "{\n"
             "\t\"a\"\t\t\"A\"\n"
@@ -877,7 +877,7 @@ TEST_CASE("Serializing nodes with values still works", "[object_model][serialize
             "\t\"c\"\t\t\"C\"\n"
             "}\n");
 
-        KeyValue parsed = EasyVDF::parse(root.to_binary(EasyVDF::Format::Vbkv));
+        KeyValue parsed = EasyVDF::parse(root.to_binary(EasyVDF::Format::Vbkv).value()).value();
         CHECK(Dump(parsed) == "a=A b=B c=C");
     }
 }
@@ -912,19 +912,18 @@ TEST_CASE("Pointer and Color comparison operators", "[object_model][operators]")
     CHECK(o.as<EasyVDF::Pointer>() != EasyVDF::Pointer{0});
     o = EasyVDF::Color{0x66, 0x77, 0x88, 0x99};
     CHECK(o.as<EasyVDF::Color>() == EasyVDF::Color{0x66, 0x77, 0x88, 0x99});
-    CHECK(o.as<EasyVDF::Color>() > EasyVDF::Color{});
+    CHECK(o.as<EasyVDF::Color>().value() > EasyVDF::Color{});
 }
 
 TEST_CASE("Conversion errors name the types", "[object_model][operators]")
 {
     Node o(EasyVDF::Pointer{1});
-    CHECK_THROWS_WITH(o.as<EasyVDF::Color>(), Catch::Contains("Pointer value to a Color"));
-    CHECK_THROWS_WITH(o.as<float>(), Catch::Contains("Pointer value to a floating point number"));
-    CHECK_THROWS_WITH(Node("x").as<int>(), Catch::Contains("String value to an integer"));
-    CHECK_THROWS_WITH(Node(1).as<std::string_view>(), Catch::Contains("Int32 value to a string"));
-    CHECK_THROWS_WITH(Node::object().as<bool>(), Catch::Contains("Object value to a bool"));
-    CHECK_THROWS_WITH(Node().as<EasyVDF::Pointer>(), Catch::Contains("missing value") && Catch::Contains("a Pointer"));
-    CHECK_THROWS_WITH(Node(1).add("k", 1), Catch::Contains("Int32 value has no children"));
+    CHECK_THAT(Message(o.as<EasyVDF::Color>()), Catch::Contains("Pointer value to a Color"));
+    CHECK_THAT(Message(o.as<float>()), Catch::Contains("Pointer value to a floating point number"));
+    CHECK_THAT(Message(Node("x").as<int>()), Catch::Contains("String value to an integer"));
+    CHECK_THAT(Message(Node(1).as<std::string_view>()), Catch::Contains("Int32 value to a string"));
+    CHECK_THAT(Message(Node::object().as<bool>()), Catch::Contains("Object value to a bool"));
+    CHECK_THAT(Message(Node().as<EasyVDF::Pointer>()), Catch::Contains("missing value") && Catch::Contains("a Pointer"));
 }
 
 TEST_CASE("Const objects are fully readable", "[object_model][operators]")
@@ -945,11 +944,11 @@ TEST_CASE("Const objects are fully readable", "[object_model][operators]")
     CHECK(croot["sub"]["s"].as<std::string_view>() == "text");
     CHECK(croot["sub"]["s"]["deeper"]["again"].is_none());
     CHECK(croot["int"]["deeper"].value_or(7) == 7);
-    CHECK(croot.at("sub").at("s").is_string());
+    CHECK(croot.at("sub")->at("s")->is_string());
     CHECK(croot.find("int")->key() == "int");
     CHECK(croot.size() == 2);
     CHECK(Dump(croot) == "int=? sub=?");
-    CHECK(croot.to_text() == root.to_text());
+    CHECK(croot.to_text().value() == root.to_text().value());
 
     Node const& child = croot["sub"];
     CHECK(child.size() == 1);

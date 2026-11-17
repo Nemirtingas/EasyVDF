@@ -3,31 +3,37 @@
 #include <vector>
 
 #include "../EasyVDF.h"
-#include "catch.hpp"
+#include "helpers.h"
 
 using Catch::Matchers::Contains;
 using EasyVDF::KeyValue;
-using EasyVDF::ParseError;
 using EasyVDF::Type;
 
 namespace {
 
-// Parses through a stream read by small blocks and from memory: both must agree.
-KeyValue ParseText(std::string const& text, EasyVDF::ReadOptions options = {})
+// Parses through a stream read by small blocks and from memory: both must agree,
+// on the document or on the error.
+EasyVDF::Result<KeyValue> TryParseText(std::string const& text, EasyVDF::ReadOptions options = {})
 {
     options.format = EasyVDF::Format::Text;
-    KeyValue from_memory = EasyVDF::parse(text, options);
+    EasyVDF::Result<KeyValue> from_memory = EasyVDF::parse(text, options);
 
     for (std::size_t chunk_size : { std::size_t(1), std::size_t(3), std::size_t(16 * 1024) })
     {
         std::stringstream ss(text, std::ios::in | std::ios::binary);
         options.chunk_size = chunk_size;
         options.directives = nullptr;
-        KeyValue from_stream = EasyVDF::parse(ss, options);
+        EasyVDF::Result<KeyValue> from_stream = EasyVDF::parse(ss, options);
         if (from_stream != from_memory)
             FAIL("stream (chunk size " << chunk_size << ") and memory parsing differ for: " << text);
     }
     return from_memory;
+}
+
+// The document, which must be valid.
+KeyValue ParseText(std::string const& text, EasyVDF::ReadOptions options = {})
+{
+    return TryParseText(text, options).value();
 }
 
 // Replaces every '\n' of an LF text by the given EOL sequence.
@@ -57,18 +63,13 @@ void CheckSimpleRoot(KeyValue const& o)
     CHECK(o["sub"]["k2"].as<std::string>() == "v2");
 }
 
-// Line and column of the ParseError thrown for text, "line:column".
+// Line and column of the error of a text, "line:column".
 std::string ErrorPosition(std::string const& text)
 {
-    try
-    {
-        ParseText(text);
-    }
-    catch (ParseError const& e)
-    {
-        return std::to_string(e.line()) + ":" + std::to_string(e.column());
-    }
-    return "no error";
+    EasyVDF::Result<KeyValue> doc = TryParseText(text);
+    if (doc)
+        return "no error";
+    return std::to_string(doc.error().line) + ":" + std::to_string(doc.error().column);
 }
 
 } // namespace
@@ -76,11 +77,11 @@ std::string ErrorPosition(std::string const& text)
 TEST_CASE("Text parser: truncated UTF-8 sequence does not read out of bounds", "[text_parser][utf8]")
 {
     // Used to segfault: the 3 bytes lead 0xE2 made the scanner jump past the end of the line.
-    CHECK_THROWS_AS(ParseText("\"root\"\n{\n\t\"k\"\t\"\xE2\n}\n"), ParseError);
-    CHECK_THROWS_AS(ParseText("\"root\"\n{\n\t\"k\"\t\"\xE2\x82\n}\n"), ParseError);
-    CHECK_THROWS_AS(ParseText("\"root\"\n{\n\t\"k\"\t\"\xF0\x9F\n}\n"), ParseError);
-    CHECK_THROWS_AS(ParseText("\"root\"\n{\n\t\"k\xC3\n}\n"), ParseError);
-    CHECK_THROWS_AS(ParseText("\"ro\xF0\x9F\x98\n{\n}\n"), ParseError);
+    CHECK(IsParseError(TryParseText("\"root\"\n{\n\t\"k\"\t\"\xE2\n}\n")));
+    CHECK(IsParseError(TryParseText("\"root\"\n{\n\t\"k\"\t\"\xE2\x82\n}\n")));
+    CHECK(IsParseError(TryParseText("\"root\"\n{\n\t\"k\"\t\"\xF0\x9F\n}\n")));
+    CHECK(IsParseError(TryParseText("\"root\"\n{\n\t\"k\xC3\n}\n")));
+    CHECK(IsParseError(TryParseText("\"ro\xF0\x9F\x98\n{\n}\n")));
 }
 
 TEST_CASE("Text parser: multi-byte UTF-8 strings are kept verbatim", "[text_parser][utf8]")
@@ -105,7 +106,7 @@ TEST_CASE("Text parser: UTF-8 is not validated, stray bytes are kept verbatim", 
     REQUIRE(o.size() == 1);
     CHECK(o.begin()->key() == "\x80\xBF");
     CHECK(o.begin()->as<std::string>() == "\xF8\xFF\xC3");
-    CHECK(ParseText(o.to_text()) == o);
+    CHECK(ParseText(o.to_text().value()) == o);
 }
 
 TEST_CASE("Text parser accepts blank lines anywhere", "[text_parser][blank_lines]")
@@ -184,60 +185,60 @@ TEST_CASE("Text parser rejects an unterminated document", "[text_parser][unexpec
 {
     SECTION("Unclosed root object")
     {
-        CHECK_THROWS_AS(ParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n"), ParseError);
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n"), Contains("end of file") && Contains("line 3"));
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n\n \n"), Contains("end of file") && Contains("line 5"));
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{"), Contains("end of file") && Contains("line 2"));
-        CHECK_THROWS_WITH(ParseText("\"root\"\r\n{\r\n\t\"k\"\t\"v\"\r\n"), Contains("end of file") && Contains("line 3"));
-        CHECK_THROWS_WITH(ParseText("\"root\"\r{\r\t\"k\"\t\"v\"\r"), Contains("end of file") && Contains("line 3"));
+        CHECK(IsParseError(TryParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n")));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n")), Contains("end of file") && Contains("line 3"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n\n \n")), Contains("end of file") && Contains("line 5"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{")), Contains("end of file") && Contains("line 2"));
+        CHECK_THAT(Message(TryParseText("\"root\"\r\n{\r\n\t\"k\"\t\"v\"\r\n")), Contains("end of file") && Contains("line 3"));
+        CHECK_THAT(Message(TryParseText("\"root\"\r{\r\t\"k\"\t\"v\"\r")), Contains("end of file") && Contains("line 3"));
     }
     SECTION("Unclosed nested object")
     {
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"sub\"\n\t{\n\t\t\"k\"\t\"v\"\n\t}\n"), Contains("end of file") && Contains("line 6"));
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"sub\"\n\t{\n\t\t\"k\"\t\"v\"\n}\n"), Contains("end of file") && Contains("line 6"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n\t\"sub\"\n\t{\n\t\t\"k\"\t\"v\"\n\t}\n")), Contains("end of file") && Contains("line 6"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n\t\"sub\"\n\t{\n\t\t\"k\"\t\"v\"\n}\n")), Contains("end of file") && Contains("line 6"));
     }
     SECTION("Root key without object")
     {
-        CHECK_THROWS_WITH(ParseText("\"root\"\n"), Contains("end of file") && Contains("line 1"));
-        CHECK_THROWS_WITH(ParseText("\"root\""), Contains("end of file") && Contains("line 1"));
-        CHECK_THROWS_WITH(ParseText("\"root\"\n\n \n"), Contains("end of file") && Contains("line 3"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n")), Contains("end of file") && Contains("line 1"));
+        CHECK_THAT(Message(TryParseText("\"root\"")), Contains("end of file") && Contains("line 1"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n\n \n")), Contains("end of file") && Contains("line 3"));
     }
     SECTION("Item key without value at end of file")
     {
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\"\n"), Contains("end of file") && Contains("line 3"));
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\""), Contains("end of file") && Contains("line 3"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n\t\"k\"\n")), Contains("end of file") && Contains("line 3"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n\t\"k\"")), Contains("end of file") && Contains("line 3"));
     }
     SECTION("Item key without value before object end")
     {
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\"\n}\n"), Contains("xpected a value or an object start") && Contains("\"k\"") && Contains("at line 4"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n\t\"k\"\n}\n")), Contains("xpected a value or an object start") && Contains("\"k\"") && Contains("at line 4"));
     }
     SECTION("Data after object end")
     {
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n} \"x\"\n"), Contains("after root object at line 3"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n} \"x\"\n")), Contains("after root object at line 3"));
     }
     SECTION("Unterminated string")
     {
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\"\t\"v\n}\n"), Contains("end of file") && Contains("line 3, column 6"));
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\\\""), Contains("end of file") && Contains("line 3, column 2"));
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\\"), Contains("end of file") && Contains("line 3, column 2"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n\t\"k\"\t\"v\n}\n")), Contains("end of file") && Contains("line 3, column 6"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n\t\"k\\\"")), Contains("end of file") && Contains("line 3, column 2"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n\t\"k\\")), Contains("end of file") && Contains("line 3, column 2"));
     }
 }
 
 TEST_CASE("Text parser rejects empty input", "[text_parser][unexpected_eof]")
 {
     // Used to return an empty object.
-    CHECK_THROWS_AS(ParseText(""), ParseError);
-    CHECK_THROWS_AS(ParseText(" "), ParseError);
-    CHECK_THROWS_AS(ParseText("\n\n\t \r\n"), ParseError);
-    CHECK_THROWS_AS(ParseText("// only a comment\n"), ParseError);
-    CHECK_THROWS_AS(ParseText("\xEF\xBB\xBF"), ParseError);
-    CHECK_THROWS_WITH(ParseText("\n \n"), Contains("end of file") && Contains("root key"));
+    CHECK(IsParseError(TryParseText("")));
+    CHECK(IsParseError(TryParseText(" ")));
+    CHECK(IsParseError(TryParseText("\n\n\t \r\n")));
+    CHECK(IsParseError(TryParseText("// only a comment\n")));
+    CHECK(IsParseError(TryParseText("\xEF\xBB\xBF")));
+    CHECK_THAT(Message(TryParseText("\n \n")), Contains("end of file") && Contains("root key"));
 
     // Same through the format detection.
-    CHECK_THROWS_AS(EasyVDF::parse(""), ParseError);
-    CHECK_THROWS_AS(EasyVDF::parse("  \n"), ParseError);
+    CHECK(IsParseError(EasyVDF::parse("")));
+    CHECK(IsParseError(EasyVDF::parse("  \n")));
     std::istringstream empty;
-    CHECK_THROWS_AS(EasyVDF::parse(empty), ParseError);
+    CHECK(IsParseError(EasyVDF::parse(empty)));
 }
 
 TEST_CASE("Text parser accepts an empty root key", "[text_parser][unexpected_eof]")
@@ -253,16 +254,16 @@ TEST_CASE("Text parser rejects data after the root object", "[text_parser][trail
 {
     SECTION("Second root object")
     {
-        CHECK_THROWS_AS(ParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n}\n\"other\"\n{\n}\n"), ParseError);
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n}\n\"other\"\n{\n}\n"), Contains("after root object at line 5"));
-        CHECK_THROWS_WITH(ParseText("\"root\"\r\n{\r\n}\r\n\r\n\"other\"\r\n{\r\n}"), Contains("after root object at line 5"));
+        CHECK(IsParseError(TryParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n}\n\"other\"\n{\n}\n")));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n\t\"k\"\t\"v\"\n}\n\"other\"\n{\n}\n")), Contains("after root object at line 5"));
+        CHECK_THAT(Message(TryParseText("\"root\"\r\n{\r\n}\r\n\r\n\"other\"\r\n{\r\n}")), Contains("after root object at line 5"));
     }
     SECTION("Stray data")
     {
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n}\n}\n"), Contains("after root object at line 4"));
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n}\n\n  x"), Contains("after root object at line 5"));
-        CHECK_THROWS_WITH(ParseText("\"root\"\n{\n}\n\"k\"\t\"v\"\n"), Contains("after root object at line 4"));
-        CHECK_THROWS_WITH(ParseText("\"root\" { } {"), Contains("after root object at line 1, column 12"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n}\n}\n")), Contains("after root object at line 4"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n}\n\n  x")), Contains("after root object at line 5"));
+        CHECK_THAT(Message(TryParseText("\"root\"\n{\n}\n\"k\"\t\"v\"\n")), Contains("after root object at line 4"));
+        CHECK_THAT(Message(TryParseText("\"root\" { } {")), Contains("after root object at line 1, column 12"));
     }
     SECTION("Blank lines and comments after the root object are accepted")
     {
@@ -287,15 +288,8 @@ TEST_CASE("Text parser reports lines and columns", "[text_parser][position]")
     CHECK(ErrorPosition("\"root\"\n{\n") == "2:0");
     CHECK(ErrorPosition("\"root\"\n{\n ") == "3:0");
 
-    try
-    {
-        ParseText("\"root\"\n{\n\t\"k\"\n}\n");
-        FAIL("no exception");
-    }
-    catch (EasyVDF::Error const& e)
-    {// ParseError is an EasyVDF::Error and a std::runtime_error.
-        CHECK_THAT(e.what(), Contains("line 4, column 1"));
-    }
+    // The message holds the position too.
+    CHECK_THAT(Message(TryParseText("\"root\"\n{\n\t\"k\"\n}\n")), Contains("line 4, column 1"));
 }
 
 TEST_CASE("Text parser: comments", "[text_parser][comments]")
@@ -350,7 +344,7 @@ TEST_CASE("Text parser: free layout", "[text_parser][layout]")
         CHECK(o["a"].is_object());
         CHECK(o["a"].empty());
         CHECK(o["b"].is_object());
-        CHECK(o.to_text() == "\"root\"\n{\n\t\"a\"\n\t{\n\t}\n\t\"b\"\n\t{\n\t}\n}\n");
+        CHECK(o.to_text().value() == "\"root\"\n{\n\t\"a\"\n\t{\n\t}\n\t\"b\"\n\t{\n\t}\n}\n");
     }
 }
 
@@ -375,8 +369,8 @@ TEST_CASE("Text parser: unquoted keys and values", "[text_parser][unquoted]")
         CHECK(p.begin()->key() == "xyz");
         CHECK(p["xyz"].as<std::string>() == "k");
 
-        CHECK_THROWS_AS(ParseText("\"root\"\n{\n\txyz\"k\" \"v\"\n}\n"), ParseError);
-        CHECK_THROWS_WITH(ParseText("xyz\"root\"\n{\n}\n"), Contains("line 1, column 4"));
+        CHECK(IsParseError(TryParseText("\"root\"\n{\n\txyz\"k\" \"v\"\n}\n")));
+        CHECK_THAT(Message(TryParseText("xyz\"root\"\n{\n}\n")), Contains("line 1, column 4"));
     }
 }
 
@@ -389,8 +383,8 @@ TEST_CASE("Text parser: values spanning lines", "[text_parser][multiline]")
     CHECK(o["last"].as<std::string>() == "x");
 
     // New lines are written as escape sequences and read back.
-    CHECK(o.to_text().find("\"line 1\\nline 2\r\\nline 3\"") != std::string::npos);
-    CHECK(ParseText(o.to_text()) == o);
+    CHECK(o.to_text().value().find("\"line 1\\nline 2\r\\nline 3\"") != std::string::npos);
+    CHECK(ParseText(o.to_text().value()) == o);
 }
 
 TEST_CASE("Text parser: escape sequences are decoded", "[text_parser][escape]")
@@ -415,10 +409,10 @@ TEST_CASE("Text parser: escape sequences are decoded", "[text_parser][escape]")
 
         EasyVDF::WriteOptions write_options;
         write_options.escapes = false;
-        CHECK(raw.dump(write_options) == "\"root\"\n{\n\t\"path\"\t\t\"C:\\\\dir\\n\"\n\t\"end\\\"\t\t\"v\"\n}\n");
+        CHECK(raw.dump(write_options).value() == "\"root\"\n{\n\t\"path\"\t\t\"C:\\\\dir\\n\"\n\t\"end\\\"\t\t\"v\"\n}\n");
 
         raw["quote"] = "a\"b";
-        CHECK_THROWS_AS(raw.dump(write_options), EasyVDF::WriteError);
+        CHECK(Outcome(raw.dump(write_options)) == "Write");
     }
 }
 
@@ -444,11 +438,11 @@ TEST_CASE("Text round trip is lossless for any string", "[text_parser][escape]")
         doc.add(s).add(s, s);
     }
 
-    const std::string text = doc.to_text();
+    const std::string text = doc.to_text().value();
     KeyValue parsed = ParseText(text);
     REQUIRE(parsed == doc);
     CHECK(parsed.key() == "root \"\\\n\t");
-    CHECK(parsed.to_text() == text);
+    CHECK(parsed.to_text().value() == text);
 
     auto values = parsed.all("k");
     REQUIRE(values.size() == strings.size());
@@ -491,7 +485,7 @@ TEST_CASE("Text parser: conditionals", "[text_parser][conditionals]")
     CHECK((*it)["k2"].as<std::string>() == "v2");
 
     // Kept and written back.
-    CHECK(o.to_text() == text);
+    CHECK(o.to_text().value() == text);
 
     SECTION("other layouts")
     {
@@ -503,16 +497,16 @@ TEST_CASE("Text parser: conditionals", "[text_parser][conditionals]")
         // Quoted: a plain string.
         CHECK(p["[$not]"].as<std::string>() == "[$a value]");
         CHECK(p.find("[$not]")->condition().empty());
-        CHECK(ParseText(p.to_text()) == p);
+        CHECK(ParseText(p.to_text().value()) == p);
     }
 
     SECTION("set_condition")
     {
         KeyValue doc("root");
         doc.add("k", "v").set_condition("$LINUX");
-        CHECK(doc.to_text() == "\"root\"\n{\n\t\"k\"\t\t\"v\"\t\t[$LINUX]\n}\n");
+        CHECK(doc.to_text().value() == "\"root\"\n{\n\t\"k\"\t\t\"v\"\t\t[$LINUX]\n}\n");
         doc.find("k")->set_condition("");
-        CHECK(doc.to_text() == "\"root\"\n{\n\t\"k\"\t\t\"v\"\n}\n");
+        CHECK(doc.to_text().value() == "\"root\"\n{\n\t\"k\"\t\t\"v\"\n}\n");
 
         // The condition is part of the entry: copies keep it, comparisons see it.
         KeyValue a("k", "v"), b("k", "v");
@@ -528,13 +522,13 @@ TEST_CASE("Text parser: conditionals", "[text_parser][conditionals]")
 
     SECTION("misplaced or malformed conditionals")
     {
-        CHECK_THROWS_AS(ParseText("[$WIN32] \"root\" { }"), ParseError);
-        CHECK_THROWS_AS(ParseText("\"root\" { [$WIN32] \"k\" \"v\" }"), ParseError);
-        CHECK_THROWS_AS(ParseText("\"root\" { \"k\" [$A] [$B] \"v\" }"), ParseError);
-        CHECK_THROWS_AS(ParseText("\"root\" { \"k\" [$A] \"v\" [$B] }"), ParseError);
-        CHECK_THROWS_AS(ParseText("\"root\" { \"k\" \"v\" [$A] [$B] }"), ParseError);
-        CHECK_THROWS_WITH(ParseText("\"root\" { \"k\" \"v\" [$WIN32\n}"), Contains("conditional") && Contains("line 1, column 18"));
-        CHECK_THROWS_AS(ParseText("\"root\" { \"k\" \"v\" [$WIN32"), ParseError);
+        CHECK(IsParseError(TryParseText("[$WIN32] \"root\" { }")));
+        CHECK(IsParseError(TryParseText("\"root\" { [$WIN32] \"k\" \"v\" }")));
+        CHECK(IsParseError(TryParseText("\"root\" { \"k\" [$A] [$B] \"v\" }")));
+        CHECK(IsParseError(TryParseText("\"root\" { \"k\" [$A] \"v\" [$B] }")));
+        CHECK(IsParseError(TryParseText("\"root\" { \"k\" \"v\" [$A] [$B] }")));
+        CHECK_THAT(Message(TryParseText("\"root\" { \"k\" \"v\" [$WIN32\n}")), Contains("conditional") && Contains("line 1, column 18"));
+        CHECK(IsParseError(TryParseText("\"root\" { \"k\" \"v\" [$WIN32")));
     }
 }
 
@@ -555,7 +549,7 @@ TEST_CASE("Text parser: #include and #base directives", "[text_parser][directive
     EasyVDF::ReadOptions options;
     options.format = EasyVDF::Format::Text;
     options.directives = &directives;
-    auto o = EasyVDF::parse(text, options);
+    auto o = EasyVDF::parse(text, options).value();
 
     using Kind = EasyVDF::Directive::Kind;
     REQUIRE(directives.size() == 4);
@@ -585,10 +579,10 @@ TEST_CASE("Text parser: #include and #base directives", "[text_parser][directive
 
     SECTION("errors")
     {
-        CHECK_THROWS_WITH(ParseText("#base \"a.vdf\"\n"), Contains("end of file") && Contains("root key"));
-        CHECK_THROWS_AS(ParseText("#base\n"), ParseError);
-        CHECK_THROWS_AS(ParseText("#base }\n\"root\" { }"), ParseError);
-        CHECK_THROWS_AS(ParseText("#unknown \"a.vdf\"\n\"root\" { }"), ParseError);
+        CHECK_THAT(Message(TryParseText("#base \"a.vdf\"\n")), Contains("end of file") && Contains("root key"));
+        CHECK(IsParseError(TryParseText("#base\n")));
+        CHECK(IsParseError(TryParseText("#base }\n\"root\" { }")));
+        CHECK(IsParseError(TryParseText("#unknown \"a.vdf\"\n\"root\" { }")));
     }
 }
 
@@ -598,21 +592,21 @@ TEST_CASE("Text parser: byte order marks", "[text_parser][bom]")
 
     CheckSimpleRoot(ParseText("\xEF\xBB\xBF" + text));
     // Through the format detection too, from memory and from a stream of 1 byte blocks.
-    CheckSimpleRoot(EasyVDF::parse("\xEF\xBB\xBF" + text));
+    CheckSimpleRoot(EasyVDF::parse("\xEF\xBB\xBF" + text).value());
     std::istringstream is("\xEF\xBB\xBF" + text);
     EasyVDF::ReadOptions options;
     options.chunk_size = 1;
-    CheckSimpleRoot(EasyVDF::parse(is, options));
+    CheckSimpleRoot(EasyVDF::parse(is, options).value());
 
     // The mark is only skipped at the very start, and only when complete.
     CHECK(ParseText("\xEF\xBB\xBFroot { }").key() == "root");
     CHECK(ParseText("\xEF\xBBroot { }").key() == "\xEF\xBBroot");
     CHECK(ParseText("\xEFroot { }").key() == "\xEFroot");
-    CHECK_THROWS_AS(ParseText("\xEF\xBB\xBF\xEF\xBB\xBF\"root\" { } x"), ParseError);
+    CHECK(IsParseError(TryParseText("\xEF\xBB\xBF\xEF\xBB\xBF\"root\" { } x")));
 
     // UTF-16 is refused with a clear message.
-    CHECK_THROWS_WITH(ParseText(std::string("\xFF\xFE\"\0r\0", 6)), Contains("UTF-16"));
-    CHECK_THROWS_WITH(ParseText(std::string("\xFE\xFF\0\"\0r", 6)), Contains("UTF-16"));
+    CHECK_THAT(Message(TryParseText(std::string("\xFF\xFE\"\0r\0", 6))), Contains("UTF-16"));
+    CHECK_THAT(Message(TryParseText(std::string("\xFE\xFF\0\"\0r", 6))), Contains("UTF-16"));
     CHECK(ParseText("\xFFroot { }").key() == "\xFFroot");
 }
 
@@ -628,16 +622,16 @@ TEST_CASE("Text parser: nesting depth limit", "[text_parser][depth]")
     };
 
     EasyVDF::ReadOptions options;
-    CHECK_NOTHROW(ParseText(nested(options.max_depth)));
-    CHECK_THROWS_WITH(ParseText(nested(options.max_depth + 1)), Contains("nested deeper") && Contains("line " + std::to_string(options.max_depth + 1)));
+    CHECK(Outcome(TryParseText(nested(options.max_depth))) == "OK");
+    CHECK_THAT(Message(TryParseText(nested(options.max_depth + 1))), Contains("nested deeper") && Contains("line " + std::to_string(options.max_depth + 1)));
 
     // A hostile input does not overflow the stack.
-    CHECK_THROWS_AS(ParseText(nested(200000)), ParseError);
-    CHECK_THROWS_AS(ParseText(std::string(1000000, '{')), ParseError);
+    CHECK(IsParseError(TryParseText(nested(200000))));
+    CHECK(IsParseError(TryParseText(std::string(1000000, '{'))));
 
     options.max_depth = 3;
-    CHECK_NOTHROW(ParseText(nested(3), options));
-    CHECK_THROWS_AS(ParseText(nested(4), options), ParseError);
+    CHECK(Outcome(TryParseText(nested(3), options)) == "OK");
+    CHECK(IsParseError(TryParseText(nested(4), options)));
 
     options.max_depth = 500;
     KeyValue deep = ParseText(nested(500), options);
@@ -660,28 +654,28 @@ TEST_CASE("Text values convert to numbers", "[text_parser][conversions]")
     CHECK(o["int"].as<uint8_t>() == 42);
     CHECK(o["int"].as<int64_t>() == 42);
     CHECK(o["int"].as<double>() == 42.0);
-    CHECK(o["int"].as<bool>());
+    CHECK(o["int"].as<bool>() == true);
     CHECK(o["neg"].as<int>() == -7);
     CHECK(o["neg"].as<int8_t>() == -7);
-    CHECK_THROWS_AS(o["neg"].as<unsigned>(), EasyVDF::TypeError);
+    CHECK(Outcome(o["neg"].as<unsigned>()) == "Type");
     CHECK(o["hex"].as<int>() == 42);
     CHECK(o["big"].as<uint64_t>() == 18446744073709551615ull);
-    CHECK_THROWS_AS(o["big"].as<int64_t>(), EasyVDF::TypeError);
+    CHECK(Outcome(o["big"].as<int64_t>()) == "Type");
     CHECK(o["float"].as<float>() == 1.5f);
     CHECK(o["float"].as<double>() == 1.5);
-    CHECK_THROWS_AS(o["float"].as<int>(), EasyVDF::TypeError);
+    CHECK(Outcome(o["float"].as<int>()) == "Type");
     CHECK(o["exp"].as<double>() == -2500.0);
-    CHECK(o["bool1"].as<bool>());
-    CHECK_FALSE(o["bool0"].as<bool>());
-    CHECK(o["word"].as<bool>());
+    CHECK(o["bool1"].as<bool>() == true);
+    CHECK(o["bool0"].as<bool>() == false);
+    CHECK(o["word"].as<bool>() == true);
     CHECK(o["color"].as<EasyVDF::Color>() == EasyVDF::Color{255, 128, 0, 64});
     CHECK(o["rgb"].as<EasyVDF::Color>() == EasyVDF::Color{1, 2, 3, 255});
     CHECK(o["spaced"].as<int>() == 12);
 
-    CHECK_THROWS_AS(o["text"].as<int>(), EasyVDF::TypeError);
-    CHECK_THROWS_AS(o["text"].as<double>(), EasyVDF::TypeError);
-    CHECK_THROWS_AS(o["text"].as<bool>(), EasyVDF::TypeError);
-    CHECK_THROWS_AS(o["empty"].as<int>(), EasyVDF::TypeError);
+    CHECK(Outcome(o["text"].as<int>()) == "Type");
+    CHECK(Outcome(o["text"].as<double>()) == "Type");
+    CHECK(Outcome(o["text"].as<bool>()) == "Type");
+    CHECK(Outcome(o["empty"].as<int>()) == "Type");
     CHECK(o["text"].value_or(5) == 5);
     CHECK(o["empty"].value_or(1.5) == 1.5);
     CHECK_FALSE(o["text"].try_as<int>().has_value());
@@ -705,10 +699,10 @@ TEST_CASE("parse_all reads the files that hold several root objects", "[text_par
         "}\n";
 
     // One document is one root object: parse() keeps refusing the rest, and says what to use.
-    CHECK_THROWS_WITH(ParseText(text), Contains("after root object at line 8, column 1") && Contains("parse_all"));
+    CHECK_THAT(Message(TryParseText(text)), Contains("after root object at line 8, column 1") && Contains("parse_all"));
 
     EasyVDF::ReadOptions options;
-    std::vector<KeyValue> roots = EasyVDF::parse_all(text, options);
+    std::vector<KeyValue> roots = EasyVDF::parse_all(text, options).value();
     REQUIRE(roots.size() == 2);
     CHECK(roots[0].key() == "InstallScript");
     CHECK(roots[0]["Run Process"]["process 1"].as<std::string>() == "setup.exe");
@@ -716,7 +710,7 @@ TEST_CASE("parse_all reads the files that hold several root objects", "[text_par
     CHECK(roots[1]["InstallScript"].as<std::string>() == "4284ab2eaacb3706");
 
     // Writing them one after the other gives the file back.
-    CHECK(roots[0].to_text() + roots[1].to_text() == text);
+    CHECK(roots[0].to_text().value() + roots[1].to_text().value() == text);
 
     SECTION("from a stream, whatever the chunk size")
     {
@@ -732,12 +726,12 @@ TEST_CASE("parse_all reads the files that hold several root objects", "[text_par
     {
         std::vector<EasyVDF::Directive> directives;
         options.directives = &directives;
-        auto single = EasyVDF::parse_all("#base \"a.vdf\"\nroot { k v } // end\n#include b.vdf\n", options);
+        auto single = EasyVDF::parse_all("#base \"a.vdf\"\nroot { k v } // end\n#include b.vdf\n", options).value();
         REQUIRE(single.size() == 1);
         CHECK(single[0] == EasyVDF::parse("root { k v }"));
         CHECK(directives.size() == 2);
 
-        auto three = EasyVDF::parse_all("a{} b { k v } \"a\" { }");
+        auto three = EasyVDF::parse_all("a{} b { k v } \"a\" { }").value();
         REQUIRE(three.size() == 3);
         CHECK(three[0].key() == "a");
         CHECK(three[1]["k"].as<std::string>() == "v");
@@ -746,14 +740,14 @@ TEST_CASE("parse_all reads the files that hold several root objects", "[text_par
 
     SECTION("errors are the same as parse()")
     {
-        CHECK_THROWS_AS(EasyVDF::parse_all(""), ParseError);
-        CHECK_THROWS_AS(EasyVDF::parse_all("  \n"), ParseError);
-        CHECK_THROWS_AS(EasyVDF::parse_all("a { } b"), ParseError);
-        CHECK_THROWS_AS(EasyVDF::parse_all("a { } b {"), ParseError);
-        CHECK_THROWS_AS(EasyVDF::parse_all("a { } }"), ParseError);
-        CHECK_THROWS_WITH(EasyVDF::parse_all("a { }\nb c\n"), Contains("line 2, column 3"));
+        CHECK(IsParseError(EasyVDF::parse_all("")));
+        CHECK(IsParseError(EasyVDF::parse_all("  \n")));
+        CHECK(IsParseError(EasyVDF::parse_all("a { } b")));
+        CHECK(IsParseError(EasyVDF::parse_all("a { } b {")));
+        CHECK(IsParseError(EasyVDF::parse_all("a { } }")));
+        CHECK_THAT(Message(EasyVDF::parse_all("a { }\nb c\n")), Contains("line 2, column 3"));
         // Stray data that is not another root object is reported without the hint.
-        CHECK_THROWS_WITH(EasyVDF::parse("a { } }"), Contains("after root object") && !Contains("parse_all"));
+        CHECK_THAT(Message(EasyVDF::parse("a { } }")), Contains("after root object") && !Contains("parse_all"));
     }
 
     SECTION("binary documents hold exactly one root")
@@ -761,10 +755,10 @@ TEST_CASE("parse_all reads the files that hold several root objects", "[text_par
         KeyValue doc("root", { {"k", 5} });
         for (EasyVDF::Format format : { EasyVDF::Format::Binary, EasyVDF::Format::Vbkv })
         {
-            auto binary_roots = EasyVDF::parse_all(doc.to_binary(format));
+            auto binary_roots = EasyVDF::parse_all(doc.to_binary(format).value()).value();
             REQUIRE(binary_roots.size() == 1);
             CHECK(binary_roots[0] == doc);
-            CHECK_THROWS_AS(EasyVDF::parse_all(doc.to_binary(format) + doc.to_binary(format)), ParseError);
+            CHECK(IsParseError(EasyVDF::parse_all(doc.to_binary(format).value() + doc.to_binary(format).value())));
         }
     }
 }

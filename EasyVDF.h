@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cassert>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
@@ -24,7 +23,6 @@
 #include <optional>
 #include <ostream>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -45,15 +43,9 @@
     #endif
 #endif
 
-// EasyVDF reports its errors by return value (EasyVDF::Result, the try_* functions);
-// the throwing API (parse(), load(), as<T>(), at(), save(), ...) and the exception
-// classes are a thin layer on top of it. Define EASYVDF_NO_EXCEPTIONS before including
-// this header to remove that layer. It is defined automatically when the compiler has
-// exceptions disabled (-fno-exceptions, /EHs-c-). See README.md, "Error handling
-// without exceptions".
-#if !defined(EASYVDF_NO_EXCEPTIONS) && !defined(__cpp_exceptions) && !defined(__EXCEPTIONS) && !defined(_CPPUNWIND)
-    #define EASYVDF_NO_EXCEPTIONS
-#endif
+// EasyVDF does not use exceptions: the operations that can fail return an
+// EasyVDF::Result, which holds the value or an EasyVDF::ErrorInfo. The header compiles
+// with exceptions enabled or disabled (-fno-exceptions, /EHs-c-). See README.md, "Errors".
 
 namespace EasyVDF {
 
@@ -120,11 +112,10 @@ inline bool operator>=(Color l, Color r) noexcept { return !(l < r); }
 //
 /////////////////////////////////////////////////////////////////////
 
-/// What went wrong. Every error has one of these codes, whether it is returned in a
-/// Result (try_* functions) or thrown (the exception class is given for each group).
+/// What went wrong. Every error that EasyVDF returns (in an ErrorInfo) has one of these codes.
 enum class ErrorCode
 {
-    // Malformed input, thrown as ParseError.
+    // Malformed input, see is_parse_error().
     Syntax,              ///< Text: a token that the grammar does not allow there.
     UnexpectedEof,       ///< The input ends before the end of the document (truncated input).
     EmptyInput,          ///< The input holds no document: no byte, or only blanks, comments and directives.
@@ -136,10 +127,10 @@ enum class ErrorCode
     ChecksumMismatch,    ///< VBKV: the CRC32 of the data does not match the header.
     DepthExceeded,       ///< Objects nested deeper than ReadOptions::max_depth.
 
-    Io,                  ///< IoError: a file can't be opened, read or written, or a stream can't be read.
-    Write,               ///< WriteError: the document can't be written (root not an object, ...).
-    Type,                ///< TypeError: no conversion to the requested type, or a scalar used as an object.
-    Key,                 ///< KeyError: Node::at() / try_at() did not find the key.
+    Io,                  ///< A file can't be opened, read or written, or a stream can't be read.
+    Write,               ///< The document can't be written (root not an object, ...).
+    Type,                ///< as<T>(): no conversion to the requested type.
+    Key,                 ///< Node::at(): the key is missing.
 };
 
 /// The name of the code: "Syntax", "UnexpectedEof", ...
@@ -165,14 +156,21 @@ inline const char* to_string(ErrorCode code) noexcept
     return "Unknown";
 }
 
+/// True for the codes of a malformed input, Syntax to DepthExceeded.
+inline bool is_parse_error(ErrorCode code) noexcept
+{
+    return code >= ErrorCode::Syntax && code <= ErrorCode::DepthExceeded;
+}
+
 inline std::ostream& operator<<(std::ostream& os, ErrorCode code)
 {
     return os << to_string(code);
 }
 
-/// An error: its code, a readable message (the what() of the matching exception)
-/// and, for text input, the 1-based position of the error. line and column are 0
-/// when they do not apply (binary input, I/O, ...); column is 0 at the end of the input.
+/// An error: its code, a readable message and, for text input, the 1-based position
+/// of the error. line and column are 0 when they do not apply (binary input, I/O, ...);
+/// column is 0 at the end of the input. The message of a text error ends with the
+/// position: "... at line 3, column 5".
 struct ErrorInfo
 {
     ErrorCode code;
@@ -198,107 +196,24 @@ inline std::ostream& operator<<(std::ostream& os, ErrorInfo const& error)
     return os << to_string(error.code) << ": " << error.message;
 }
 
-#ifndef EASYVDF_NO_EXCEPTIONS
-
-/// Base class of every exception thrown by EasyVDF. code(), line() and column()
-/// give the same information as the ErrorInfo of the try_* functions; info() rebuilds it.
-class Error : public std::runtime_error
-{
-    ErrorCode m_Code;
-    std::size_t m_Line;
-    std::size_t m_Column;
-
-protected:
-    Error(ErrorCode code, std::string const& message, std::size_t line, std::size_t column) :
-        std::runtime_error(message), m_Code(code), m_Line(line), m_Column(column)
-    {}
-
-public:
-    explicit Error(ErrorInfo const& info) :
-        Error(info.code, info.message, info.line, info.column)
-    {}
-
-    ErrorCode code() const noexcept { return m_Code; }
-
-    /// 1-based position in a text input, 0 when unknown or not applicable.
-    std::size_t line() const noexcept { return m_Line; }
-    std::size_t column() const noexcept { return m_Column; }
-
-    /// The error as a value, with what() as its message.
-    ErrorInfo info() const { return ErrorInfo(m_Code, what(), m_Line, m_Column); }
-};
-
-/// Malformed input. line() and column() are 1-based and 0 when unknown (binary input).
-/// Its code() is one of the parse codes, Syntax to UnsupportedEncoding.
-class ParseError : public Error
-{
-public:
-    explicit ParseError(std::string const& message, std::size_t line = 0, std::size_t column = 0) :
-        Error(ErrorCode::Syntax, message, line, column)
-    {}
-
-    explicit ParseError(ErrorInfo const& info) : Error(info) {}
-};
-
-/// A value has no conversion to the requested type, or a non-object was used as an object.
-class TypeError : public Error
-{
-public:
-    explicit TypeError(std::string const& message) : Error(ErrorCode::Type, message, 0, 0) {}
-    explicit TypeError(const char* message) : Error(ErrorCode::Type, message, 0, 0) {}
-    explicit TypeError(ErrorInfo const& info) : Error(info) {}
-};
-
-/// Node::at() did not find the key.
-class KeyError : public Error
-{
-public:
-    explicit KeyError(std::string const& message) : Error(ErrorCode::Key, message, 0, 0) {}
-    explicit KeyError(const char* message) : Error(ErrorCode::Key, message, 0, 0) {}
-    explicit KeyError(ErrorInfo const& info) : Error(info) {}
-};
-
-/// The tree can't be written (root without value or not an object, ...).
-class WriteError : public Error
-{
-public:
-    explicit WriteError(std::string const& message) : Error(ErrorCode::Write, message, 0, 0) {}
-    explicit WriteError(const char* message) : Error(ErrorCode::Write, message, 0, 0) {}
-    explicit WriteError(ErrorInfo const& info) : Error(info) {}
-};
-
-/// A file could not be opened, read or written.
-class IoError : public Error
-{
-public:
-    explicit IoError(std::string const& message) : Error(ErrorCode::Io, message, 0, 0) {}
-    explicit IoError(const char* message) : Error(ErrorCode::Io, message, 0, 0) {}
-    explicit IoError(ErrorInfo const& info) : Error(info) {}
-};
-
-#endif // EASYVDF_NO_EXCEPTIONS
-
 namespace Details {
 
-/// Reports an error that the caller did not handle: Result::value() on an error,
-/// a scalar used as an object, ... Throws the exception that matches the code;
-/// without exceptions, prints the error on stderr and calls std::abort().
-[[noreturn]] inline void Raise(ErrorInfo const& error)
+/// A mistake that has no error value: the value of a Result that holds an error,
+/// a scalar used as an object, ... Prints the error on stderr and calls std::abort(),
+/// like Rust's unwrap() and panic!.
+[[noreturn]] inline void Panic(ErrorInfo const& error)
 {
-#ifndef EASYVDF_NO_EXCEPTIONS
-    switch (error.code)
-    {
-        case ErrorCode::Io   : throw IoError(error);
-        case ErrorCode::Write: throw WriteError(error);
-        case ErrorCode::Type : throw TypeError(error);
-        case ErrorCode::Key  : throw KeyError(error);
-        default              : throw ParseError(error);
-    }
-#else
     std::fprintf(stderr, "Unhandled EasyVDF error (%s): %s\n", to_string(error.code), error.message.c_str());
     std::fflush(stderr);
     std::abort();
-#endif
+}
+
+/// Result::error() on a Result that holds a value.
+[[noreturn]] inline void PanicNoError()
+{
+    std::fprintf(stderr, "EasyVDF: error() called on a Result that holds a value\n");
+    std::fflush(stderr);
+    std::abort();
 }
 
 } // namespace Details
@@ -393,27 +308,26 @@ struct ResultOps
 } // namespace Details
 
 /// A value of type T or an ErrorInfo, like C++23 std::expected<T, ErrorInfo> or
-/// Rust's Result<T, E>. Returned by the try_* functions, which never throw
-/// (except std::bad_alloc).
+/// Rust's Result<T, E>. Every operation of EasyVDF that can fail returns one.
 ///
 /// ```
-/// EasyVDF::Result<EasyVDF::KeyValue> doc = EasyVDF::try_load(path);
+/// EasyVDF::Result<EasyVDF::KeyValue> doc = EasyVDF::load(path);
 /// if (!doc)
 ///     std::cerr << doc.error() << '\n';      // "Syntax: Expected a key ... at line 3, column 5"
 /// else
 ///     std::cout << (*doc)["name"].value_or("?") << '\n';
 /// ```
 ///
-/// - `*r` and `r->` access the value (has_value() must be true), `r.error()` the
-///   error (has_value() must be false).
-/// - `r.value()` returns the value, or reports the error like an uncaught one: it
-///   throws the matching exception (ParseError, IoError, ...), and without
-///   exceptions prints the error on stderr and calls std::abort(), like Rust's unwrap().
+/// - `*r`, `r->` and `r.value()` access the value, `r.error()` the error. Using the
+///   value of a Result that holds an error (or the error of one that holds a value)
+///   is a bug: the error is printed on stderr and std::abort() is called, like
+///   Rust's unwrap(). Test has_value() first, or use value_or().
 /// - `map(f)` transforms the value, `and_then(f)` chains an operation that can fail,
 ///   `or_else(f)` recovers from an error, `map_error(f)` transforms the error.
+/// - `r == value` is true when r holds a value equal to value.
 ///
-/// Result<T&> holds a reference (see Node::try_at()), Result<void> only tells
-/// success from failure (see KeyValue::try_save()).
+/// Result<T&> holds a reference (see Node::at()), Result<void> only tells success
+/// from failure (see KeyValue::save()).
 template<typename T>
 class [[nodiscard]] Result
 {
@@ -421,6 +335,18 @@ class [[nodiscard]] Result
     static_assert(!std::is_same_v<std::remove_cv_t<T>, ErrorInfo>, "EasyVDF: Result<ErrorInfo> can't tell a value from an error");
 
     std::variant<T, ErrorInfo> m_Storage;
+
+    void CheckValue() const
+    {
+        if (!has_value())
+            Details::Panic(*std::get_if<1>(&m_Storage));
+    }
+
+    void CheckError() const
+    {
+        if (has_value())
+            Details::PanicNoError();
+    }
 
 public:
     using value_type = T;
@@ -445,32 +371,31 @@ public:
     bool has_value() const noexcept { return m_Storage.index() == 0; }
     explicit operator bool() const noexcept { return has_value(); }
 
-    /// The value; has_value() must be true.
-    T& operator*() & noexcept { assert(has_value()); return *std::get_if<0>(&m_Storage); }
-    T const& operator*() const& noexcept { assert(has_value()); return *std::get_if<0>(&m_Storage); }
-    T&& operator*() && noexcept { assert(has_value()); return std::move(*std::get_if<0>(&m_Storage)); }
-    T const&& operator*() const&& noexcept { assert(has_value()); return std::move(*std::get_if<0>(&m_Storage)); }
-    T* operator->() noexcept { assert(has_value()); return std::get_if<0>(&m_Storage); }
-    T const* operator->() const noexcept { assert(has_value()); return std::get_if<0>(&m_Storage); }
+    /// The value; an error is printed before std::abort().
+    T& value() & { CheckValue(); return *std::get_if<0>(&m_Storage); }
+    T const& value() const& { CheckValue(); return *std::get_if<0>(&m_Storage); }
+    T&& value() && { CheckValue(); return std::move(*std::get_if<0>(&m_Storage)); }
+    T const&& value() const&& { CheckValue(); return std::move(*std::get_if<0>(&m_Storage)); }
 
-    /// The value; an error is thrown as the matching exception, or printed before
-    /// std::abort() without exceptions.
-    T& value() & { Check(); return **this; }
-    T const& value() const& { Check(); return **this; }
-    T&& value() && { Check(); return std::move(**this); }
-    T const&& value() const&& { Check(); return std::move(**this); }
+    /// Same as value().
+    T& operator*() & { return value(); }
+    T const& operator*() const& { return value(); }
+    T&& operator*() && { return std::move(*this).value(); }
+    T const&& operator*() const&& { return std::move(*this).value(); }
+    T* operator->() { return &value(); }
+    T const* operator->() const { return &value(); }
 
-    /// The error; has_value() must be false.
-    ErrorInfo& error() & noexcept { assert(!has_value()); return *std::get_if<1>(&m_Storage); }
-    ErrorInfo const& error() const& noexcept { assert(!has_value()); return *std::get_if<1>(&m_Storage); }
-    ErrorInfo&& error() && noexcept { assert(!has_value()); return std::move(*std::get_if<1>(&m_Storage)); }
+    /// The error; a Result that holds a value aborts.
+    ErrorInfo& error() & { CheckError(); return *std::get_if<1>(&m_Storage); }
+    ErrorInfo const& error() const& { CheckError(); return *std::get_if<1>(&m_Storage); }
+    ErrorInfo&& error() && { CheckError(); return std::move(*std::get_if<1>(&m_Storage)); }
 
     /// The value, or default_value converted to T when this holds an error.
     template<typename U>
     T value_or(U&& default_value) const&
     {
         if (has_value())
-            return **this;
+            return *std::get_if<0>(&m_Storage);
         return static_cast<T>(std::forward<U>(default_value));
     }
 
@@ -478,7 +403,7 @@ public:
     T value_or(U&& default_value) &&
     {
         if (has_value())
-            return std::move(**this);
+            return std::move(*std::get_if<0>(&m_Storage));
         return static_cast<T>(std::forward<U>(default_value));
     }
 
@@ -502,15 +427,30 @@ public:
     template<typename F> Result map_error(F&& f) const& { return Details::ResultOps::MapError(*this, std::forward<F>(f)); }
     template<typename F> Result map_error(F&& f) && { return Details::ResultOps::MapError(std::move(*this), std::forward<F>(f)); }
 
-private:
-    void Check() const
+    /// Same values, or same errors.
+    friend bool operator==(Result const& l, Result const& r)
     {
-        if (!has_value())
-            Details::Raise(*std::get_if<1>(&m_Storage));
+        if (l.has_value() != r.has_value())
+            return false;
+        if (l.has_value())
+            return *std::get_if<0>(&l.m_Storage) == *std::get_if<0>(&r.m_Storage);
+        return *std::get_if<1>(&l.m_Storage) == *std::get_if<1>(&r.m_Storage);
     }
+
+    friend bool operator!=(Result const& l, Result const& r) { return !(l == r); }
+
+    /// True when r holds a value equal to value: `doc["appid"].as<int>() == 440`.
+    template<typename U, std::enable_if_t<!Details::IsResult<U>::value && !std::is_same_v<U, ErrorInfo>, int> = 0>
+    friend bool operator==(Result const& r, U const& value) { return r.has_value() && *std::get_if<0>(&r.m_Storage) == value; }
+    template<typename U, std::enable_if_t<!Details::IsResult<U>::value && !std::is_same_v<U, ErrorInfo>, int> = 0>
+    friend bool operator==(U const& value, Result const& r) { return r == value; }
+    template<typename U, std::enable_if_t<!Details::IsResult<U>::value && !std::is_same_v<U, ErrorInfo>, int> = 0>
+    friend bool operator!=(Result const& r, U const& value) { return !(r == value); }
+    template<typename U, std::enable_if_t<!Details::IsResult<U>::value && !std::is_same_v<U, ErrorInfo>, int> = 0>
+    friend bool operator!=(U const& value, Result const& r) { return !(r == value); }
 };
 
-/// A reference or an error, see Node::try_at(). Like a pointer, the Result does not
+/// A reference or an error, see Node::at(). Like a pointer, the Result does not
 /// own the value: the reference stays valid as long as the node it refers to.
 /// value_or() returns a copy.
 template<typename T>
@@ -546,26 +486,27 @@ public:
     bool has_value() const noexcept { return m_Storage.index() == 0; }
     explicit operator bool() const noexcept { return has_value(); }
 
-    T& operator*() const noexcept { assert(has_value()); return **std::get_if<0>(&m_Storage); }
-    T* operator->() const noexcept { assert(has_value()); return *std::get_if<0>(&m_Storage); }
-
+    /// The value; an error is printed before std::abort().
     T& value() const
     {
         if (!has_value())
-            Details::Raise(*std::get_if<1>(&m_Storage));
-        return **this;
+            Details::Panic(*std::get_if<1>(&m_Storage));
+        return **std::get_if<0>(&m_Storage);
     }
 
-    ErrorInfo& error() & noexcept { assert(!has_value()); return *std::get_if<1>(&m_Storage); }
-    ErrorInfo const& error() const& noexcept { assert(!has_value()); return *std::get_if<1>(&m_Storage); }
-    ErrorInfo&& error() && noexcept { assert(!has_value()); return std::move(*std::get_if<1>(&m_Storage)); }
+    T& operator*() const { return value(); }
+    T* operator->() const { return &value(); }
+
+    ErrorInfo& error() & { CheckError(); return *std::get_if<1>(&m_Storage); }
+    ErrorInfo const& error() const& { CheckError(); return *std::get_if<1>(&m_Storage); }
+    ErrorInfo&& error() && { CheckError(); return std::move(*std::get_if<1>(&m_Storage)); }
 
     /// A copy of the value, or default_value converted to it.
     template<typename U>
     std::remove_cv_t<T> value_or(U&& default_value) const
     {
         if (has_value())
-            return **this;
+            return **std::get_if<0>(&m_Storage);
         return static_cast<std::remove_cv_t<T>>(std::forward<U>(default_value));
     }
 
@@ -573,14 +514,37 @@ public:
     template<typename F> auto and_then(F&& f) const { return Details::ResultOps::AndThen(*this, std::forward<F>(f)); }
     template<typename F> Result or_else(F&& f) const { return Details::ResultOps::OrElse(*this, std::forward<F>(f)); }
     template<typename F> Result map_error(F&& f) const { return Details::ResultOps::MapError(*this, std::forward<F>(f)); }
+
+    /// True when r refers to a value equal to value.
+    template<typename U, std::enable_if_t<!Details::IsResult<U>::value && !std::is_same_v<U, ErrorInfo>, int> = 0>
+    friend bool operator==(Result const& r, U const& value) { return r.has_value() && **std::get_if<0>(&r.m_Storage) == value; }
+    template<typename U, std::enable_if_t<!Details::IsResult<U>::value && !std::is_same_v<U, ErrorInfo>, int> = 0>
+    friend bool operator==(U const& value, Result const& r) { return r == value; }
+    template<typename U, std::enable_if_t<!Details::IsResult<U>::value && !std::is_same_v<U, ErrorInfo>, int> = 0>
+    friend bool operator!=(Result const& r, U const& value) { return !(r == value); }
+    template<typename U, std::enable_if_t<!Details::IsResult<U>::value && !std::is_same_v<U, ErrorInfo>, int> = 0>
+    friend bool operator!=(U const& value, Result const& r) { return !(r == value); }
+
+private:
+    void CheckError() const
+    {
+        if (has_value())
+            Details::PanicNoError();
+    }
 };
 
-/// Success or an error, see KeyValue::try_save(). The functions given to map()
+/// Success or an error, see KeyValue::save(). The functions given to map()
 /// and and_then() take no argument.
 template<>
 class [[nodiscard]] Result<void>
 {
     std::optional<ErrorInfo> m_Error;
+
+    void CheckError() const
+    {
+        if (!m_Error)
+            Details::PanicNoError();
+    }
 
 public:
     using value_type = void;
@@ -596,17 +560,20 @@ public:
     bool has_value() const noexcept { return !m_Error.has_value(); }
     explicit operator bool() const noexcept { return has_value(); }
 
-    /// Reports the error, if any: throws the matching exception, or prints it
-    /// before std::abort() without exceptions.
+    /// Does nothing on success; an error is printed before std::abort().
     void value() const
     {
         if (m_Error)
-            Details::Raise(*m_Error);
+            Details::Panic(*m_Error);
     }
 
-    ErrorInfo& error() & noexcept { assert(!has_value()); return *m_Error; }
-    ErrorInfo const& error() const& noexcept { assert(!has_value()); return *m_Error; }
-    ErrorInfo&& error() && noexcept { assert(!has_value()); return std::move(*m_Error); }
+    ErrorInfo& error() & { CheckError(); return *m_Error; }
+    ErrorInfo const& error() const& { CheckError(); return *m_Error; }
+    ErrorInfo&& error() && { CheckError(); return std::move(*m_Error); }
+
+    /// Both successes, or the same error.
+    friend bool operator==(Result const& l, Result const& r) { return l.m_Error == r.m_Error; }
+    friend bool operator!=(Result const& l, Result const& r) { return !(l == r); }
 
     template<typename F> auto map(F&& f) const& { return Details::ResultOps::Map(*this, std::forward<F>(f)); }
     template<typename F> auto map(F&& f) && { return Details::ResultOps::Map(std::move(*this), std::forward<F>(f)); }
@@ -924,7 +891,7 @@ inline uint32_t Crc32(std::string_view data) noexcept
 /// A value of a KeyValues tree: nothing (Type::None), an object (a list of
 /// key/value children, duplicate keys allowed) or a scalar.
 ///
-/// - `node["key"]` goes down the tree. On a const node it never throws: a missing
+/// - `node["key"]` goes down the tree. On a const node it never fails: a missing
 ///   key gives a node without value, so `doc["a"]["b"].value_or(0)` is always safe.
 ///   On a non-const node it prepares the key for writing, like std::map:
 ///   `doc["a"]["b"] = 1` creates what is missing. Keys that are only read are
@@ -973,7 +940,7 @@ public:
         return node;
     }
 
-    /// Replaces the value. Strong exception guarantee; other may be a child of *this.
+    /// Replaces the value; unchanged if an allocation fails (std::bad_alloc). other may be a child of *this.
     Node& operator=(Node const& other)
     {
         if (this != &other)
@@ -1034,28 +1001,24 @@ public:
     bool is_object() const noexcept { return type() == Type::Object; }
     bool is_string() const noexcept { return type() == Type::String; }
 
-#ifndef EASYVDF_NO_EXCEPTIONS
     /// Converts the value to T: std::string, std::string_view (String nodes only),
     /// bool, any integer or floating point type, Color or Pointer.
     /// Strings are parsed ("42", "0x2A", "1.5", "255 0 0 255"), numbers are range
     /// checked, any scalar converts to std::string.
-    /// Throws TypeError when there is no value or no lossless conversion.
-    /// Not available with EASYVDF_NO_EXCEPTIONS: use try_as<T>() or value_or().
+    /// An ErrorCode::Type error when there is no value or no lossless conversion:
+    /// `if (auto appid = doc["appid"].as<uint32_t>()) use(*appid);`
     template<typename T>
-    T as() const
+    Result<T> as() const
     {
         T result{};
-        if (!Convert(result))
-        {
-            throw TypeError(has_value()
-                ? std::string("EasyVDF: can't convert a ") + Details::TypeName(type()) + " value to " + Details::TargetName<T>()
-                : std::string("EasyVDF: can't convert a missing value (Type::None) to ") + Details::TargetName<T>());
-        }
-        return result;
+        if (Convert(result))
+            return result;
+        return ErrorInfo(ErrorCode::Type, has_value()
+            ? std::string("EasyVDF: can't convert a ") + Details::TypeName(type()) + " value to " + Details::TargetName<T>()
+            : std::string("EasyVDF: can't convert a missing value (Type::None) to ") + Details::TargetName<T>());
     }
-#endif
 
-    /// Like as<T>(), but returns std::nullopt instead of throwing.
+    /// Like as<T>(), with std::nullopt instead of the error.
     template<typename T>
     std::optional<T> try_as() const
     {
@@ -1084,30 +1047,24 @@ public:
     bool empty() const noexcept;
 
     /// First child with this key, or a node without value if there is none (or if
-    /// this is not an object). Never throws, never modifies the tree.
+    /// this is not an object). Never fails, never modifies the tree.
     Node const& operator[](std::string_view key) const noexcept;
 
     /// First child with this key, for reading or writing. A missing key is created
     /// lazily: it only becomes part of the tree once it is given a value.
-    /// Throws TypeError if this node holds a scalar (without exceptions: prints the
-    /// error and calls std::abort(), test is_object() / is_none() first).
+    /// A scalar has no children: on a node that holds one, the error is printed and
+    /// std::abort() is called (test is_object() / is_none() first).
     Node& operator[](std::string_view key);
 
     /// First child with this key, nullptr if there is none.
     KeyValue const* find(std::string_view key) const noexcept;
     KeyValue* find(std::string_view key) noexcept;
 
-#ifndef EASYVDF_NO_EXCEPTIONS
-    /// First child with this key, throws KeyError if there is none.
-    Node const& at(std::string_view key) const;
-    Node& at(std::string_view key);
-#endif
-
     /// First child with this key, or an ErrorCode::Key error if there is none:
-    /// `if (auto appid = doc.try_at("appid")) appid->as<int>();`
-    /// The reference is valid as long as the child, like the one at() returns.
-    Result<Node const&> try_at(std::string_view key) const;
-    Result<Node&> try_at(std::string_view key);
+    /// `if (auto appid = doc.at("appid")) use(*appid);`
+    /// The Result refers to the child: it is valid as long as the child.
+    Result<Node const&> at(std::string_view key) const;
+    Result<Node&> at(std::string_view key);
 
     bool contains(std::string_view key) const noexcept { return find(key) != nullptr; }
 
@@ -1120,7 +1077,7 @@ public:
     Details::ChildRange<false> all(std::string_view key);
 
     /// Appends a child, even if the key already exists (duplicate keys are legal).
-    /// A node without value becomes an object; a scalar is a TypeError, like for operator[].
+    /// A node without value becomes an object; a scalar aborts, like for operator[].
     KeyValue& add(std::string key, Node value);
 
     /// Appends an empty object.
@@ -1168,7 +1125,7 @@ private:
     Details::Children* ChildrenPtr() noexcept { return std::get_if<Details::Children>(&m_Value); }
 
     // The children of this node, making it an object if it has no value.
-    // A scalar has none: Details::Raise() reports a TypeError.
+    // A scalar has none: Details::Panic() reports it.
     Details::Children& MakeChildren();
 
     // Moves the pending children that were given a value to the end of the items.
@@ -1429,10 +1386,10 @@ struct ReadOptions
     Format format = Format::Auto;
     /// Text: decode escape sequences (\n \t \\ \" ...) in quoted strings.
     bool escapes = true;
-    /// VBKV: check the CRC32 of the file, ErrorCode::ChecksumMismatch (ParseError) on mismatch.
+    /// VBKV: check the CRC32 of the file, ErrorCode::ChecksumMismatch on mismatch.
     bool verify_crc = true;
     /// Maximum object nesting, the root object counts for 1; deeper input is an
-    /// ErrorCode::DepthExceeded ParseError. The parsers themselves are not recursive, but writing, copying,
+    /// ErrorCode::DepthExceeded error. The parsers themselves are not recursive, but writing, copying,
     /// comparing and destroying a tree use stack space proportional to its depth:
     /// keep this limit reasonable for untrusted input.
     std::size_t max_depth = 128;
@@ -1542,32 +1499,24 @@ public:
             m_Condition = std::make_unique<std::string>(condition);
     }
 
-#ifndef EASYVDF_NO_EXCEPTIONS
-    /// Serializes the document. The value must be an object, else WriteError is thrown.
-    std::string dump(WriteOptions const& options = {}) const;
+    /// Serializes the document, or an ErrorCode::Write error: the value must be an
+    /// object, a binary string can't hold a null character, ...
+    Result<std::string> dump(WriteOptions const& options = {}) const;
 
     /// dump() as text.
-    std::string to_text() const { return dump(Format::Text); }
+    Result<std::string> to_text() const { return dump(Format::Text); }
 
     /// dump() as binary: Format::Binary or Format::Vbkv.
-    std::string to_binary(Format format = Format::Binary) const { return dump(format); }
+    Result<std::string> to_binary(Format format = Format::Binary) const { return dump(format); }
 
-    /// Writes dump() to a stream (open it in binary mode). The state of the stream
-    /// is not checked, test it after the call.
-    void write(std::ostream& os, WriteOptions const& options = {}) const;
+    /// Writes dump() to a stream (open it in binary mode). Nothing is written when
+    /// the document can't be serialized. The state of the stream is not checked,
+    /// test it after the call.
+    Result<void> write(std::ostream& os, WriteOptions const& options = {}) const;
 
-    /// Writes dump() to a file. Throws IoError if the file can't be written.
-    void save(std::filesystem::path const& path, WriteOptions const& options = {}) const;
-#endif
-
-    /// The non-throwing versions of dump(), to_text(), to_binary(), write() and save():
-    /// ErrorCode::Write when the document can't be written, ErrorCode::Io when the
-    /// file can't be. Nothing is written when the document can't be serialized.
-    Result<std::string> try_dump(WriteOptions const& options = {}) const;
-    Result<std::string> try_to_text() const { return try_dump(Format::Text); }
-    Result<std::string> try_to_binary(Format format = Format::Binary) const { return try_dump(format); }
-    Result<void> try_write(std::ostream& os, WriteOptions const& options = {}) const;
-    Result<void> try_save(std::filesystem::path const& path, WriteOptions const& options = {}) const;
+    /// Writes dump() to a file: an ErrorCode::Io error if the file can't be written.
+    /// Nothing is created or truncated when the document can't be serialized.
+    Result<void> save(std::filesystem::path const& path, WriteOptions const& options = {}) const;
 
     /// Structured bindings: `auto& [key, value] = kv;` (key is const, value is the Node).
     template<std::size_t I>
@@ -1606,38 +1555,27 @@ public:
     friend bool operator!=(KeyValue const& l, KeyValue const& r) noexcept { return !(l == r); }
 };
 
-#ifndef EASYVDF_NO_EXCEPTIONS
 /// Parses a document held in memory (text or binary, see ReadOptions::format).
-/// A document is one root key and its object: anything after it is an error,
-/// see parse_all() for the files that hold several. Throws ParseError.
-KeyValue parse(std::string_view data, ReadOptions const& options = {});
+/// A document is one root key and its object: anything after it is an
+/// ErrorCode::TrailingData error, see parse_all() for the files that hold several.
+/// `if (auto doc = EasyVDF::parse(text)) use(*doc); else report(doc.error());`
+Result<KeyValue> parse(std::string_view data, ReadOptions const& options = {});
 
 /// Parses a document from a stream, read sequentially to its end: pipes and
-/// std::cin work. Open files in binary mode. Throws ParseError, or IoError if
-/// the stream reports a read error.
-KeyValue parse(std::istream& is, ReadOptions const& options = {});
+/// std::cin work. Open files in binary mode. A read error of the stream is an
+/// ErrorCode::Io error.
+Result<KeyValue> parse(std::istream& is, ReadOptions const& options = {});
 
-/// Parses a file. Throws IoError if it can't be opened, ParseError if it is malformed.
-KeyValue load(std::filesystem::path const& path, ReadOptions const& options = {});
+/// Parses a file: an ErrorCode::Io error if it can't be opened.
+Result<KeyValue> load(std::filesystem::path const& path, ReadOptions const& options = {});
 
 /// Like parse() and load() for text files that hold several root objects one
 /// after the other, such as the signed Steam files (installscript.vdf: the
 /// "InstallScript" object is followed by a "kvsignatures" one). Returns every
 /// root object, in order, at least one.
-std::vector<KeyValue> parse_all(std::string_view data, ReadOptions const& options = {});
-std::vector<KeyValue> parse_all(std::istream& is, ReadOptions const& options = {});
-std::vector<KeyValue> load_all(std::filesystem::path const& path, ReadOptions const& options = {});
-#endif
-
-/// The non-throwing versions of parse(), load(), parse_all() and load_all(): the
-/// error that they throw is returned instead, with the same message.
-/// `if (auto doc = EasyVDF::try_load(path)) use(*doc); else report(doc.error());`
-Result<KeyValue> try_parse(std::string_view data, ReadOptions const& options = {});
-Result<KeyValue> try_parse(std::istream& is, ReadOptions const& options = {});
-Result<KeyValue> try_load(std::filesystem::path const& path, ReadOptions const& options = {});
-Result<std::vector<KeyValue>> try_parse_all(std::string_view data, ReadOptions const& options = {});
-Result<std::vector<KeyValue>> try_parse_all(std::istream& is, ReadOptions const& options = {});
-Result<std::vector<KeyValue>> try_load_all(std::filesystem::path const& path, ReadOptions const& options = {});
+Result<std::vector<KeyValue>> parse_all(std::string_view data, ReadOptions const& options = {});
+Result<std::vector<KeyValue>> parse_all(std::istream& is, ReadOptions const& options = {});
+Result<std::vector<KeyValue>> load_all(std::filesystem::path const& path, ReadOptions const& options = {});
 
 /// Prints a value: the text of a scalar (`std::cout << doc["name"]`), the
 /// `{ ... }` block of an object, nothing for a node without value.
@@ -1884,7 +1822,7 @@ inline Details::Children& Node::MakeChildren()
     if (Details::Children* c = ChildrenPtr())
         return *c;
 
-    Details::Raise(ErrorInfo(ErrorCode::Type, std::string("EasyVDF: a ") + Details::TypeName(type()) + " value has no children"));
+    Details::Panic(ErrorInfo(ErrorCode::Type, std::string("EasyVDF: a ") + Details::TypeName(type()) + " value has no children"));
 }
 
 inline void Node::Promote(Details::Children& children)
@@ -1932,31 +1870,19 @@ inline ErrorInfo KeyNotFound(std::string_view key)
 
 } // namespace Details
 
-inline Result<Node const&> Node::try_at(std::string_view key) const
+inline Result<Node const&> Node::at(std::string_view key) const
 {
     if (KeyValue const* child = find(key))
         return static_cast<Node const&>(*child);
     return Details::KeyNotFound(key);
 }
 
-inline Result<Node&> Node::try_at(std::string_view key)
+inline Result<Node&> Node::at(std::string_view key)
 {
     if (KeyValue* child = find(key))
         return static_cast<Node&>(*child);
     return Details::KeyNotFound(key);
 }
-
-#ifndef EASYVDF_NO_EXCEPTIONS
-inline Node const& Node::at(std::string_view key) const
-{
-    return try_at(key).value();
-}
-
-inline Node& Node::at(std::string_view key)
-{
-    return try_at(key).value();
-}
-#endif
 
 inline std::size_t Node::count(std::string_view key) const noexcept
 {
@@ -3132,26 +3058,14 @@ inline bool WriteText(std::string& out, KeyValue const& item, std::size_t depth,
 
 namespace Details {
 
-/// A path for an error message. Never fails for a path that the narrow
-/// character set can't represent (Windows).
+/// A path for an error message, in UTF-8.
 inline std::string PathText(std::filesystem::path const& path)
 {
-#ifndef EASYVDF_NO_EXCEPTIONS
-    try
-    {
-        return path.string();
-    }
-    catch (std::exception const&)
-    {
-        return "<path>";
-    }
-#else
-    // path.string() can't report a conversion error without exceptions: UTF-8 always converts.
+    // Not path.string(): it fails for the paths that the narrow character set can't represent (Windows).
     std::string text;
     for (auto c : path.u8string())
         text += static_cast<char>(c);
     return text;
-#endif
 }
 
 inline ErrorInfo OpenForReadingError(std::filesystem::path const& path)
@@ -3161,7 +3075,7 @@ inline ErrorInfo OpenForReadingError(std::filesystem::path const& path)
 
 } // namespace Details
 
-inline Result<std::string> KeyValue::try_dump(WriteOptions const& options) const
+inline Result<std::string> KeyValue::dump(WriteOptions const& options) const
 {
     // VDF has no representation for a key without a value, and a document is an object.
     if (!has_value())
@@ -3205,9 +3119,9 @@ inline Result<std::string> KeyValue::try_dump(WriteOptions const& options) const
     return out;
 }
 
-inline Result<void> KeyValue::try_write(std::ostream& os, WriteOptions const& options) const
+inline Result<void> KeyValue::write(std::ostream& os, WriteOptions const& options) const
 {
-    Result<std::string> data = try_dump(options);
+    Result<std::string> data = dump(options);
     if (!data)
         return std::move(data).error();
 
@@ -3215,10 +3129,10 @@ inline Result<void> KeyValue::try_write(std::ostream& os, WriteOptions const& op
     return {};
 }
 
-inline Result<void> KeyValue::try_save(std::filesystem::path const& path, WriteOptions const& options) const
+inline Result<void> KeyValue::save(std::filesystem::path const& path, WriteOptions const& options) const
 {
     // Serialize first: nothing is created or truncated if the tree can't be written.
-    Result<std::string> data = try_dump(options);
+    Result<std::string> data = dump(options);
     if (!data)
         return std::move(data).error();
 
@@ -3233,96 +3147,47 @@ inline Result<void> KeyValue::try_save(std::filesystem::path const& path, WriteO
     return {};
 }
 
-inline Result<KeyValue> try_parse(std::string_view data, ReadOptions const& options)
+inline Result<KeyValue> parse(std::string_view data, ReadOptions const& options)
 {
     Details::Reader reader(data);
     return Details::ParseSingle(reader, options);
 }
 
-inline Result<KeyValue> try_parse(std::istream& is, ReadOptions const& options)
+inline Result<KeyValue> parse(std::istream& is, ReadOptions const& options)
 {
     Details::Reader reader(is, options.chunk_size);
     return Details::ParseSingle(reader, options);
 }
 
-inline Result<KeyValue> try_load(std::filesystem::path const& path, ReadOptions const& options)
+inline Result<KeyValue> load(std::filesystem::path const& path, ReadOptions const& options)
 {
     std::ifstream file(path, std::ios::binary);
     if (!file)
         return Details::OpenForReadingError(path);
 
-    return try_parse(file, options);
+    return parse(file, options);
 }
 
-inline Result<std::vector<KeyValue>> try_parse_all(std::string_view data, ReadOptions const& options)
+inline Result<std::vector<KeyValue>> parse_all(std::string_view data, ReadOptions const& options)
 {
     Details::Reader reader(data);
     return Details::ParseDocument(reader, options, true);
 }
 
-inline Result<std::vector<KeyValue>> try_parse_all(std::istream& is, ReadOptions const& options)
+inline Result<std::vector<KeyValue>> parse_all(std::istream& is, ReadOptions const& options)
 {
     Details::Reader reader(is, options.chunk_size);
     return Details::ParseDocument(reader, options, true);
 }
 
-inline Result<std::vector<KeyValue>> try_load_all(std::filesystem::path const& path, ReadOptions const& options)
+inline Result<std::vector<KeyValue>> load_all(std::filesystem::path const& path, ReadOptions const& options)
 {
     std::ifstream file(path, std::ios::binary);
     if (!file)
         return Details::OpenForReadingError(path);
 
-    return try_parse_all(file, options);
+    return parse_all(file, options);
 }
-
-#ifndef EASYVDF_NO_EXCEPTIONS
-// The throwing API: the try_* functions, with the error thrown by Result::value().
-
-inline std::string KeyValue::dump(WriteOptions const& options) const
-{
-    return try_dump(options).value();
-}
-
-inline void KeyValue::write(std::ostream& os, WriteOptions const& options) const
-{
-    try_write(os, options).value();
-}
-
-inline void KeyValue::save(std::filesystem::path const& path, WriteOptions const& options) const
-{
-    try_save(path, options).value();
-}
-
-inline KeyValue parse(std::string_view data, ReadOptions const& options)
-{
-    return try_parse(data, options).value();
-}
-
-inline KeyValue parse(std::istream& is, ReadOptions const& options)
-{
-    return try_parse(is, options).value();
-}
-
-inline KeyValue load(std::filesystem::path const& path, ReadOptions const& options)
-{
-    return try_load(path, options).value();
-}
-
-inline std::vector<KeyValue> parse_all(std::string_view data, ReadOptions const& options)
-{
-    return try_parse_all(data, options).value();
-}
-
-inline std::vector<KeyValue> parse_all(std::istream& is, ReadOptions const& options)
-{
-    return try_parse_all(is, options).value();
-}
-
-inline std::vector<KeyValue> load_all(std::filesystem::path const& path, ReadOptions const& options)
-{
-    return try_load_all(path, options).value();
-}
-#endif // EASYVDF_NO_EXCEPTIONS
 
 inline std::ostream& operator<<(std::ostream& os, Node const& node)
 {

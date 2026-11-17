@@ -7,7 +7,7 @@
 
 #include "../EasyVDF.h"
 
-#include "catch.hpp"
+#include "helpers.h"
 
 #if defined(WIN64) || defined(_WIN64) || defined(__MINGW64__) || defined(WIN32) || defined(_WIN32) || defined(__MINGW32__)
     #define NATIVE_VDF "windows_eol.vdf"
@@ -33,20 +33,20 @@ static void print_to_stream(std::ostream& os, EasyVDF::KeyValue const& o, int in
             }
             os << sindent << '}' << std::endl;
             break;
-        case EasyVDF::Type::String : os << sindent << '"' << o.key() << '"' << ": (string)" << '"' << o.as<std::string_view>() << '"' << std::endl; break;
-        case EasyVDF::Type::Int32  : os << sindent << '"' << o.key() << '"' << ": (int32)" << o.as<int32_t>() << std::endl; break;
-        case EasyVDF::Type::Float  : os << sindent << '"' << o.key() << '"' << ": (float)" << o.as<float>() << std::endl; break;
-        case EasyVDF::Type::Pointer: os << sindent << '"' << o.key() << '"' << ": (pointer)" << o.as<std::string>() << std::endl; break;
-        case EasyVDF::Type::Color  : os << sindent << '"' << o.key() << '"' << ": (color)" << o.as<std::string>() << std::endl; break;
-        case EasyVDF::Type::UInt64 : os << sindent << '"' << o.key() << '"' << ": (uint64)" << o.as<uint64_t>() << std::endl; break;
-        case EasyVDF::Type::Int64  : os << sindent << '"' << o.key() << '"' << ": (int64)" << o.as<int64_t>() << std::endl; break;
+        case EasyVDF::Type::String : os << sindent << '"' << o.key() << '"' << ": (string)" << '"' << o.as<std::string_view>().value() << '"' << std::endl; break;
+        case EasyVDF::Type::Int32  : os << sindent << '"' << o.key() << '"' << ": (int32)" << o.as<int32_t>().value() << std::endl; break;
+        case EasyVDF::Type::Float  : os << sindent << '"' << o.key() << '"' << ": (float)" << o.as<float>().value() << std::endl; break;
+        case EasyVDF::Type::Pointer: os << sindent << '"' << o.key() << '"' << ": (pointer)" << o.as<std::string>().value() << std::endl; break;
+        case EasyVDF::Type::Color  : os << sindent << '"' << o.key() << '"' << ": (color)" << o.as<std::string>().value() << std::endl; break;
+        case EasyVDF::Type::UInt64 : os << sindent << '"' << o.key() << '"' << ": (uint64)" << o.as<uint64_t>().value() << std::endl; break;
+        case EasyVDF::Type::Int64  : os << sindent << '"' << o.key() << '"' << ": (int64)" << o.as<int64_t>().value() << std::endl; break;
     }
 }
 
 static EasyVDF::KeyValue LoadAndPrint(const char* title, const char* path)
 {
     auto start = std::chrono::steady_clock::now();
-    EasyVDF::KeyValue o = EasyVDF::load(path);
+    EasyVDF::KeyValue o = EasyVDF::load(path).value();
     auto elapsed = std::chrono::steady_clock::now() - start;
 
     std::cout << "==================== " << title << " ====================" << std::endl;
@@ -84,7 +84,7 @@ TEST_CASE("Parse VDF with Windows EOL", "[parse_vdf_windows_eol]")
 
 TEST_CASE("The three EOL flavours give the same document", "[parse_vdf_eol]")
 {
-    auto linux_doc = EasyVDF::load("linux_eol.vdf");
+    auto linux_doc = EasyVDF::load("linux_eol.vdf").value();
     CHECK(linux_doc == EasyVDF::load("macos_eol.vdf"));
     CHECK(linux_doc == EasyVDF::load("windows_eol.vdf"));
 }
@@ -116,10 +116,10 @@ TEST_CASE("Parse binary VDF", "[parse_binary_vdf]")
 
 TEST_CASE("Serialize to text", "[serialize_object_as_text]")
 {
-    EasyVDF::KeyValue o = EasyVDF::load(NATIVE_VDF);
+    EasyVDF::KeyValue o = EasyVDF::load(NATIVE_VDF).value();
 
     std::stringstream sstr;
-    o.write(sstr);
+    o.write(sstr).value();
 
     const char* const expected =
         "\"999999\"\n"
@@ -132,31 +132,31 @@ TEST_CASE("Serialize to text", "[serialize_object_as_text]")
         "}\n";
 
     CHECK(sstr.str() == expected);
-    CHECK(o.to_text() == expected);
-    CHECK(EasyVDF::parse(o.to_text()) == o);
+    CHECK(o.to_text().value() == expected);
+    CHECK(EasyVDF::parse(o.to_text().value()) == o);
 }
 
 TEST_CASE("Serialize to binary", "[binary_serialize]")
 {
-    EasyVDF::KeyValue o = EasyVDF::load(NATIVE_VDF);
+    EasyVDF::KeyValue o = EasyVDF::load(NATIVE_VDF).value();
 
     SECTION("Serializing to binary V1")
     {
         std::stringstream sstr;
-        o.write(sstr, EasyVDF::Format::Binary);
+        o.write(sstr, EasyVDF::Format::Binary).value();
         CHECK(memcmp(sstr.str().data(), "\x00\x39\x39\x39\x39\x39\x39\x00\x00\x4f", 10) == 0);
-        CHECK(sstr.str() == o.to_binary());
+        CHECK(sstr.str() == o.to_binary().value());
     }
 
     SECTION("Serializing to binary V2")
     {
         std::stringstream sstr;
-        o.write(sstr, EasyVDF::Format::Vbkv);
+        o.write(sstr, EasyVDF::Format::Vbkv).value();
         const std::string blob = sstr.str();
         REQUIRE(blob.size() > 10);
         CHECK(memcmp(blob.data(), "VBKV", 4) == 0);
         CHECK(memcmp(blob.data() + 8, "\x00\x39", 2) == 0);
-        CHECK(blob == o.to_binary(EasyVDF::Format::Vbkv));
+        CHECK(blob == o.to_binary(EasyVDF::Format::Vbkv).value());
     }
 }
 
@@ -168,21 +168,21 @@ TEST_CASE("save() and load() round trip in every format", "[files]")
         ~Remove() { std::remove(path); }
     };
 
-    EasyVDF::KeyValue o = EasyVDF::load("binary.vdf");
+    EasyVDF::KeyValue o = EasyVDF::load("binary.vdf").value();
 
     for (EasyVDF::Format format : { EasyVDF::Format::Binary, EasyVDF::Format::Vbkv })
     {
         Remove remove{ "test_files_round_trip.tmp" };
-        o.save(remove.path, format);
+        o.save(remove.path, format).value();
         CHECK(EasyVDF::load(remove.path) == o);
     }
 
     {
         // Text does not keep the types: compare the text forms.
         Remove remove{ "test_files_round_trip.tmp" };
-        o.save(remove.path);
-        EasyVDF::KeyValue text = EasyVDF::load(remove.path);
-        CHECK(text.to_text() == o.to_text());
+        o.save(remove.path).value();
+        EasyVDF::KeyValue text = EasyVDF::load(remove.path).value();
+        CHECK(text.to_text().value() == o.to_text().value());
         CHECK(text["Int32Key"].type() == EasyVDF::Type::String);
         CHECK(text["Int32Key"].as<int32_t>() == -1337);
         CHECK(text["FloatKey"].as<float>() == 3.1415f);
@@ -195,10 +195,10 @@ TEST_CASE("save() and load() round trip in every format", "[files]")
 
 TEST_CASE("File errors throw IoError", "[files]")
 {
-    CHECK_THROWS_AS(EasyVDF::load("no_such_file.vdf"), EasyVDF::IoError);
-    CHECK_THROWS_AS(EasyVDF::KeyValue("root").save("no_such_directory/file.vdf"), EasyVDF::IoError);
+    CHECK(Outcome(EasyVDF::load("no_such_file.vdf")) == "Io");
+    CHECK(Outcome(EasyVDF::KeyValue("root").save("no_such_directory/file.vdf")) == "Io");
 
     // Nothing is created when the document can't be written.
-    CHECK_THROWS_AS(EasyVDF::KeyValue().save("test_files_not_created.tmp"), EasyVDF::WriteError);
+    CHECK(Outcome(EasyVDF::KeyValue().save("test_files_not_created.tmp")) == "Write");
     CHECK_FALSE(std::ifstream("test_files_not_created.tmp").good());
 }
