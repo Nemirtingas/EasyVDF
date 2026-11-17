@@ -1,135 +1,173 @@
 #include <fstream>
 #include <sstream>
+#include <streambuf>
 #include <string>
 
 #include "../EasyVDF.h"
 #include "catch.hpp"
 
-namespace {
-
-EasyVDF::ValveDataObject ParseText(std::string const& text)
-{
-    std::istringstream is(text);
-    return EasyVDF::ValveDataObject::ParseObject(is);
-}
-
-}
-
-TEST_CASE("Text parser: truncated UTF-8 sequence does not read out of bounds", "[text_parser][utf8]")
-{
-    // Used to segfault: the 3 bytes lead 0xE2 made the scanner jump past the end of the line.
-    CHECK_THROWS_AS(ParseText("\"root\"\n{\n\t\"k\"\t\"\xE2\n}\n"), EasyVDF::ParserException);
-    CHECK_THROWS_AS(ParseText("\"root\"\n{\n\t\"k\"\t\"\xE2\x82\n}\n"), EasyVDF::ParserException);
-    CHECK_THROWS_AS(ParseText("\"root\"\n{\n\t\"k\"\t\"\xF0\x9F\n}\n"), EasyVDF::ParserException);
-    CHECK_THROWS_AS(ParseText("\"root\"\n{\n\t\"k\xC3\n}\n"), EasyVDF::ParserException);
-    CHECK_THROWS_AS(ParseText("\"ro\xF0\x9F\x98\n{\n}\n"), EasyVDF::ParserException);
-}
-
-TEST_CASE("Text parser: multi-byte UTF-8 strings are kept verbatim", "[text_parser][utf8]")
-{
-    // A UTF-8 lead byte right before the closing quote must not swallow the quote.
-    auto o = ParseText("\"r\xC3\xA9\"\n{\n\t\"k\xE2\x82\xAC\"\t\"\xF0\x9F\x98\x80\"\n\t\"k2\"\t\"a\xC3\xA9\"\n}\n");
-    REQUIRE(o.Type() == EasyVDF::ObjectType::Object);
-    CHECK(o.Name() == "r\xC3\xA9");
-    REQUIRE(o.Collection().size() == 2);
-    CHECK(o.Collection()[0].Name() == "k\xE2\x82\xAC");
-    CHECK(o.Collection()[0].String() == "\xF0\x9F\x98\x80");
-    CHECK(o.Collection()[1].Name() == "k2");
-    CHECK(o.Collection()[1].String() == "a\xC3\xA9");
-}
-
-TEST_CASE("Text parser: UTF-8 is not validated, stray bytes are kept verbatim", "[text_parser][utf8]")
-{
-    // Policy: strings are opaque bytes, only '"' and '\\' are significant.
-    auto o = ParseText("\"root\"\n{\n\t\"\x80\xBF\"\t\"\xF8\xFF\xC3\"\n}\n");
-    REQUIRE(o.Collection().size() == 1);
-    CHECK(o.Collection()[0].Name() == "\x80\xBF");
-    CHECK(o.Collection()[0].String() == "\xF8\xFF\xC3");
-}
+using Catch::Matchers::Contains;
+using EasyVDF::Format;
+using EasyVDF::KeyValue;
+using EasyVDF::Node;
+using EasyVDF::ParseError;
+using EasyVDF::Type;
 
 namespace {
 
-EasyVDF::ValveDataObject ParseBinary(std::string const& blob, size_t chunk_size)
+KeyValue ParseBinary(std::string const& blob, std::size_t chunk_size)
 {
     std::istringstream is(blob);
-    return EasyVDF::ValveDataObject::ParseObject(is, chunk_size);
+    EasyVDF::ReadOptions options;
+    options.chunk_size = chunk_size;
+    return EasyVDF::parse(is, options);
+}
+
+std::string ReadFile(const char* path)
+{
+    std::ifstream f(path, std::ios::binary | std::ios::in);
+    REQUIRE(f);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
 // Deep comparison, returns an empty string when equal, else a description of the first difference.
-std::string Compare(EasyVDF::ValveDataObject const& a, EasyVDF::ValveDataObject const& b, std::string const& path = "")
+std::string Compare(KeyValue const& a, KeyValue const& b, std::string const& path = "")
 {
-    std::string here = path + "/" + a.Name();
-    if (a.Name() != b.Name())
-        return here + ": name differs ('" + a.Name() + "' vs '" + b.Name() + "')";
-    if (a.Type() != b.Type())
-        return here + ": type differs (" + std::to_string((int)a.Type()) + " vs " + std::to_string((int)b.Type()) + ")";
+    std::string here = path + "/" + a.key();
+    if (a.key() != b.key())
+        return here + ": name differs ('" + a.key() + "' vs '" + b.key() + "')";
+    if (a.type() != b.type())
+        return here + ": type differs (" + std::to_string((int)a.type()) + " vs " + std::to_string((int)b.type()) + ")";
 
-    switch (a.Type())
+    switch (a.type())
     {
-        case EasyVDF::ObjectType::Object:
+        case Type::Object:
         {
-            auto const& ca = a.Collection();
-            auto const& cb = b.Collection();
-            if (ca.size() != cb.size())
+            if (a.size() != b.size())
                 return here + ": collection size differs";
-            for (size_t i = 0; i < ca.size(); ++i)
+            auto ib = b.begin();
+            for (auto const& child : a)
             {
-                std::string r = Compare(ca[i], cb[i], here);
+                std::string r = Compare(child, *ib++, here);
                 if (!r.empty())
                     return r;
             }
             return std::string();
         }
-        case EasyVDF::ObjectType::String : return a.String() == b.String() ? std::string() : here + ": string differs ('" + a.String() + "' vs '" + b.String() + "')";
-        case EasyVDF::ObjectType::Int32  : return a.Int32() == b.Int32() ? std::string() : here + ": int32 differs";
-        case EasyVDF::ObjectType::Float  : return a.Float() == b.Float() ? std::string() : here + ": float differs";
-        case EasyVDF::ObjectType::Pointer: return a.Pointer().value == b.Pointer().value ? std::string() : here + ": pointer differs";
-        case EasyVDF::ObjectType::Color  : return a.Color().value == b.Color().value ? std::string() : here + ": color differs";
-        case EasyVDF::ObjectType::Int64  : return a.Int64() == b.Int64() ? std::string() : here + ": int64 differs";
-        case EasyVDF::ObjectType::UInt64 : return a.UInt64() == b.UInt64() ? std::string() : here + ": uint64 differs";
+        case Type::String : return a.as<std::string>() == b.as<std::string>() ? std::string() : here + ": string differs ('" + a.as<std::string>() + "' vs '" + b.as<std::string>() + "')";
+        case Type::Int32  : return a.as<int32_t>() == b.as<int32_t>() ? std::string() : here + ": int32 differs";
+        case Type::Float  : return a.as<float>() == b.as<float>() ? std::string() : here + ": float differs";
+        case Type::Pointer: return a.as<EasyVDF::Pointer>() == b.as<EasyVDF::Pointer>() ? std::string() : here + ": pointer differs";
+        case Type::Color  : return a.as<EasyVDF::Color>() == b.as<EasyVDF::Color>() ? std::string() : here + ": color differs";
+        case Type::Int64  : return a.as<int64_t>() == b.as<int64_t>() ? std::string() : here + ": int64 differs";
+        case Type::UInt64 : return a.as<uint64_t>() == b.as<uint64_t>() ? std::string() : here + ": uint64 differs";
         default: return here + ": unexpected type";
     }
 }
 
-EasyVDF::ValveDataObject MakeSample()
+KeyValue MakeSample()
 {
-    using EasyVDF::ValveDataObject;
+    KeyValue nested("Nested\xC3\xA9");
+    nested.add("NestedString", "NestedValue");
+    nested.add("EmptyObject");
+    nested.add("Wrapper").add("Inner", "InnerValue");
+    nested.add("NestedInt", int32_t(0x7FFFFFFF));
 
-    ValveDataObject nested("Nested\xC3\xA9");
-    nested.Collection().emplace_back(ValveDataObject("NestedString", std::string("NestedValue")));
-    nested.Collection().emplace_back(ValveDataObject("EmptyObject"));
-    nested.Collection().emplace_back(ValveDataObject("Wrapper", ValveDataObject("Inner", std::string("InnerValue"))));
-    nested.Collection().emplace_back(ValveDataObject("NestedInt", int32_t(0x7FFFFFFF)));
-
-    ValveDataObject o("RootObject");
-    auto& c = o.Collection();
-    c.emplace_back(ValveDataObject("StringKey", std::string("StringValue")));
-    c.emplace_back(ValveDataObject("EmptyString", std::string()));
-    c.emplace_back(ValveDataObject("Utf8\xE2\x82\xAC", std::string("\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80\xC3\xA9\xF0\x9F\x98\x80")));
-    c.emplace_back(ValveDataObject("Int32Key", int32_t(-1337)));
-    c.emplace_back(ValveDataObject("Int32Min", int32_t(-2147483647 - 1)));
-    c.emplace_back(ValveDataObject("FloatKey", float(3.1415f)));
-    c.emplace_back(ValveDataObject("FloatNeg", float(-1.5e-30f)));
-    c.emplace_back(ValveDataObject("PointerKey", EasyVDF::pointer_t{0x90807060}));
-    c.emplace_back(ValveDataObject("ColorKey", EasyVDF::color_t{0x99887766}));
-    c.emplace_back(std::move(nested));
-    c.emplace_back(ValveDataObject("UInt64Key", uint64_t(0xfedcba9876543210ull)));
-    c.emplace_back(ValveDataObject("Int64Key", int64_t(-99999999999991337ll)));
-    c.emplace_back(ValveDataObject("Last\xF0\x9F\x98\x80", std::string("\xF0\x9F\x98\x80")));
+    KeyValue o("RootObject");
+    o.add("StringKey", "StringValue");
+    o.add("EmptyString", "");
+    o.add("Utf8\xE2\x82\xAC", "\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80\xC3\xA9\xF0\x9F\x98\x80");
+    o.add("Int32Key", int32_t(-1337));
+    o.add("Int32Min", int32_t(-2147483647 - 1));
+    o.add("FloatKey", 3.1415f);
+    o.add("FloatNeg", -1.5e-30f);
+    o.add("PointerKey", EasyVDF::Pointer{0x90807060});
+    o.add("ColorKey", EasyVDF::Color{0x66, 0x77, 0x88, 0x99});
+    o.insert(o.end(), std::move(nested));
+    o.add("UInt64Key", uint64_t(0xfedcba9876543210ull));
+    o.add("Int64Key", int64_t(-99999999999991337ll));
+    o.add("Last\xF0\x9F\x98\x80", "\xF0\x9F\x98\x80");
     return o;
 }
+
+KeyValue MakeBinaryVdfFile()
+{
+    KeyValue expected("RootObject");
+    expected.add("ObjectKey").add("ObjectKeyValue", "ObjectStringValue");
+    expected.add("StringKey", "StringValue");
+    expected.add("Int32Key", int32_t(-1337));
+    expected.add("FloatKey", 3.1415f);
+    expected.add("PointerKey", EasyVDF::Pointer{0x90807060});
+    expected.add("ColorKey", EasyVDF::Color{0x66, 0x77, 0x88, 0x99});
+    expected.add("UInt64Key", uint64_t(0xfedcba9876543210ull));
+    expected.add("Int64Key", int64_t(-99999999999991337ll));
+    return expected;
+}
+
+// Returns "ParseError", "OK" or the type of the other exception, to report the outcome in a single CHECK.
+std::string ParseOutcome(std::string const& blob, std::size_t chunk_size)
+{
+    try
+    {
+        ParseBinary(blob, chunk_size);
+        return "OK";
+    }
+    catch (ParseError const&)
+    {
+        return "ParseError";
+    }
+    catch (std::exception const& e)
+    {
+        return std::string("other exception: ") + e.what();
+    }
+}
+
+// Same payload with the VBKV checksum recomputed, for hand made VBKV blobs.
+std::string Vbkv(std::string const& payload)
+{
+    std::string blob = "VBKV";
+    const uint32_t crc = EasyVDF::Details::Crc32(payload);
+    for (int shift = 0; shift < 32; shift += 8)
+        blob += static_cast<char>((crc >> shift) & 0xFF);
+    return blob + payload;
+}
+
+// A stream buffer that can only be read forward: no seek, no putback area.
+class PipeBuffer : public std::streambuf
+{
+    std::string _Data;
+    std::size_t _Position = 0;
+    char _Current = 0;
+
+protected:
+    int_type underflow() override
+    {
+        if (_Position == _Data.size())
+            return traits_type::eof();
+
+        _Current = _Data[_Position++];
+        setg(&_Current, &_Current, &_Current + 1);
+        return traits_type::to_int_type(_Current);
+    }
+
+    pos_type seekoff(off_type, std::ios_base::seekdir, std::ios_base::openmode) override { return pos_type(off_type(-1)); }
+    pos_type seekpos(pos_type, std::ios_base::openmode) override { return pos_type(off_type(-1)); }
+
+public:
+    explicit PipeBuffer(std::string data) : _Data(std::move(data)) {}
+};
 
 }
 
 TEST_CASE("Binary parser: round trip with every chunk size", "[binary_parser][chunks]")
 {
     auto sample = MakeSample();
-    for (int version : {1, 2})
+    for (Format format : {Format::Binary, Format::Vbkv})
     {
-        std::string blob = sample.SerializeAsBinary(version);
-        for (size_t chunk_size = 1; chunk_size <= blob.size() + 1; ++chunk_size)
+        std::string blob = sample.to_binary(format);
+        for (std::size_t chunk_size = 1; chunk_size <= blob.size() + 1; ++chunk_size)
         {
-            INFO("version " << version << ", chunk size " << chunk_size);
+            INFO("format " << (int)format << ", chunk size " << chunk_size);
             std::string diff;
             try
             {
@@ -141,35 +179,26 @@ TEST_CASE("Binary parser: round trip with every chunk size", "[binary_parser][ch
             }
             CHECK(diff == "");
         }
-        INFO("version " << version << ", default chunk size");
+        INFO("format " << (int)format << ", default chunk size");
         std::istringstream is(blob);
-        CHECK(Compare(sample, EasyVDF::ValveDataObject::ParseObject(is)) == "");
+        CHECK(Compare(sample, EasyVDF::parse(is)) == "");
+        CHECK(EasyVDF::parse(blob) == sample);
+        // Writing what was read gives the same bytes.
+        CHECK(EasyVDF::parse(blob).to_binary(format) == blob);
     }
 }
 
 TEST_CASE("Binary parser: binary.vdf with every chunk size", "[binary_parser][chunks]")
 {
-    std::ifstream f("binary.vdf", std::ios::binary | std::ios::in);
-    REQUIRE(f);
-    std::string blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const std::string blob = ReadFile("binary.vdf");
     REQUIRE(blob.size() > 8);
 
-    using EasyVDF::ValveDataObject;
-    ValveDataObject expected("RootObject");
-    auto& c = expected.Collection();
-    c.emplace_back(ValveDataObject("ObjectKey", ValveDataObject("ObjectKeyValue", std::string("ObjectStringValue"))));
-    c.emplace_back(ValveDataObject("StringKey", std::string("StringValue")));
-    c.emplace_back(ValveDataObject("Int32Key", int32_t(-1337)));
-    c.emplace_back(ValveDataObject("FloatKey", float(3.1415f)));
-    c.emplace_back(ValveDataObject("PointerKey", EasyVDF::pointer_t{0x90807060}));
-    c.emplace_back(ValveDataObject("ColorKey", EasyVDF::color_t{0x99887766}));
-    c.emplace_back(ValveDataObject("UInt64Key", uint64_t(0xfedcba9876543210ull)));
-    c.emplace_back(ValveDataObject("Int64Key", int64_t(-99999999999991337ll)));
+    KeyValue expected = MakeBinaryVdfFile();
 
     // The library writes the exact same bytes back.
-    CHECK(expected.SerializeAsBinary(2) == blob);
+    CHECK(expected.to_binary(Format::Vbkv) == blob);
 
-    for (size_t chunk_size = 1; chunk_size <= blob.size() + 1; ++chunk_size)
+    for (std::size_t chunk_size = 1; chunk_size <= blob.size() + 1; ++chunk_size)
     {
         INFO("chunk size " << chunk_size);
         std::string diff;
@@ -185,8 +214,9 @@ TEST_CASE("Binary parser: binary.vdf with every chunk size", "[binary_parser][ch
     }
 }
 
-TEST_CASE("Binary parser: unknown node type throws ParserException", "[binary_parser][errors]")
+TEST_CASE("Binary parser: unknown node type throws ParseError", "[binary_parser][errors]")
 {
+    // 5 (WideString) and 9 (binary blob) are known but not supported.
     for (int type : {5, 9, 12, 0x42, 0x7F, 0x80, 0xFF})
     {
         INFO("node type " << type);
@@ -199,86 +229,81 @@ TEST_CASE("Binary parser: unknown node type throws ParserException", "[binary_pa
             ParseBinary(blob, 1024);
             FAIL("no exception thrown");
         }
-        catch (EasyVDF::ParserException const& e)
+        catch (ParseError const& e)
         {
-            CHECK_THAT(e.what(), Catch::Matchers::Contains(std::to_string((int)type)));
+            CHECK_THAT(e.what(), Contains(std::to_string((int)type)));
+            CHECK(e.line() == 0);
         }
+
+        CHECK_THROWS_AS(EasyVDF::parse(blob), ParseError);
+        CHECK_THROWS_AS(EasyVDF::parse(Vbkv(blob)), ParseError);
     }
+
+    CHECK_THROWS_WITH(EasyVDF::parse(std::string("\x00R\x00\x05k\x00\x00\x00\x08", 9)), Contains("WideString"));
 }
 
-namespace {
-
-// Returns "ParserException", "OK" or the type of the other exception, to report the outcome in a single CHECK.
-std::string ParseOutcome(std::string const& blob, size_t chunk_size)
+TEST_CASE("Binary parser: truncated input throws ParseError", "[binary_parser][errors]")
 {
-    try
-    {
-        ParseBinary(blob, chunk_size);
-        return "OK";
-    }
-    catch (EasyVDF::ParserException const&)
-    {
-        return "ParserException";
-    }
-    catch (std::exception const& e)
-    {
-        return std::string("other exception: ") + e.what();
-    }
-}
-
-}
-
-TEST_CASE("Binary parser: truncated input throws ParserException", "[binary_parser][errors]")
-{
-    std::ifstream f("binary.vdf", std::ios::binary | std::ios::in);
-    REQUIRE(f);
-    std::string file_blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const std::string file_blob = ReadFile("binary.vdf");
 
     auto sample = MakeSample();
-    for (std::string const& blob : {sample.SerializeAsBinary(1), sample.SerializeAsBinary(2), file_blob})
+    for (std::string const& blob : {sample.to_binary(Format::Binary), sample.to_binary(Format::Vbkv), file_blob})
     {
         // Every strict prefix is truncated: in the root header, a key, a value, or a missing end marker.
-        for (size_t length = 0; length < blob.size(); ++length)
+        // This includes the inputs shorter than the 4 bytes magic, and the empty one.
+        for (std::size_t length = 0; length < blob.size(); ++length)
         {
-            for (size_t chunk_size : {size_t(1), size_t(3), size_t(7), size_t(64), size_t(10 * 1024)})
+            for (std::size_t chunk_size : {std::size_t(1), std::size_t(3), std::size_t(7), std::size_t(64), std::size_t(10 * 1024)})
             {
                 INFO("prefix length " << length << " of " << blob.size() << ", chunk size " << chunk_size);
-                CHECK(ParseOutcome(blob.substr(0, length), chunk_size) == "ParserException");
+                CHECK(ParseOutcome(blob.substr(0, length), chunk_size) == "ParseError");
+            }
+
+            // From memory too.
+            try
+            {
+                EasyVDF::parse(std::string_view(blob).substr(0, length));
+                FAIL("prefix length " << length << " parsed");
+            }
+            catch (ParseError const&)
+            {
             }
         }
     }
 
     // Nested object closed but root end marker missing.
-    CHECK(ParseOutcome(std::string("\x00Root\x00\x00Sub\x00\x01k\x00v\x00\x08", 17), 1024) == "ParserException");
+    CHECK(ParseOutcome(std::string("\x00Root\x00\x00Sub\x00\x01k\x00v\x00\x08", 17), 1024) == "ParseError");
 }
 
 TEST_CASE("Binary parser: data after the root object", "[binary_parser][trailing]")
 {
     auto sample = MakeSample();
-    const std::string v1 = sample.SerializeAsBinary(1);
-    const std::string v2 = sample.SerializeAsBinary(2);
+    const std::string v1 = sample.to_binary(Format::Binary);
+    const std::string v2 = sample.to_binary(Format::Vbkv);
+    // The VBKV checksum covers everything after the header: recompute it for the altered payloads.
+    const std::string p2 = v2.substr(8);
 
-    for (size_t chunk_size : {size_t(1), size_t(2), size_t(5), size_t(16), v1.size(), v1.size() + 1, v2.size(), v2.size() + 1, size_t(10 * 1024)})
+    for (std::size_t chunk_size : {std::size_t(1), std::size_t(2), std::size_t(5), std::size_t(16), v1.size(), v1.size() + 1, v2.size(), v2.size() + 1, std::size_t(10 * 1024)})
     {
         INFO("chunk size " << chunk_size);
 
         // Accepted: a single extra end marker, 0x08 or the root end marker itself.
         CHECK(ParseOutcome(v1 + "\x08", chunk_size) == "OK");
-        CHECK(ParseOutcome(v2 + "\x08", chunk_size) == "OK");
-        CHECK(ParseOutcome(v2 + "\x0b", chunk_size) == "OK");
+        CHECK(ParseOutcome(Vbkv(p2 + "\x08"), chunk_size) == "OK");
+        CHECK(ParseOutcome(Vbkv(p2 + "\x0b"), chunk_size) == "OK");
         CHECK(Compare(sample, ParseBinary(v1 + "\x08", chunk_size)) == "");
-        CHECK(Compare(sample, ParseBinary(v2 + "\x0b", chunk_size)) == "");
+        CHECK(Compare(sample, ParseBinary(Vbkv(p2 + "\x0b"), chunk_size)) == "");
 
         // Rejected: anything else.
-        CHECK(ParseOutcome(v1 + "\x0b", chunk_size) == "ParserException");
-        CHECK(ParseOutcome(v1 + "\x08\x08", chunk_size) == "ParserException");
-        CHECK(ParseOutcome(v2 + "\x0b\x0b", chunk_size) == "ParserException");
-        CHECK(ParseOutcome(v1 + std::string(1, '\0'), chunk_size) == "ParserException");
-        CHECK(ParseOutcome(v2 + "garbage", chunk_size) == "ParserException");
-        CHECK(ParseOutcome(v2 + "\x08garbage", chunk_size) == "ParserException");
+        CHECK(ParseOutcome(v1 + "\x0b", chunk_size) == "ParseError");
+        CHECK(ParseOutcome(v1 + "\x08\x08", chunk_size) == "ParseError");
+        CHECK(ParseOutcome(Vbkv(p2 + "\x0b\x0b"), chunk_size) == "ParseError");
+        CHECK(ParseOutcome(v1 + std::string(1, '\0'), chunk_size) == "ParseError");
+        CHECK(ParseOutcome(Vbkv(p2 + "garbage"), chunk_size) == "ParseError");
+        CHECK(ParseOutcome(Vbkv(p2 + "\x08garbage"), chunk_size) == "ParseError");
         // A second root object (used to be parsed into the same object, leaking the first one).
-        CHECK(ParseOutcome(v1 + v1, chunk_size) == "ParserException");
-        CHECK(ParseOutcome(v2 + v2.substr(8), chunk_size) == "ParserException");
+        CHECK(ParseOutcome(v1 + v1, chunk_size) == "ParseError");
+        CHECK(ParseOutcome(Vbkv(p2 + p2), chunk_size) == "ParseError");
     }
 }
 
@@ -297,44 +322,249 @@ TEST_CASE("Binary parser: values are decoded as little-endian from unaligned off
     const std::string blob(raw, sizeof(raw) - 1);
     REQUIRE(blob.size() == 58);
 
-    for (size_t chunk_size = 0; chunk_size <= blob.size() + 1; ++chunk_size)
+    for (std::size_t chunk_size = 0; chunk_size <= blob.size() + 1; ++chunk_size)
     {
         INFO("chunk size " << chunk_size);
-        auto o = ParseBinary(blob, chunk_size);
-        REQUIRE(o.Type() == EasyVDF::ObjectType::Object);
-        CHECK(o.Name() == "R");
-        auto const& c = o.Collection();
-        REQUIRE(c.size() == 6);
-        CHECK(c[0].Int32() == int32_t(-2130574588)); // 0x81020304
-        CHECK(c[1].Float() == -1.5f);
-        CHECK(c[2].Pointer().value == 0x44332211u);
-        CHECK(c[3].Color().value == 0xd4c3b2a1u);
-        CHECK(c[4].Int64() == -2);
-        CHECK(c[5].UInt64() == 0xf102030405060708ull);
+        const KeyValue o = ParseBinary(blob, chunk_size);
+        REQUIRE(o.type() == Type::Object);
+        CHECK(o.key() == "R");
+        REQUIRE(o.size() == 6);
+        CHECK(o["i"].as<int32_t>() == int32_t(-2130574588)); // 0x81020304
+        CHECK(o["fl"].as<float>() == -1.5f);
+        CHECK(o["p"].as<EasyVDF::Pointer>().value == 0x44332211u);
+        CHECK(o["col"].as<EasyVDF::Color>() == EasyVDF::Color{0xa1, 0xb2, 0xc3, 0xd4});
+        CHECK(o["i6"].as<int64_t>() == -2);
+        CHECK(o["u"].as<uint64_t>() == 0xf102030405060708ull);
     }
+
+    // The serializer writes the same bytes, whatever the byte order of the host.
+    CHECK(EasyVDF::parse(blob).to_binary() == blob);
+
+    KeyValue built("R");
+    built.add("i", int32_t(-2130574588));
+    built.add("fl", -1.5f);
+    built.add("p", EasyVDF::Pointer{0x44332211u});
+    built.add("col", EasyVDF::Color{0xa1, 0xb2, 0xc3, 0xd4});
+    built.add("i6", int64_t(-2));
+    built.add("u", uint64_t(0xf102030405060708ull));
+    CHECK(built.to_binary() == blob);
 }
 
 TEST_CASE("Binary parser: VBKV magic and tiny chunk sizes", "[binary_parser][endianness]")
 {
     auto sample = MakeSample();
-    const std::string v2 = sample.SerializeAsBinary(2);
+    const std::string v2 = sample.to_binary(Format::Vbkv);
     REQUIRE(v2.compare(0, 4, "VBKV") == 0);
-    for (size_t chunk_size : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(4)})
+    for (std::size_t chunk_size : {std::size_t(0), std::size_t(1), std::size_t(2), std::size_t(3), std::size_t(4)})
     {
         INFO("chunk size " << chunk_size);
         CHECK(Compare(sample, ParseBinary(v2, chunk_size)) == "");
-        CHECK(Compare(sample, ParseBinary(sample.SerializeAsBinary(1), chunk_size)) == "");
+        CHECK(Compare(sample, ParseBinary(sample.to_binary(Format::Binary), chunk_size)) == "");
     }
 }
 
-TEST_CASE("Text parser: escaped backslash before the closing quote", "[text_parser][escape]")
+TEST_CASE("VBKV checksum is written and verified", "[binary_parser][crc]")
 {
-    // Escape sequences are kept verbatim (not unescaped), but "\\" must not escape the closing quote.
-    auto o = ParseText("\"root\"\n{\n\t\"path\"\t\"C:\\\\\"\n\t\"quote\"\t\"a\\\"b\"\n\t\"k\\\\\"\t\"v\"\n}\n");
-    REQUIRE(o.Collection().size() == 3);
-    CHECK(o.Collection()[0].Name() == "path");
-    CHECK(o.Collection()[0].String() == "C:\\\\");
-    CHECK(o.Collection()[1].String() == "a\\\"b");
-    CHECK(o.Collection()[2].Name() == "k\\\\");
-    CHECK(o.Collection()[2].String() == "v");
+    // The standard CRC-32 check value.
+    CHECK(EasyVDF::Details::Crc32("123456789") == 0xCBF43926u);
+    CHECK(EasyVDF::Details::Crc32("") == 0u);
+
+    const std::string blob = ReadFile("binary.vdf");
+    // binary.vdf: CRC32 of the 177 bytes after the header, little-endian.
+    CHECK(blob.substr(4, 4) == std::string("\x7b\x88\x85\x97", 4));
+    CHECK(Vbkv(blob.substr(8)) == blob);
+
+    KeyValue expected = MakeBinaryVdfFile();
+
+    SECTION("a corrupted payload is detected, whatever the chunk size")
+    {
+        for (std::size_t position = 8; position < blob.size(); ++position)
+        {
+            std::string corrupted = blob;
+            corrupted[position] ^= 0x20;
+            for (std::size_t chunk_size : {std::size_t(1), std::size_t(5), std::size_t(4096)})
+            {
+                INFO("corrupted byte " << position << ", chunk size " << chunk_size);
+                CHECK(ParseOutcome(corrupted, chunk_size) == "ParseError");
+            }
+        }
+    }
+
+    SECTION("a wrong checksum is reported")
+    {
+        for (std::size_t position = 4; position < 8; ++position)
+        {
+            std::string corrupted = blob;
+            corrupted[position] ^= 0x01;
+            CHECK_THROWS_WITH(EasyVDF::parse(corrupted), Contains("checksum mismatch") && Contains("0x9785887b"));
+        }
+    }
+
+    SECTION("verification can be disabled")
+    {
+        // Files written by older versions of this library have a zero checksum.
+        std::string zero_crc = blob;
+        zero_crc.replace(4, 4, 4, '\0');
+        CHECK_THROWS_AS(EasyVDF::parse(zero_crc), ParseError);
+
+        EasyVDF::ReadOptions options;
+        options.verify_crc = false;
+        CHECK(EasyVDF::parse(zero_crc, options) == expected);
+        for (std::size_t chunk_size : {std::size_t(1), std::size_t(4096)})
+        {
+            std::istringstream is(zero_crc);
+            options.chunk_size = chunk_size;
+            CHECK(EasyVDF::parse(is, options) == expected);
+        }
+    }
+
+    SECTION("the checksum covers a trailing end marker")
+    {
+        const std::string payload = blob.substr(8) + "\x0b";
+        CHECK(EasyVDF::parse(Vbkv(payload)) == expected);
+        CHECK_THROWS_WITH(EasyVDF::parse(blob + "\x0b"), Contains("checksum mismatch"));
+    }
+}
+
+TEST_CASE("Binary parser: both end markers end an object in both formats", "[binary_parser][end_markers]")
+{
+    KeyValue expected("R", { {"S", { {"k", "v"} }}, {"i", int32_t(1)} });
+
+    const std::string with_08("\x00R\x00\x00S\x00\x01k\x00v\x00\x08\x02i\x00\x01\x00\x00\x00\x08", 20);
+    const std::string with_0b("\x00R\x00\x00S\x00\x01k\x00v\x00\x0b\x02i\x00\x01\x00\x00\x00\x0b", 20);
+    const std::string mixed  ("\x00R\x00\x00S\x00\x01k\x00v\x00\x0b\x02i\x00\x01\x00\x00\x00\x08", 20);
+
+    for (std::string const& payload : {with_08, with_0b, mixed})
+    {
+        CHECK(EasyVDF::parse(payload) == expected);
+        CHECK(EasyVDF::parse(Vbkv(payload)) == expected);
+    }
+
+    CHECK(expected.to_binary(Format::Binary) == with_08);
+    CHECK(expected.to_binary(Format::Vbkv) == Vbkv(with_0b));
+}
+
+TEST_CASE("Binary parser: nesting depth limit", "[binary_parser][depth]")
+{
+    auto nested = [](std::size_t depth) {
+        std::string blob;
+        for (std::size_t i = 0; i < depth; ++i)
+            blob += std::string("\x00o\x00", 3);
+        blob += std::string(depth, '\x08');
+        return blob;
+    };
+
+    EasyVDF::ReadOptions options;
+    CHECK_NOTHROW(EasyVDF::parse(nested(options.max_depth)));
+    CHECK_THROWS_WITH(EasyVDF::parse(nested(options.max_depth + 1)), Contains("nested deeper"));
+
+    // A hostile input does not overflow the stack.
+    CHECK_THROWS_AS(EasyVDF::parse(nested(1000000)), ParseError);
+    CHECK_THROWS_AS(EasyVDF::parse(Vbkv(nested(1000000))), ParseError);
+    CHECK(ParseOutcome(nested(100000), 7) == "ParseError");
+
+    options.max_depth = 2;
+    CHECK_NOTHROW(EasyVDF::parse(nested(2), options));
+    CHECK_THROWS_AS(EasyVDF::parse(nested(3), options), ParseError);
+
+    options.max_depth = 500;
+    CHECK(EasyVDF::parse(nested(500), options).to_binary() == nested(500));
+}
+
+TEST_CASE("Streams are read sequentially, without seeking", "[binary_parser][streams]")
+{
+    auto sample = MakeSample();
+
+    for (std::string const& data : {sample.to_binary(Format::Binary), sample.to_binary(Format::Vbkv), sample.to_text(), "\xEF\xBB\xBF" + sample.to_text()})
+    {
+        const KeyValue expected = EasyVDF::parse(data);
+        for (std::size_t chunk_size : {std::size_t(1), std::size_t(4), std::size_t(16 * 1024)})
+        {
+            INFO("chunk size " << chunk_size);
+            PipeBuffer buffer(data);
+            std::istream pipe(&buffer);
+            REQUIRE(pipe.tellg() == std::istream::pos_type(-1));
+            pipe.clear();
+
+            EasyVDF::ReadOptions options;
+            options.chunk_size = chunk_size;
+            CHECK(EasyVDF::parse(pipe, options) == expected);
+        }
+    }
+}
+
+TEST_CASE("Short inputs are handled", "[binary_parser][streams]")
+{
+    // Used to throw "Failed to read stream" for anything shorter than 4 bytes.
+    CHECK(EasyVDF::parse("a{}").key() == "a");
+    CHECK(EasyVDF::parse("a{}").empty());
+    CHECK(EasyVDF::parse(std::string("\x00\x00\x08", 3)).key() == "");
+    CHECK(EasyVDF::parse(std::string("\x00\x00\x08", 3)).is_object());
+
+    std::istringstream text("a{}");
+    CHECK(EasyVDF::parse(text).key() == "a");
+    std::istringstream binary(std::string("\x00\x00\x08", 3));
+    CHECK(EasyVDF::parse(binary).is_object());
+
+    for (const char* input : {"", "V", "VB", "VBK", "VBKV", "a", "a{", "{", "}", "\""})
+    {
+        INFO("input '" << input << "'");
+        CHECK_THROWS_AS(EasyVDF::parse(input), ParseError);
+        std::istringstream is(input);
+        CHECK_THROWS_AS(EasyVDF::parse(is), ParseError);
+    }
+
+    // A text document whose root key starts like the VBKV magic.
+    for (const char* input : {"V{}", "VB{}", "VBK{}", "VBKW{}", "VBK { k v }"})
+    {
+        INFO("input '" << input << "'");
+        const std::string expected_key(input, std::string(input).find_first_of(" {"));
+        CHECK(EasyVDF::parse(input).key() == expected_key);
+        for (std::size_t chunk_size : {std::size_t(1), std::size_t(2), std::size_t(3), std::size_t(100)})
+        {
+            std::istringstream is(input);
+            EasyVDF::ReadOptions options;
+            options.chunk_size = chunk_size;
+            CHECK(EasyVDF::parse(is, options).key() == expected_key);
+        }
+    }
+}
+
+TEST_CASE("The format can be forced", "[binary_parser][format]")
+{
+    auto sample = MakeSample();
+    EasyVDF::ReadOptions options;
+
+    options.format = Format::Binary;
+    CHECK(EasyVDF::parse(sample.to_binary(Format::Binary), options) == sample);
+    CHECK(EasyVDF::parse(sample.to_binary(Format::Vbkv), options) == sample);
+    CHECK_THROWS_WITH(EasyVDF::parse(sample.to_text(), options), Contains("root item type is not an object"));
+
+    options.format = Format::Vbkv;
+    CHECK(EasyVDF::parse(sample.to_binary(Format::Binary), options) == sample);
+    CHECK(EasyVDF::parse(sample.to_binary(Format::Vbkv), options) == sample);
+
+    options.format = Format::Text;
+    CHECK(EasyVDF::parse(sample.to_text(), options).to_text() == sample.to_text());
+    CHECK_THROWS_AS(EasyVDF::parse(sample.to_binary(Format::Binary), options), ParseError);
+    // "VBKV" is a valid unquoted root key.
+    CHECK(EasyVDF::parse("VBKV { k v }", options).key() == "VBKV");
+}
+
+TEST_CASE("Binary writer rejects what the format can't hold", "[binary_parser][errors]")
+{
+    KeyValue with_null("root");
+    with_null.add("k", std::string("a\0b", 3));
+    CHECK_THROWS_AS(with_null.to_binary(), EasyVDF::WriteError);
+    CHECK_THROWS_AS(with_null.to_binary(Format::Vbkv), EasyVDF::WriteError);
+    CHECK_NOTHROW(with_null.to_text());
+
+    KeyValue null_key("root");
+    null_key.add(std::string("a\0b", 3), "v");
+    CHECK_THROWS_AS(null_key.to_binary(), EasyVDF::WriteError);
+
+    // Conditionals only exist in text.
+    KeyValue conditional("root");
+    conditional.add("k", "v").set_condition("$WIN32");
+    CHECK(EasyVDF::parse(conditional.to_binary()).find("k")->condition().empty());
 }

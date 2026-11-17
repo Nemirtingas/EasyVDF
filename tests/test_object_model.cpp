@@ -8,12 +8,12 @@
 #include <sstream>
 #include <string>
 #include <type_traits>
-#include <unordered_map>
 
 #include "catch.hpp"
 
-using EasyVDF::ObjectType;
-using EasyVDF::ValveDataObject;
+using EasyVDF::KeyValue;
+using EasyVDF::Node;
+using EasyVDF::Type;
 
 /////////////////////////////////////////////////////////////////////
 // Global operator new/delete replacement: counts allocations and can be
@@ -69,6 +69,9 @@ const bool CanInjectAllocationFailures = false;
 const bool CanInjectAllocationFailures = true;
 #endif
 
+// For the same reason, exact allocation counts only hold without those proxies.
+#define CHECK_ALLOCATIONS(expr) do { if (CanInjectAllocationFailures) CHECK(expr); } while (false)
+
 // Runs f with the 1st, 2nd, ... allocation failing until f completes without
 // failure, and checks that every failed attempt released what it allocated.
 template<typename F>
@@ -83,7 +86,7 @@ void CheckNoLeakOnAllocationFailure(F&& f)
         return;
     }
 
-    for (int fail_at = 0; fail_at < 1000; ++fail_at)
+    for (int fail_at = 0; fail_at < 5000; ++fail_at)
     {
         long long live_before = g_live_allocations;
         bool threw = false;
@@ -102,101 +105,119 @@ void CheckNoLeakOnAllocationFailure(F&& f)
         }
         long long leaked = g_live_allocations - live_before;
 
-        INFO("allocation #" << fail_at << " failed: " << (threw ? "threw" : "completed"));
-        CHECK(leaked == 0);
+        if (leaked != 0)
+        {
+            INFO("allocation #" << fail_at << " failed: " << (threw ? "threw" : "completed"));
+            CHECK(leaked == 0);
+        }
         if (!threw)
+        {
+            // At least one allocation was made to fail, unless f does not allocate.
+            SUCCEED("completed after " << fail_at << " injected failures");
             return;
+        }
     }
     FAIL("f never completed");
 }
 
-// "a=A b=B" for a collection of String values.
-std::string Dump(EasyVDF::ValveCollection const& c)
+// "a=A b=B" for the children of an object.
+std::string Dump(Node const& object)
 {
     std::string r;
-    for (auto const& item : c)
+    for (auto const& [key, value] : object)
     {
         if (!r.empty())
             r += ' ';
-        r += item.Name() + '=' + (item.Type() == ObjectType::String ? item.String() : std::string("?"));
+        r += key + '=' + (value.type() == Type::String ? value.as<std::string>() : std::string("?"));
     }
     return r;
 }
 
-ValveDataObject MakeABC()
+KeyValue MakeABC()
 {
-    ValveDataObject root("Root");
-    root.Collection().emplace_back("a", std::string("A"));
-    root.Collection().emplace_back("b", std::string("B"));
-    root.Collection().emplace_back("c", std::string("C"));
+    KeyValue root("Root");
+    root.add("a", "A");
+    root.add("b", "B");
+    root.add("c", "C");
     return root;
 }
 
-ValveDataObject RoundTripBinary(ValveDataObject const& o, int version)
+// A tree with long keys and values: every node needs heap allocations.
+KeyValue MakeTree()
 {
-    std::stringstream sstr(o.SerializeAsBinary(version));
-    return ValveDataObject::ParseObject(sstr);
+    KeyValue tree(LongKey);
+    tree.add(LongKey, LongValue);
+    tree.add(LongKey, int32_t(1));
+    tree.add(LongKey).add(LongKey, LongValue).set_condition(LongValue);
+    tree.add(LongKey + "2").add(LongKey).add(LongKey, 1.5f);
+    return tree;
 }
 
 }
 
 TEST_CASE("Typed assignment sets the matching type", "[object_model][assignment]")
 {
-    ValveDataObject o;
+    Node o;
 
-    SECTION("pointer_t")
+    SECTION("Pointer")
     {
-        o = EasyVDF::pointer_t{0x90807060};
-        REQUIRE(o.Type() == ObjectType::Pointer);
-        CHECK(o.Pointer().value == 0x90807060u);
-        CHECK_THROWS_AS(o.Int32(), std::invalid_argument);
+        o = EasyVDF::Pointer{0x90807060};
+        REQUIRE(o.type() == Type::Pointer);
+        CHECK(o.as<EasyVDF::Pointer>().value == 0x90807060u);
+        CHECK(o.as<uint32_t>() == 0x90807060u);
+        CHECK_THROWS_AS(o.as<int32_t>(), EasyVDF::TypeError);
+        CHECK_THROWS_AS(o.as<EasyVDF::Color>(), EasyVDF::TypeError);
     }
 
-    SECTION("color_t")
+    SECTION("Color")
     {
-        o = EasyVDF::color_t{0x99887766};
-        REQUIRE(o.Type() == ObjectType::Color);
-        CHECK(o.Color().value == 0x99887766u);
-        CHECK_THROWS_AS(o.Int32(), std::invalid_argument);
+        o = EasyVDF::Color{0x66, 0x77, 0x88, 0x99};
+        REQUIRE(o.type() == Type::Color);
+        CHECK(o.as<EasyVDF::Color>() == EasyVDF::Color{0x66, 0x77, 0x88, 0x99});
+        CHECK(o.as<std::string>() == "102 119 136 153");
+        CHECK_THROWS_AS(o.as<int32_t>(), EasyVDF::TypeError);
+        CHECK_THROWS_AS(o.as<EasyVDF::Pointer>(), EasyVDF::TypeError);
     }
 
-    SECTION("pointer_t and color_t through a reference wrapper")
+    SECTION("Pointer and Color assigned to a child")
     {
-        ValveDataObject root("Root");
-        root.Collection().emplace_back("PointerKey", int32_t(1));
-        root.Collection().emplace_back("ColorKey", int32_t(2));
+        KeyValue root("Root");
+        root.add("PointerKey", int32_t(1));
+        root.add("ColorKey", int32_t(2));
 
-        root["PointerKey"][0] = EasyVDF::pointer_t{0x11223344};
-        root["ColorKey"][0] = EasyVDF::color_t{0x55667788};
+        root["PointerKey"] = EasyVDF::Pointer{0x11223344};
+        root["ColorKey"] = EasyVDF::Color{0x55, 0x66, 0x77, 0x88};
 
-        REQUIRE(root["PointerKey"][0].Type() == ObjectType::Pointer);
-        CHECK(root["PointerKey"][0].Pointer().value == 0x11223344u);
-        REQUIRE(root["ColorKey"][0].Type() == ObjectType::Color);
-        CHECK(root["ColorKey"][0].Color().value == 0x55667788u);
+        REQUIRE(root["PointerKey"].type() == Type::Pointer);
+        CHECK(root["PointerKey"].as<EasyVDF::Pointer>().value == 0x11223344u);
+        REQUIRE(root["ColorKey"].type() == Type::Color);
+        CHECK(root["ColorKey"].as<EasyVDF::Color>() == EasyVDF::Color{0x55, 0x66, 0x77, 0x88});
+        CHECK(root.size() == 2);
     }
 }
 
-TEST_CASE("Assigned pointer_t and color_t survive a binary round trip", "[object_model][assignment][serialize]")
+TEST_CASE("Assigned Pointer and Color survive a binary round trip", "[object_model][assignment][serialize]")
 {
-    ValveDataObject root("Root");
-    root.Collection().emplace_back("PointerKey", int32_t(0));
-    root.Collection().emplace_back("ColorKey", int32_t(0));
-    root.Collection()[0] = EasyVDF::pointer_t{0x90807060};
-    root.Collection()[1] = EasyVDF::color_t{0x99887766};
+    KeyValue root("Root");
+    root.add("PointerKey", int32_t(0));
+    root.add("ColorKey", int32_t(0));
+    root["PointerKey"] = EasyVDF::Pointer{0x90807060};
+    root["ColorKey"] = EasyVDF::Color{0x66, 0x77, 0x88, 0x99};
 
-    for (int version : {1, 2})
+    for (EasyVDF::Format format : {EasyVDF::Format::Binary, EasyVDF::Format::Vbkv})
     {
-        CAPTURE(version);
-        ValveDataObject parsed = RoundTripBinary(root, version);
+        CAPTURE((int)format);
+        KeyValue parsed = EasyVDF::parse(root.to_binary(format));
 
-        REQUIRE(parsed.Type() == ObjectType::Object);
-        CHECK(parsed.Name() == "Root");
-        REQUIRE(parsed["PointerKey"].size() == 1);
-        REQUIRE(parsed["PointerKey"][0].Type() == ObjectType::Pointer);
-        CHECK(parsed["PointerKey"][0].Pointer().value == 0x90807060u);
-        REQUIRE(parsed["ColorKey"].size() == 1);
-        REQUIRE(parsed["ColorKey"][0].Type() == ObjectType::Color);
-        CHECK(parsed["ColorKey"][0].Color().value == 0x99887766u);
+        REQUIRE(parsed.type() == Type::Object);
+        CHECK(parsed.key() == "Root");
+        REQUIRE(parsed.count("PointerKey") == 1);
+        REQUIRE(parsed["PointerKey"].type() == Type::Pointer);
+        CHECK(parsed["PointerKey"].as<EasyVDF::Pointer>().value == 0x90807060u);
+        REQUIRE(parsed.count("ColorKey") == 1);
+        REQUIRE(parsed["ColorKey"].type() == Type::Color);
+        CHECK(parsed["ColorKey"].as<EasyVDF::Color>() == EasyVDF::Color{0x66, 0x77, 0x88, 0x99});
+        CHECK(parsed == root);
     }
 }
 
@@ -205,319 +226,382 @@ TEST_CASE("Copy assignment does not write to std::cout", "[object_model][assignm
     std::stringstream captured;
     std::streambuf* old_buf = std::cout.rdbuf(captured.rdbuf());
 
-    ValveDataObject a("a", std::string("A"));
-    ValveDataObject b("b", std::string("B"));
+    KeyValue a("a", "A");
+    KeyValue b("b", "B");
     b = a;
+    Node n = a;
+    n = b;
 
     std::cout.rdbuf(old_buf);
 
     CHECK(captured.str().empty());
 }
 
-TEST_CASE("operator[] returns only exact key matches", "[object_model][lookup]")
+TEST_CASE("Lookups return only exact key matches", "[object_model][lookup]")
 {
-    ValveDataObject root("Root");
-    auto& c = root.Collection();
-    c.emplace_back("key", int32_t(1));
-    c.emplace_back("Key", int32_t(2));
-    c.emplace_back("key2", int32_t(3));
-    c.emplace_back("ke", int32_t(4));
-    c.emplace_back("key", int32_t(5));
+    KeyValue root("Root");
+    root.add("key", int32_t(1));
+    root.add("Key", int32_t(2));
+    root.add("key2", int32_t(3));
+    root.add("ke", int32_t(4));
+    root.add("key", int32_t(5));
 
-    auto r = root["key"];
+    auto r = root.all("key");
     REQUIRE(r.size() == 2);
-    CHECK(r[0].Int32() == 1);
-    CHECK(r[1].Int32() == 5);
+    auto it = r.begin();
+    CHECK(it->as<int32_t>() == 1);
+    CHECK((++it)->as<int32_t>() == 5);
+    CHECK(++it == r.end());
+    CHECK(root["key"].as<int32_t>() == 1);
+    CHECK(root.count("key") == 2);
 
-    ValveDataObject const& croot = root;
-    auto cr = croot[std::string("Key")];
+    KeyValue const& croot = root;
+    auto cr = croot.all(std::string("Key"));
     REQUIRE(cr.size() == 1);
-    CHECK(cr[0].Int32() == 2);
+    CHECK(cr.front().as<int32_t>() == 2);
+    CHECK(croot["Key"].as<int32_t>() == 2);
+    CHECK(croot["ke"].as<int32_t>() == 4);
+    CHECK(croot["key2"].as<int32_t>() == 3);
 
-    CHECK(root["missing"].empty());
-    CHECK(root[""].empty());
+    CHECK(croot.all("missing").empty());
+    CHECK(croot.all("").empty());
+    CHECK(croot.count("missing") == 0);
+    CHECK(croot.count("") == 0);
+    CHECK_FALSE(croot.contains("k"));
+    CHECK_FALSE(croot.contains("KEY"));
+    CHECK(croot.find("") == nullptr);
+    CHECK(croot[""].is_none());
 }
 
-TEST_CASE("operator[] does not confuse keys sharing a hash", "[object_model][lookup]")
+TEST_CASE("Children operations keep keys paired with values", "[object_model][assignment]")
 {
-    // A collision can only be found by brute force when size_t is 32 bits
-    // (birthday bound around 2^16 keys). On 64 bits this test is a no-op.
-    if (sizeof(size_t) > 4)
-    {
-        WARN("size_t is wider than 32 bits, no std::hash collision to test with");
-        return;
-    }
-
-    std::hash<std::string> hasher;
-    std::unordered_map<size_t, std::string> seen;
-    std::string first, second;
-    for (uint32_t i = 0; i < 2000000 && first.empty(); ++i)
-    {
-        std::string key = "key" + std::to_string(i);
-        auto inserted = seen.emplace(hasher(key), key);
-        if (!inserted.second)
-        {
-            first = inserted.first->second;
-            second = key;
-        }
-    }
-    REQUIRE_FALSE(first.empty());
-    REQUIRE(hasher(first) == hasher(second));
-
-    ValveDataObject root("Root");
-    root.Collection().emplace_back(first, int32_t(1));
-    root.Collection().emplace_back(second, int32_t(2));
-
-    auto r1 = root[first];
-    REQUIRE(r1.size() == 1);
-    CHECK(r1[0].Name() == first);
-    CHECK(r1[0].Int32() == 1);
-
-    ValveDataObject const& croot = root;
-    auto r2 = croot[second];
-    REQUIRE(r2.size() == 1);
-    CHECK(r2[0].Name() == second);
-    CHECK(r2[0].Int32() == 2);
-}
-
-TEST_CASE("Collection algorithms keep keys paired with values", "[object_model][assignment]")
-{
-    ValveDataObject root = MakeABC();
-    auto& c = root.Collection();
-    REQUIRE(Dump(c) == "a=A b=B c=C");
+    KeyValue root = MakeABC();
+    REQUIRE(Dump(root) == "a=A b=B c=C");
 
     SECTION("erase")
     {
-        c.erase(c.begin());
-        CHECK(Dump(c) == "b=B c=C");
+        auto next = root.erase(root.begin());
+        CHECK(next->key() == "b");
+        CHECK(Dump(root) == "b=B c=C");
     }
 
     SECTION("insert in the middle")
     {
-        c.insert(c.begin() + 1, ValveDataObject("x", std::string("X")));
-        CHECK(Dump(c) == "a=A x=X b=B c=C");
+        auto inserted = root.insert(++root.begin(), KeyValue("x", "X"));
+        CHECK(inserted->key() == "x");
+        CHECK(Dump(root) == "a=A x=X b=B c=C");
+        root.insert(root.begin(), KeyValue("first", "1"));
+        root.insert(root.end(), KeyValue("last", "2"));
+        CHECK(Dump(root) == "first=1 a=A x=X b=B c=C last=2");
     }
 
     SECTION("std::swap")
     {
-        std::swap(c[0], c[1]);
-        CHECK(Dump(c) == "b=B a=A c=C");
+        auto first = root.begin();
+        auto second = ++root.begin();
+        std::swap(*first, *second);
+        CHECK(Dump(root) == "b=B a=A c=C");
     }
 
-    SECTION("std::sort")
+    SECTION("sort")
     {
-        std::sort(c.begin(), c.end(), [](ValveDataObject const& l, ValveDataObject const& r) { return l.Name() > r.Name(); });
-        CHECK(Dump(c) == "c=C b=B a=A");
+        root.sort([](KeyValue const& l, KeyValue const& r) { return l.key() > r.key(); });
+        CHECK(Dump(root) == "c=C b=B a=A");
+        CHECK(root["a"].as<std::string>() == "A");
+        CHECK(root["b"].as<std::string>() == "B");
+        CHECK(root["c"].as<std::string>() == "C");
     }
 
-    SECTION("remove_if + erase")
+    SECTION("erase by key")
     {
-        c.erase(std::remove_if(c.begin(), c.end(), [](ValveDataObject const& o) { return o.Name() == "b"; }), c.end());
-        CHECK(Dump(c) == "a=A c=C");
+        CHECK(root.erase("b") == 1);
+        CHECK(root.erase("b") == 0);
+        CHECK(Dump(root) == "a=A c=C");
     }
 
-    SECTION("lookup after reordering")
+    SECTION("erase while iterating")
     {
-        std::reverse(c.begin(), c.end());
-        CHECK(root["a"][0].String() == "A");
-        CHECK(root["b"][0].String() == "B");
-        CHECK(root["c"][0].String() == "C");
+        for (auto it = root.begin(); it != root.end();)
+        {
+            if (it->key() != "b")
+                it = root.erase(it);
+            else
+                ++it;
+        }
+        CHECK(Dump(root) == "b=B");
+    }
+
+    SECTION("erase with a key owned by the erased child")
+    {
+        CHECK(root.erase(root.find("b")->key()) == 1);
+        CHECK(Dump(root) == "a=A c=C");
+    }
+
+    SECTION("clear")
+    {
+        root.clear();
+        CHECK(root.empty());
+        CHECK(root.is_object());
+        CHECK(root.to_text() == "\"Root\"\n{\n}\n");
     }
 }
 
-TEST_CASE("ValveDataObject copy and move carry the name with the value", "[object_model][assignment]")
+TEST_CASE("KeyValue copy and move carry the key with the value", "[object_model][assignment]")
 {
-    ValveDataObject src = MakeABC();
-    src.Name("Source");
+    KeyValue src = MakeABC();
+    src.set_key("Source");
 
     SECTION("copy construction is deep")
     {
-        ValveDataObject copy(src);
-        CHECK(copy.Name() == "Source");
-        CHECK(Dump(copy.Collection()) == "a=A b=B c=C");
-        copy.Collection()[0].String() = "changed";
-        CHECK(src.Collection()[0].String() == "A");
+        KeyValue copy(src);
+        CHECK(copy.key() == "Source");
+        CHECK(Dump(copy) == "a=A b=B c=C");
+        CHECK(copy == src);
+        copy["a"] = "changed";
+        CHECK(src["a"].as<std::string>() == "A");
+        CHECK(copy != src);
     }
 
     SECTION("copy assignment")
     {
-        ValveDataObject dst("dst", int32_t(5));
+        KeyValue dst("dst", int32_t(5));
         dst = src;
-        CHECK(dst.Name() == "Source");
-        CHECK(Dump(dst.Collection()) == "a=A b=B c=C");
-        CHECK(src.Name() == "Source");
-        CHECK(Dump(src.Collection()) == "a=A b=B c=C");
+        CHECK(dst.key() == "Source");
+        CHECK(Dump(dst) == "a=A b=B c=C");
+        CHECK(src.key() == "Source");
+        CHECK(Dump(src) == "a=A b=B c=C");
     }
 
     SECTION("move construction")
     {
-        ValveDataObject dst(std::move(src));
-        CHECK(dst.Name() == "Source");
-        CHECK(Dump(dst.Collection()) == "a=A b=B c=C");
+        KeyValue dst(std::move(src));
+        CHECK(dst.key() == "Source");
+        CHECK(Dump(dst) == "a=A b=B c=C");
     }
 
     SECTION("move assignment")
     {
-        ValveDataObject dst("dst", int32_t(5));
+        KeyValue dst("dst", int32_t(5));
         dst = std::move(src);
-        CHECK(dst.Name() == "Source");
-        CHECK(Dump(dst.Collection()) == "a=A b=B c=C");
+        CHECK(dst.key() == "Source");
+        CHECK(Dump(dst) == "a=A b=B c=C");
     }
 
     SECTION("self copy assignment")
     {
-        ValveDataObject& alias = src;
+        KeyValue& alias = src;
         src = alias;
-        CHECK(src.Name() == "Source");
-        CHECK(Dump(src.Collection()) == "a=A b=B c=C");
+        CHECK(src.key() == "Source");
+        CHECK(Dump(src) == "a=A b=B c=C");
     }
 
     SECTION("self move assignment")
     {
-        ValveDataObject& alias = src;
+        KeyValue& alias = src;
         src = std::move(alias);
-        CHECK(src.Name() == "Source");
-        CHECK(Dump(src.Collection()) == "a=A b=B c=C");
+        CHECK(src.key() == "Source");
+        CHECK(Dump(src) == "a=A b=B c=C");
     }
 
     SECTION("assign a child to its parent (copy)")
     {
-        src = src.Collection()[1];
-        CHECK(src.Name() == "b");
-        CHECK(src.String() == "B");
+        src = *src.find("b");
+        CHECK(src.key() == "b");
+        CHECK(src.as<std::string>() == "B");
     }
 
     SECTION("assign a child to its parent (move)")
     {
-        src = std::move(src.Collection()[1]);
-        CHECK(src.Name() == "b");
-        CHECK(src.String() == "B");
+        src = std::move(*src.find("b"));
+        CHECK(src.key() == "b");
+        CHECK(src.as<std::string>() == "B");
     }
 }
 
-TEST_CASE("Assigning through a reference wrapper keeps the key", "[object_model][assignment]")
+TEST_CASE("Assigning a value keeps the key", "[object_model][assignment]")
 {
-    ValveDataObject root = MakeABC();
-    root.Collection().emplace_back("obj", ValveDataObject("child", std::string("Child")));
+    KeyValue root = MakeABC();
+    root.add("obj").add("child", "Child");
 
-    SECTION("from a ValveDataObject copy")
+    SECTION("from a KeyValue copy")
     {
-        ValveDataObject other("other", std::string("Other"));
-        root["a"][0] = other;
-        CHECK(Dump(root.Collection()).find("a=Other b=B c=C") == 0);
-        CHECK(other.Name() == "other");
-        CHECK(other.String() == "Other");
+        KeyValue other("other", "Other");
+        root["a"] = other;
+        CHECK(Dump(root).find("a=Other b=B c=C") == 0);
+        CHECK(other.key() == "other");
+        CHECK(other.as<std::string>() == "Other");
     }
 
-    SECTION("from a moved ValveDataObject")
+    SECTION("from a moved KeyValue")
     {
-        ValveDataObject other("other", std::string("Other"));
-        root["a"][0] = std::move(other);
-        CHECK(Dump(root.Collection()).find("a=Other b=B c=C") == 0);
+        KeyValue other("other", "Other");
+        root["a"] = std::move(other);
+        CHECK(Dump(root).find("a=Other b=B c=C") == 0);
     }
 
-    SECTION("from another reference wrapper")
+    SECTION("from another child")
     {
-        root["a"][0] = root["c"][0];
-        CHECK(Dump(root.Collection()).find("a=C b=B c=C") == 0);
+        root["a"] = root["c"];
+        CHECK(Dump(root).find("a=C b=B c=C") == 0);
     }
 
-    SECTION("from a moved reference wrapper")
+    SECTION("from a moved child: the source loses its value and leaves the tree")
     {
-        auto refs = root["c"];
-        root["a"][0] = std::move(refs[0]);
-        CHECK(root["a"][0].String() == "C");
-        CHECK(root.Collection()[0].Name() == "a");
-        CHECK(root.Collection()[2].Name() == "c");
+        root["a"] = std::move(root["c"]);
+        CHECK(root["a"].as<std::string>() == "C");
+        CHECK(Dump(root) == "a=C b=B obj=?");
+        CHECK_FALSE(root.contains("c"));
+    }
+
+    SECTION("on a KeyValue itself")
+    {
+        KeyValue& a = *root.find("a");
+        a = *root.find("c");
+        CHECK(a.key() == "c");
+        a = static_cast<Node const&>(*root.find("b"));
+        CHECK(a.key() == "c");
+        CHECK(a.as<std::string>() == "B");
+        a = "text";
+        CHECK(a.key() == "c");
+        a = 5;
+        CHECK(a.key() == "c");
+        CHECK(a.as<int>() == 5);
     }
 
     SECTION("self assignment")
     {
-        auto refs = root["a"];
-        refs[0] = refs[0];
-        CHECK(Dump(root.Collection()).find("a=A b=B c=C") == 0);
-        refs[0] = std::move(refs[0]);
-        CHECK(Dump(root.Collection()).find("a=A b=B c=C") == 0);
+        Node& a = root["a"];
+        Node& alias = root["a"];
+        a = alias;
+        CHECK(Dump(root).find("a=A b=B c=C") == 0);
+        a = std::move(alias);
+        CHECK(Dump(root).find("a=A b=B c=C") == 0);
     }
 
-    SECTION("an object element receives the value of its own child (copy)")
+    SECTION("an object receives the value of its own child (copy)")
     {
-        root["obj"][0] = root["obj"][0]["child"][0];
-        REQUIRE(root["obj"].size() == 1);
-        CHECK(root["obj"][0].Type() == ObjectType::String);
-        CHECK(root["obj"][0].String() == "Child");
+        root["obj"] = root["obj"]["child"];
+        REQUIRE(root.count("obj") == 1);
+        CHECK(root["obj"].type() == Type::String);
+        CHECK(root["obj"].as<std::string>() == "Child");
     }
 
-    SECTION("an object element receives the value of its own child (move)")
+    SECTION("an object receives the value of its own child (move)")
     {
-        auto obj = root["obj"];
-        auto child = obj[0]["child"];
-        obj[0] = std::move(child[0]);
-        REQUIRE(root["obj"].size() == 1);
-        CHECK(root["obj"][0].Type() == ObjectType::String);
-        CHECK(root["obj"][0].String() == "Child");
+        Node& obj = root["obj"];
+        obj = std::move(obj["child"]);
+        REQUIRE(root.count("obj") == 1);
+        CHECK(root["obj"].type() == Type::String);
+        CHECK(root["obj"].as<std::string>() == "Child");
+    }
+
+    SECTION("an object receives a string owned by its own child")
+    {
+        root["obj"] = root["obj"]["child"].as<std::string_view>();
+        CHECK(root["obj"].as<std::string>() == "Child");
     }
 
     SECTION("typed values")
     {
-        root["b"][0] = int32_t(42);
-        CHECK(root.Collection()[1].Name() == "b");
-        CHECK(root.Collection()[1].Int32() == 42);
+        root["b"] = int32_t(42);
+        auto second = ++root.begin();
+        CHECK(second->key() == "b");
+        CHECK(second->as<int32_t>() == 42);
     }
 }
 
-static_assert(std::is_nothrow_move_constructible<ValveDataObject>::value, "moves must be noexcept");
-static_assert(std::is_nothrow_move_assignable<ValveDataObject>::value, "moves must be noexcept");
+static_assert(std::is_nothrow_move_constructible<Node>::value, "moves must be noexcept");
+static_assert(std::is_nothrow_move_assignable<Node>::value, "moves must be noexcept");
+static_assert(std::is_nothrow_move_constructible<KeyValue>::value, "moves must be noexcept");
+static_assert(std::is_nothrow_move_assignable<KeyValue>::value, "moves must be noexcept");
+static_assert(std::is_nothrow_default_constructible<Node>::value, "an empty node does not allocate");
+static_assert(std::is_nothrow_default_constructible<KeyValue>::value, "an empty node does not allocate");
 
 TEST_CASE("Moves do not allocate", "[object_model][exception_safety]")
 {
-    ValveDataObject a = MakeABC();
+    KeyValue a = MakeTree();
+    const KeyValue expected = a;
 
     long long total_before = g_total_allocations;
-    ValveDataObject b(std::move(a));
+    KeyValue b(std::move(a));
     a = std::move(b);
     b = std::move(a);
     std::swap(a, b);
-    CHECK(g_total_allocations == total_before);
+    Node n(std::move(static_cast<Node&>(a)));
+    Node m;
+    m = std::move(n);
+    static_cast<Node&>(a) = std::move(m);
+    CHECK_ALLOCATIONS(g_total_allocations == total_before);
+    CHECK(static_cast<Node const&>(a) == static_cast<Node const&>(expected));
 
-    SECTION("vector growth only allocates the new buffer")
+    SECTION("an empty Node or KeyValue does not allocate")
     {
-        auto& c = a.Collection();
-        c.shrink_to_fit();
-        REQUIRE(c.size() == c.capacity());
+        total_before = g_total_allocations;
+        {
+            Node node;
+            KeyValue key_value;
+            Node null(nullptr);
+            Node number(5);
+            Node small_string("short");
+            CHECK(node.is_none());
+            CHECK(key_value.is_none());
+        }
+        CHECK_ALLOCATIONS(g_total_allocations == total_before);
+    }
+
+    SECTION("lookups do not allocate")
+    {
+        KeyValue const& tree = expected;
+        total_before = g_total_allocations;
+        bool found = tree[LongKey].has_value() && tree.contains(LongKey) && tree.find(LongKey) != nullptr
+            && tree.count(LongKey) == 3 && tree.at(LongKey).is_string() && !tree["missing"]["deeper"].has_value()
+            && tree[LongKey + "2"][LongKey][LongKey].value_or(0.f) == 1.5f && tree[LongKey].as<std::string_view>() == LongValue;
+        long long allocations = g_total_allocations - total_before;
+        CHECK(found);
+        // Only the temporary LongKey + "2" allocates.
+        CHECK_ALLOCATIONS(allocations == 1);
+    }
+
+    SECTION("a child is one allocation, plus its long strings")
+    {
+        KeyValue root("root");
+        root.add("warmup", 0);
+        root.add("warmup", 0);
 
         total_before = g_total_allocations;
-        c.reserve(c.capacity() + 1);
-        CHECK(g_total_allocations - total_before == 1);
-        CHECK(Dump(c) == "a=A b=B c=C");
+        root.add("k", 5);
+        CHECK_ALLOCATIONS(g_total_allocations - total_before <= 2); // the child, maybe the growth of the list
     }
 }
 
 TEST_CASE("Constructors and assignments do not leak when an allocation fails", "[object_model][exception_safety]")
 {
-    ValveDataObject child(LongKey, LongValue);
-    ValveDataObject tree(LongKey);
-    tree.Collection().emplace_back(child);
-    tree.Collection().emplace_back(LongKey, int32_t(1));
-    tree.Collection().emplace_back(LongKey, ValveDataObject(LongKey, LongValue));
+    const KeyValue tree = MakeTree();
 
-    SECTION("default") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o; }); }
-    SECTION("key") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey); }); }
-    SECTION("key, string const&") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, LongValue); }); }
-    SECTION("key, string&&") { CheckNoLeakOnAllocationFailure([&] { std::string v = LongValue; ValveDataObject o(LongKey, std::move(v)); }); }
-    SECTION("key, int32_t") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, int32_t(1)); }); }
-    SECTION("key, float") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, 1.f); }); }
-    SECTION("key, pointer_t") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, EasyVDF::pointer_t{1}); }); }
-    SECTION("key, color_t") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, EasyVDF::color_t{1}); }); }
-    SECTION("key, int64_t") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, int64_t(1)); }); }
-    SECTION("key, uint64_t") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, uint64_t(1)); }); }
-    SECTION("key, ValveDataObject const&") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(LongKey, tree); }); }
-    SECTION("key, ValveDataObject&&") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject tmp(tree); ValveDataObject o(LongKey, std::move(tmp)); }); }
-    SECTION("copy") { CheckNoLeakOnAllocationFailure([&] { ValveDataObject o(tree); }); }
+    SECTION("default") { CheckNoLeakOnAllocationFailure([&] { KeyValue o; Node n; }); }
+    SECTION("key") { CheckNoLeakOnAllocationFailure([&] { KeyValue o(LongKey); }); }
+    SECTION("key, string const&") { CheckNoLeakOnAllocationFailure([&] { KeyValue o(LongKey, LongValue); }); }
+    SECTION("key, string&&") { CheckNoLeakOnAllocationFailure([&] { std::string v = LongValue; KeyValue o(LongKey, std::move(v)); }); }
+    SECTION("key, const char*") { CheckNoLeakOnAllocationFailure([&] { KeyValue o(LongKey, LongValue.c_str()); }); }
+    SECTION("key, int32_t") { CheckNoLeakOnAllocationFailure([&] { KeyValue o(LongKey, int32_t(1)); }); }
+    SECTION("key, float") { CheckNoLeakOnAllocationFailure([&] { KeyValue o(LongKey, 1.f); }); }
+    SECTION("key, Pointer") { CheckNoLeakOnAllocationFailure([&] { KeyValue o(LongKey, EasyVDF::Pointer{1}); }); }
+    SECTION("key, Color") { CheckNoLeakOnAllocationFailure([&] { KeyValue o(LongKey, EasyVDF::Color{1, 2, 3, 4}); }); }
+    SECTION("key, int64_t") { CheckNoLeakOnAllocationFailure([&] { KeyValue o(LongKey, int64_t(1)); }); }
+    SECTION("key, uint64_t") { CheckNoLeakOnAllocationFailure([&] { KeyValue o(LongKey, uint64_t(1)); }); }
+    SECTION("key, Node const&") { CheckNoLeakOnAllocationFailure([&] { KeyValue o(LongKey, static_cast<Node const&>(tree)); }); }
+    SECTION("key, Node&&") { CheckNoLeakOnAllocationFailure([&] { Node tmp(tree); KeyValue o(LongKey, std::move(tmp)); }); }
+    SECTION("initializer list")
+    {
+        CheckNoLeakOnAllocationFailure([&] {
+            KeyValue o(LongKey, { {LongKey, LongValue}, {LongKey, 5}, {LongKey, { {LongKey, LongValue} }} });
+        });
+    }
+    SECTION("copy") { CheckNoLeakOnAllocationFailure([&] { KeyValue o(tree); }); }
     SECTION("copy assignment")
     {
         CheckNoLeakOnAllocationFailure([&] {
-            ValveDataObject o(LongKey, LongValue);
+            KeyValue o(LongKey, LongValue);
             bool threw = false;
             try
             {
@@ -529,8 +613,29 @@ TEST_CASE("Constructors and assignments do not leak when an allocation fails", "
             }
             if (threw)
             {// Strong guarantee: o is unchanged.
-                if (o.Name() != LongKey || o.Type() != ObjectType::String || o.String() != LongValue)
+                if (o.key() != LongKey || o.type() != Type::String || o.as<std::string_view>() != LongValue)
                     FAIL("copy assignment modified the target before throwing");
+                throw std::bad_alloc();
+            }
+        });
+    }
+    SECTION("value assignment")
+    {
+        CheckNoLeakOnAllocationFailure([&] {
+            KeyValue o(LongKey, LongValue);
+            bool threw = false;
+            try
+            {
+                static_cast<Node&>(o) = tree;
+            }
+            catch (std::bad_alloc const&)
+            {
+                threw = true;
+            }
+            if (threw)
+            {
+                if (o.key() != LongKey || o.type() != Type::String || o.as<std::string_view>() != LongValue)
+                    FAIL("value assignment modified the target before throwing");
                 throw std::bad_alloc();
             }
         });
@@ -538,20 +643,47 @@ TEST_CASE("Constructors and assignments do not leak when an allocation fails", "
     SECTION("assignments on a moved-from object")
     {
         CheckNoLeakOnAllocationFailure([&] {
-            ValveDataObject src(LongKey, LongValue);
-            ValveDataObject o(std::move(src));
+            KeyValue src(LongKey, LongValue);
+            KeyValue o(std::move(src));
             src = LongValue;
-            src.Name(LongKey);
+            src.set_key(LongKey);
             o = int32_t(1);
         });
     }
-    SECTION("reference wrapper assignment")
+    SECTION("building a tree")
     {
         CheckNoLeakOnAllocationFailure([&] {
-            ValveDataObject root(LongKey);
-            root.Collection().emplace_back(LongKey, int32_t(1));
-            root[LongKey][0] = tree;
+            KeyValue root(LongKey);
+            root.add(LongKey, int32_t(1));
+            root[LongKey] = static_cast<Node const&>(tree);
+            root[LongValue][LongKey][LongValue] = LongValue;
+            root[LongValue + "!"].value_or(0);
+            root.insert(root.begin(), tree);
+            root.add(LongKey).set_condition(LongValue);
+            root.erase(LongKey);
+            for (auto& child : root.all(LongValue))
+                child = 5;
         });
+    }
+    SECTION("parsing text")
+    {
+        const std::string text = tree.to_text();
+        CheckNoLeakOnAllocationFailure([&] { EasyVDF::parse(text); });
+        CheckNoLeakOnAllocationFailure([&] { std::istringstream is(text); EasyVDF::parse(is); });
+        CheckNoLeakOnAllocationFailure([&] { try { EasyVDF::parse(text.substr(0, text.size() - 3)); } catch (EasyVDF::ParseError const&) {} });
+    }
+    SECTION("parsing binary")
+    {
+        const std::string binary = tree.to_binary();
+        const std::string vbkv = tree.to_binary(EasyVDF::Format::Vbkv);
+        CheckNoLeakOnAllocationFailure([&] { EasyVDF::parse(binary); });
+        CheckNoLeakOnAllocationFailure([&] { std::istringstream is(vbkv); EasyVDF::parse(is); });
+        CheckNoLeakOnAllocationFailure([&] { try { EasyVDF::parse(std::string_view(binary).substr(0, binary.size() - 3)); } catch (EasyVDF::ParseError const&) {} });
+    }
+    SECTION("writing")
+    {
+        CheckNoLeakOnAllocationFailure([&] { tree.to_text(); });
+        CheckNoLeakOnAllocationFailure([&] { tree.to_binary(EasyVDF::Format::Vbkv); });
     }
 }
 
@@ -560,132 +692,184 @@ TEST_CASE("A moved-from object is empty and usable", "[object_model][moved_from]
     bool by_assignment = GENERATE(false, true);
     CAPTURE(by_assignment);
 
-    ValveDataObject a("a", std::string("A"));
+    KeyValue a("a", "A");
+    a.set_condition("$WIN32");
     if (by_assignment)
     {
-        ValveDataObject b;
+        KeyValue b;
         b = std::move(a);
-        CHECK(b.Name() == "a");
+        CHECK(b.key() == "a");
+        CHECK(b.condition() == "$WIN32");
     }
     else
     {
-        ValveDataObject b(std::move(a));
-        CHECK(b.Name() == "a");
+        KeyValue b(std::move(a));
+        CHECK(b.key() == "a");
+        CHECK(b.condition() == "$WIN32");
     }
 
     // Observers
-    CHECK(a.Name().empty());
-    CHECK(a.Type() == ObjectType::None);
-    CHECK(a.Empty());
-    CHECK((a == nullptr));
-    CHECK_THROWS_AS(a.String(), std::invalid_argument);
-    CHECK_THROWS_AS(a.Collection(), std::invalid_argument);
-    CHECK_THROWS_AS(a.Int32(), std::invalid_argument);
-    CHECK_THROWS_AS(a["key"], std::invalid_argument);
-    CHECK_THROWS_AS(a.SerializeAsText(), EasyVDF::SerializeException);
-    CHECK_THROWS_AS(a.SerializeAsBinary(), EasyVDF::SerializeException);
+    CHECK(a.key().empty());
+    CHECK(a.condition().empty());
+    CHECK(a.type() == Type::None);
+    CHECK(a.is_none());
+    CHECK_FALSE(a.has_value());
+    CHECK_FALSE(static_cast<bool>(a));
+    CHECK(a.empty());
+    CHECK(a.begin() == a.end());
+    CHECK_THROWS_AS(a.as<std::string>(), EasyVDF::TypeError);
+    CHECK_THROWS_AS(a.as<int32_t>(), EasyVDF::TypeError);
+    CHECK_THROWS_AS(a.at("key"), EasyVDF::KeyError);
+    CHECK(std::as_const(a)["key"].is_none());
+    CHECK_THROWS_AS(a.to_text(), EasyVDF::WriteError);
+    CHECK_THROWS_AS(a.to_binary(), EasyVDF::WriteError);
+    CHECK(a == KeyValue());
 
     // Copies of it are empty too.
-    ValveDataObject copy(a);
-    CHECK(copy.Name().empty());
-    CHECK(copy.Type() == ObjectType::None);
-    ValveDataObject assigned("x", int32_t(1));
+    KeyValue copy(a);
+    CHECK(copy.key().empty());
+    CHECK(copy.type() == Type::None);
+    KeyValue assigned("x", int32_t(1));
     assigned = a;
-    CHECK(assigned.Name().empty());
-    CHECK(assigned.Type() == ObjectType::None);
+    CHECK(assigned.key().empty());
+    CHECK(assigned.type() == Type::None);
 
-    SECTION("assign a value") { a = int32_t(3); CHECK(a.Int32() == 3); CHECK(a.Name().empty()); }
-    SECTION("assign a string") { a = std::string("S"); CHECK(a.String() == "S"); }
-    SECTION("assign nullptr") { a = nullptr; CHECK(a.Empty()); }
-    SECTION("rename") { a.Name("renamed"); CHECK(a.Name() == "renamed"); CHECK(a.Empty()); }
+    SECTION("assign a value") { a = int32_t(3); CHECK(a.as<int32_t>() == 3); CHECK(a.key().empty()); }
+    SECTION("assign a string") { a = std::string("S"); CHECK(a.as<std::string>() == "S"); }
+    SECTION("assign nullptr") { a = nullptr; CHECK(a.is_none()); }
+    SECTION("rename") { a.set_key("renamed"); CHECK(a.key() == "renamed"); CHECK(a.is_none()); }
     SECTION("assign an object")
     {
         a = MakeABC();
-        CHECK(a.Name() == "Root");
-        CHECK(Dump(a.Collection()) == "a=A b=B c=C");
+        CHECK(a.key() == "Root");
+        CHECK(Dump(a) == "a=A b=B c=C");
     }
-    SECTION("assign through a reference wrapper")
+    SECTION("use it as an object")
     {
-        EasyVDF::ValveDataObjectRef ref(&a);
-        ref = ValveDataObject("other", std::string("Other"));
-        CHECK(a.Name().empty());
-        CHECK(a.String() == "Other");
+        a["k"] = "v";
+        a.add("k2", 2);
+        CHECK(a.is_object());
+        CHECK(Dump(a) == "k=v k2=?");
     }
     SECTION("move from it again")
     {
-        ValveDataObject b(std::move(a));
-        CHECK(b.Empty());
+        KeyValue b(std::move(a));
+        CHECK(b.is_none());
         a = std::move(b);
-        CHECK(a.Empty());
+        CHECK(a.is_none());
     }
     // a is destroyed at the end of each section.
 }
 
-TEST_CASE("A collection holding a moved-from element stays usable", "[object_model][moved_from]")
+TEST_CASE("An object holding a moved-from child stays usable", "[object_model][moved_from]")
 {
-    ValveDataObject root = MakeABC();
-    ValveDataObject taken(std::move(root.Collection()[1]));
-    CHECK(taken.Name() == "b");
+    KeyValue root = MakeABC();
+    KeyValue taken(std::move(*root.find("b")));
+    CHECK(taken.key() == "b");
+    CHECK(taken.as<std::string>() == "B");
 
-    CHECK(root.Collection().size() == 3);
-    CHECK(root["a"].size() == 1);
-    CHECK(root["b"].empty());
-    CHECK(root[""].size() == 1);
+    // A child without value is not part of its parent anymore.
+    CHECK(root.size() == 2);
+    CHECK(Dump(root) == "a=A c=C");
+    CHECK(root.count("a") == 1);
+    CHECK_FALSE(root.contains("b"));
+    CHECK_FALSE(root.contains(""));
+    CHECK(root.to_text() == "\"Root\"\n{\n\t\"a\"\t\t\"A\"\n\t\"c\"\t\t\"C\"\n}\n");
 
-    ValveDataObject copy(root);
-    CHECK(copy.Collection()[1].Empty());
-    CHECK(copy.Collection()[1].Name().empty());
+    KeyValue copy(root);
+    CHECK(copy.size() == 2);
+    CHECK(copy == root);
 
-    root.Collection()[1] = std::move(taken);
-    CHECK(Dump(root.Collection()) == "a=A b=B c=C");
+    root.insert(++root.begin(), std::move(taken));
+    CHECK(Dump(root) == "a=A b=B c=C");
 }
 
-TEST_CASE("Serializing a node without value throws", "[object_model][serialize]")
+TEST_CASE("A node without value can't be written", "[object_model][serialize]")
 {
-    ValveDataObject root = MakeABC();
+    SECTION("a document without value throws")
+    {
+        KeyValue none;
+        none.set_key("none");
+        CHECK_THROWS_AS(none.to_text(), EasyVDF::WriteError);
+        CHECK_THROWS_AS(none.to_binary(EasyVDF::Format::Binary), EasyVDF::WriteError);
+        CHECK_THROWS_AS(none.to_binary(EasyVDF::Format::Vbkv), EasyVDF::WriteError);
 
-    SECTION("default constructed child")
-    {
-        root.Collection().emplace_back();
-        root.Collection().back().Name("none");
+        KeyValue reset = MakeABC();
+        reset = nullptr;
+        CHECK_THROWS_AS(reset.to_text(), EasyVDF::WriteError);
+        CHECK_THROWS_AS(reset.to_binary(), EasyVDF::WriteError);
+
+        KeyValue moved = MakeABC();
+        KeyValue taken(std::move(moved));
+        CHECK_THROWS_AS(moved.to_text(), EasyVDF::WriteError);
     }
-    SECTION("child assigned nullptr")
+
+    SECTION("a document that is not an object throws")
     {
-        root["b"][0] = nullptr;
+        CHECK_THROWS_AS(KeyValue("k", "v").to_text(), EasyVDF::WriteError);
+        CHECK_THROWS_AS(KeyValue("k", 5).to_binary(), EasyVDF::WriteError);
+        CHECK_THROWS_WITH(KeyValue("k", 5).to_binary(EasyVDF::Format::Vbkv), Catch::Contains("Int32") && Catch::Contains("object"));
+    }
+
+    // VDF has no representation for a key without a value: such a child is
+    // never part of its parent, so nothing unreadable can be written.
+    KeyValue root = MakeABC();
+    std::string expected_dump = "a=A b=B c=C";
+
+    SECTION("child without value added")
+    {
+        root.add("none", Node());
+        root.add("null", nullptr);
+        root.insert(root.begin(), KeyValue());
+    }
+    SECTION("child reset")
+    {
+        root["b"] = nullptr;
+        expected_dump = "a=A c=C";
+    }
+    SECTION("child reset()")
+    {
+        root["b"].reset();
+        expected_dump = "a=A c=C";
     }
     SECTION("moved-from child")
     {
-        ValveDataObject taken(std::move(root.Collection()[1]));
+        KeyValue taken(std::move(*root.find("b")));
+        expected_dump = "a=A c=C";
     }
     SECTION("nested child")
     {
-        ValveDataObject inner("inner");
-        inner.Collection().emplace_back("none", int32_t(0));
-        inner.Collection()[0] = nullptr;
-        root.Collection().emplace_back(std::move(inner));
+        KeyValue& inner = root.add("inner");
+        inner.add("none", int32_t(0));
+        inner["none"] = nullptr;
+        expected_dump = "a=A b=B c=C inner=?";
+        CHECK(inner.is_object());
+        CHECK(inner.empty());
     }
 
-    CHECK_THROWS_AS(root.SerializeAsText(), EasyVDF::SerializeException);
-    CHECK_THROWS_AS(root.SerializeAsBinary(1), EasyVDF::SerializeException);
-    CHECK_THROWS_AS(root.SerializeAsBinary(2), EasyVDF::SerializeException);
+    CHECK(Dump(root) == expected_dump);
+    for (EasyVDF::Format format : {EasyVDF::Format::Text, EasyVDF::Format::Binary, EasyVDF::Format::Vbkv})
+    {
+        KeyValue parsed = EasyVDF::parse(root.dump(format));
+        CHECK(Dump(parsed) == expected_dump);
+        CHECK(parsed == root);
+    }
 }
 
 TEST_CASE("Serializing nodes with values still works", "[object_model][serialize]")
 {
     SECTION("empty object")
     {
-        ValveDataObject root("Root");
-        CHECK(root.SerializeAsText() == "\"Root\"\n{\n}\n");
+        KeyValue root("Root");
+        CHECK(root.to_text() == "\"Root\"\n{\n}\n");
+        CHECK(root.to_binary() == std::string("\x00Root\x00\x08", 7));
     }
 
-    SECTION("removing the empty node makes the tree serializable")
+    SECTION("text and binary")
     {
-        ValveDataObject root = MakeABC();
-        root.Collection().emplace_back();
-        REQUIRE_THROWS_AS(root.SerializeAsText(), EasyVDF::SerializeException);
-        root.Collection().pop_back();
+        KeyValue root = MakeABC();
 
-        CHECK(root.SerializeAsText() ==
+        CHECK(root.to_text() ==
             "\"Root\"\n"
             "{\n"
             "\t\"a\"\t\t\"A\"\n"
@@ -693,15 +877,15 @@ TEST_CASE("Serializing nodes with values still works", "[object_model][serialize
             "\t\"c\"\t\t\"C\"\n"
             "}\n");
 
-        ValveDataObject parsed = RoundTripBinary(root, 2);
-        CHECK(Dump(parsed.Collection()) == "a=A b=B c=C");
+        KeyValue parsed = EasyVDF::parse(root.to_binary(EasyVDF::Format::Vbkv));
+        CHECK(Dump(parsed) == "a=A b=B c=C");
     }
 }
 
 namespace adl_check {
 
 // This namespace has its own operator== and operator<, which hide any
-// operator declared at global scope: pointer_t/color_t operators must be
+// operator declared at global scope: Pointer/Color operators must be
 // found by argument-dependent lookup.
 struct Unrelated {};
 inline bool operator==(Unrelated, Unrelated) { return true; }
@@ -716,62 +900,84 @@ bool AllComparisons(T small, T big)
 
 }
 
-TEST_CASE("pointer_t and color_t comparison operators", "[object_model][operators]")
+TEST_CASE("Pointer and Color comparison operators", "[object_model][operators]")
 {
-    CHECK(adl_check::AllComparisons(EasyVDF::pointer_t{1}, EasyVDF::pointer_t{2}));
-    CHECK(adl_check::AllComparisons(EasyVDF::color_t{1}, EasyVDF::color_t{2}));
+    CHECK(adl_check::AllComparisons(EasyVDF::Pointer{1}, EasyVDF::Pointer{2}));
+    CHECK(adl_check::AllComparisons(EasyVDF::Color{0, 0, 0, 1}, EasyVDF::Color{0, 0, 0, 2}));
+    CHECK(adl_check::AllComparisons(EasyVDF::Color{0, 9, 9, 9}, EasyVDF::Color{1, 0, 0, 0}));
 
     // Catch's decomposition also lives in its own namespace.
-    ValveDataObject o("p", EasyVDF::pointer_t{0x90807060});
-    CHECK(o.Pointer() == EasyVDF::pointer_t{0x90807060});
-    CHECK(o.Pointer() != EasyVDF::pointer_t{0});
-    o = EasyVDF::color_t{0x99887766};
-    CHECK(o.Color() == EasyVDF::color_t{0x99887766});
-    CHECK(o.Color() > EasyVDF::color_t{0});
+    Node o(EasyVDF::Pointer{0x90807060});
+    CHECK(o.as<EasyVDF::Pointer>() == EasyVDF::Pointer{0x90807060});
+    CHECK(o.as<EasyVDF::Pointer>() != EasyVDF::Pointer{0});
+    o = EasyVDF::Color{0x66, 0x77, 0x88, 0x99};
+    CHECK(o.as<EasyVDF::Color>() == EasyVDF::Color{0x66, 0x77, 0x88, 0x99});
+    CHECK(o.as<EasyVDF::Color>() > EasyVDF::Color{});
 }
 
-TEST_CASE("Color() reports the Color type in its error", "[object_model][operators]")
+TEST_CASE("Conversion errors name the types", "[object_model][operators]")
 {
-    ValveDataObject o("p", EasyVDF::pointer_t{1});
-    CHECK_THROWS_WITH(o.Color(), Catch::Contains("Color") && !Catch::Contains("Pointer"));
+    Node o(EasyVDF::Pointer{1});
+    CHECK_THROWS_WITH(o.as<EasyVDF::Color>(), Catch::Contains("Pointer value to a Color"));
+    CHECK_THROWS_WITH(o.as<float>(), Catch::Contains("Pointer value to a floating point number"));
+    CHECK_THROWS_WITH(Node("x").as<int>(), Catch::Contains("String value to an integer"));
+    CHECK_THROWS_WITH(Node(1).as<std::string_view>(), Catch::Contains("Int32 value to a string"));
+    CHECK_THROWS_WITH(Node::object().as<bool>(), Catch::Contains("Object value to a bool"));
+    CHECK_THROWS_WITH(Node().as<EasyVDF::Pointer>(), Catch::Contains("missing value") && Catch::Contains("a Pointer"));
+    CHECK_THROWS_WITH(Node(1).add("k", 1), Catch::Contains("Int32 value has no children"));
 }
 
-TEST_CASE("operator==(nullptr) works on const objects", "[object_model][operators]")
+TEST_CASE("Const objects are fully readable", "[object_model][operators]")
 {
-    ValveDataObject root("Root");
-    root.Collection().emplace_back("none", int32_t(0));
-    root.Collection()[0] = nullptr;
-    root.Collection().emplace_back("int", int32_t(1));
+    KeyValue root("Root");
+    root.add("none", int32_t(0));
+    root["none"] = nullptr;
+    root.add("int", int32_t(1));
+    root.add("sub").add("s", "text");
 
-    ValveDataObject const& croot = root;
-    CHECK_FALSE(croot == nullptr);
-    CHECK(croot.Collection()[0] == nullptr);
+    KeyValue const& croot = root;
+    CHECK(croot.has_value());
+    CHECK(croot["none"].is_none());
+    CHECK_FALSE(croot["none"]);
+    CHECK(croot["int"]);
+    CHECK(croot["int"].as<int>() == 1);
+    CHECK(croot["sub"]["s"].as<std::string>() == "text");
+    CHECK(croot["sub"]["s"].as<std::string_view>() == "text");
+    CHECK(croot["sub"]["s"]["deeper"]["again"].is_none());
+    CHECK(croot["int"]["deeper"].value_or(7) == 7);
+    CHECK(croot.at("sub").at("s").is_string());
+    CHECK(croot.find("int")->key() == "int");
+    CHECK(croot.size() == 2);
+    CHECK(Dump(croot) == "int=? sub=?");
+    CHECK(croot.to_text() == root.to_text());
 
-    const EasyVDF::ValveDataObjectConstRef none = croot["none"][0];
-    const EasyVDF::ValveDataObjectConstRef value = croot["int"][0];
-    CHECK(none == nullptr);
-    CHECK_FALSE(value == nullptr);
-
-    const EasyVDF::ValveDataObjectRef ref = root["none"][0];
-    CHECK(ref == nullptr);
+    Node const& child = croot["sub"];
+    CHECK(child.size() == 1);
+    for (auto const& [key, value] : child)
+    {
+        CHECK(key == "s");
+        CHECK(value.as<std::string>() == "text");
+    }
 }
 
-TEST_CASE("Assigning a std::string&& through a reference wrapper moves it", "[object_model][operators]")
+TEST_CASE("Assigning a std::string&& moves it", "[object_model][operators]")
 {
-    ValveDataObject root("Root");
-    root.Collection().emplace_back("s", int32_t(0));
-    auto refs = root["s"];
+    KeyValue root("Root");
+    root.add("s", int32_t(0));
+    Node& s = root["s"];
     std::string value = LongValue;
 
     long long total_before = g_total_allocations;
-    refs[0] = value;
+    s = value;
     long long copy_allocations = g_total_allocations - total_before;
-    CHECK(root.Collection()[0].String() == LongValue);
+    CHECK(s.as<std::string_view>() == LongValue);
+    CHECK_ALLOCATIONS(copy_allocations == 1);
 
     // Moving does not allocate a copy of the string buffer.
     total_before = g_total_allocations;
-    refs[0] = std::move(value);
+    s = std::move(value);
     long long move_allocations = g_total_allocations - total_before;
+    CHECK_ALLOCATIONS(move_allocations == 0);
     CHECK(move_allocations < copy_allocations);
-    CHECK(root.Collection()[0].String() == LongValue);
+    CHECK(root["s"].as<std::string_view>() == LongValue);
 }

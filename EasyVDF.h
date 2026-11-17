@@ -1,151 +1,1662 @@
+// EasyVDF - single-header C++17 reader/writer for Valve KeyValues (VDF) files,
+// text and binary. See README.md for an overview and examples.
 #pragma once
 
-#include <istream>
-#include <ostream>
-#include <sstream>
-#include <string>
-#include <vector>
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <initializer_list>
+#include <istream>
+#include <iterator>
+#include <limits>
+#include <locale>
+#include <memory>
+#include <optional>
+#include <ostream>
+#include <sstream>
 #include <stdexcept>
-#include <functional>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <tuple>
+#include <type_traits>
 #include <utility>
+#include <variant>
+#include <vector>
+
+// Floating-point std::from_chars/std::to_chars are missing from some standard
+// libraries (libc++ before LLVM 20): fall back to classic-locale streams there.
+// Define EASYVDF_HAS_FLOAT_CHARCONV to 0 or 1 before including this header to override the detection.
+#ifndef EASYVDF_HAS_FLOAT_CHARCONV
+    #if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+        #define EASYVDF_HAS_FLOAT_CHARCONV 1
+    #else
+        #define EASYVDF_HAS_FLOAT_CHARCONV 0
+    #endif
+#endif
 
 namespace EasyVDF {
 
-// VBKV
-static constexpr uint32_t BinaryVDFMagic = 0x564B4256;
+/////////////////////////////////////////////////////////////////////
+//
+//                          Basic types
+//
+/////////////////////////////////////////////////////////////////////
 
-enum class ObjectType : int8_t
+/// What a Node holds.
+/// Text files only ever produce Object and String; the other types come from
+/// binary files or from values assigned in code.
+enum class Type : uint8_t
 {
-    None       = -1,
-    Object     =  0,
-    String     =  1,
-    Int32      =  2,
-    Float      =  3,
-    Pointer    =  4,
-    WideString =  5,
-    Color      =  6,
-    UInt64     =  7,
-    Binary     =  9,
-    Int64      =  10,
+    None,    ///< No value (missing key, default constructed or moved-from node).
+    Object,  ///< A list of key/value children.
+    String,
+    Int32,
+    Float,   ///< 32 bits float, the only floating point type of the format.
+    Pointer,
+    Color,
+    UInt64,
+    Int64,
 };
 
-class ValveDataObject;
-
-template<typename T>
-class ValveDataObjectRefWrapper;
-
-using ValveDataObjectRef = ValveDataObjectRefWrapper<ValveDataObject>;
-using ValveDataObjectConstRef = ValveDataObjectRefWrapper<const ValveDataObject>;
-
-using ValveCollection = std::vector<::EasyVDF::ValveDataObject>;
-using ValveCollectionRef = std::vector<::EasyVDF::ValveDataObjectRef>;
-using ValveCollectionConstRef = std::vector<::EasyVDF::ValveDataObjectConstRef>;
-
-struct pointer_t
+/// File formats.
+enum class Format
 {
-    uint32_t value;
+    Auto,   ///< Reading only: detect text / binary / VBKV from the first bytes.
+    Text,   ///< Text KeyValues ("key" "value").
+    Binary, ///< Binary KeyValues, objects end with 0x08 (Steam appinfo, shortcuts.vdf, ...).
+    Vbkv,   ///< Binary KeyValues with a "VBKV" + CRC32 header, objects end with 0x0B.
 };
 
-struct color_t
+/// A 32 bits "pointer" value of the binary format.
+struct Pointer
 {
-    uint32_t value;
+    uint32_t value = 0;
 };
 
+/// A color value of the binary format (4 bytes: r, g, b, a). Its text form is "r g b a".
+struct Color
+{
+    uint8_t r = 0, g = 0, b = 0, a = 0;
+};
+
+inline bool operator==(Pointer l, Pointer r) noexcept { return l.value == r.value; }
+inline bool operator!=(Pointer l, Pointer r) noexcept { return l.value != r.value; }
+inline bool operator< (Pointer l, Pointer r) noexcept { return l.value <  r.value; }
+inline bool operator<=(Pointer l, Pointer r) noexcept { return l.value <= r.value; }
+inline bool operator> (Pointer l, Pointer r) noexcept { return l.value >  r.value; }
+inline bool operator>=(Pointer l, Pointer r) noexcept { return l.value >= r.value; }
+
+inline bool operator==(Color l, Color r) noexcept { return std::tie(l.r, l.g, l.b, l.a) == std::tie(r.r, r.g, r.b, r.a); }
+inline bool operator!=(Color l, Color r) noexcept { return !(l == r); }
+inline bool operator< (Color l, Color r) noexcept { return std::tie(l.r, l.g, l.b, l.a) < std::tie(r.r, r.g, r.b, r.a); }
+inline bool operator<=(Color l, Color r) noexcept { return !(r < l); }
+inline bool operator> (Color l, Color r) noexcept { return r < l; }
+inline bool operator>=(Color l, Color r) noexcept { return !(l < r); }
+
+/////////////////////////////////////////////////////////////////////
+//
+//                          Exceptions
+//
+/////////////////////////////////////////////////////////////////////
+
+/// Base class of every exception thrown by EasyVDF.
+class Error : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
+
+/// Malformed input. line() and column() are 1-based and 0 when unknown (binary input).
+class ParseError : public Error
+{
+    std::size_t m_Line;
+    std::size_t m_Column;
+
+public:
+    explicit ParseError(std::string const& message, std::size_t line = 0, std::size_t column = 0) :
+        Error(message), m_Line(line), m_Column(column)
+    {}
+
+    std::size_t line() const noexcept { return m_Line; }
+    std::size_t column() const noexcept { return m_Column; }
+};
+
+/// A value has no conversion to the requested type, or a non-object was used as an object.
+class TypeError : public Error
+{
+public:
+    using Error::Error;
+};
+
+/// Node::at() did not find the key.
+class KeyError : public Error
+{
+public:
+    using Error::Error;
+};
+
+/// The tree can't be written (root without value or not an object, ...).
+class WriteError : public Error
+{
+public:
+    using Error::Error;
+};
+
+/// A file could not be opened, read or written.
+class IoError : public Error
+{
+public:
+    using Error::Error;
+};
+
+class Node;
+class KeyValue;
+
+/////////////////////////////////////////////////////////////////////
+//
+//                     Implementation details
+//
+/////////////////////////////////////////////////////////////////////
 namespace Details {
 
-static inline bool is_cr(char c)
-{
-    return c == '\r';
-}
+template<bool Const> class ChildIterator;
+template<bool Const> class ChildRange;
 
-static inline bool is_cr(wchar_t c)
+/// Children of an object node. Every child is allocated on its own, so a
+/// reference to a child stays valid until that child is erased.
+struct Children
 {
-    return c == L'\r';
-}
+    /// Children in document order.
+    std::vector<std::unique_ptr<KeyValue>> items;
+    /// Children created by the non-const Node::operator[] that have not been
+    /// given a value yet. They are invisible until they get one.
+    std::vector<std::unique_ptr<KeyValue>> pending;
+    /// The object itself was created by Node::operator[] on a node without value:
+    /// it only exists while one of its children has a value.
+    bool implicit = false;
 
-static inline bool is_lf(char c)
+    Children() noexcept;
+    Children(Children const& other);
+    Children(Children&& other) noexcept;
+    Children& operator=(Children const& other);
+    Children& operator=(Children&& other) noexcept;
+    ~Children();
+
+    std::size_t slots() const noexcept { return items.size() + pending.size(); }
+    KeyValue* slot(std::size_t i) const noexcept;
+};
+
+using Value = std::variant<std::monostate, Children, std::string, int32_t, float, Pointer, Color, uint64_t, int64_t>;
+
+template<typename T>
+constexpr bool IsCharacter = std::is_same_v<T, char> || std::is_same_v<T, wchar_t> || std::is_same_v<T, char16_t> || std::is_same_v<T, char32_t>;
+
+template<typename T>
+constexpr bool IsNumber = std::is_arithmetic_v<T> && !IsCharacter<T>;
+
+template<typename T>
+constexpr bool IsStringLike = std::is_convertible_v<T const&, std::string_view> && !std::is_same_v<T, std::nullptr_t>;
+
+/// Types that can be stored in a Node: numbers, bool, strings, Color and Pointer.
+template<typename T>
+constexpr bool IsScalar = IsNumber<std::decay_t<T>> || IsStringLike<std::decay_t<T>>
+    || std::is_same_v<std::decay_t<T>, Color> || std::is_same_v<std::decay_t<T>, Pointer>;
+
+template<typename T>
+using ValueOrResult = std::conditional_t<IsStringLike<std::decay_t<T>>, std::string, std::decay_t<T>>;
+
+inline const char* TypeName(Type type) noexcept
 {
-    return c == '\n';
-}
-
-static inline bool is_lf(wchar_t c)
-{
-    return c == L'\n';
-}
-
-template<typename CharT, typename Traits, typename Allocator>
-static std::basic_istream<CharT, Traits>& getline(std::basic_istream<CharT, Traits>& is, std::basic_string<CharT, Traits, Allocator>& buffer)
-{
-    CharT c;
-
-    buffer.clear();
-    while(is.get(c))
+    switch (type)
     {
-        buffer.push_back(c);
-        
-        if (is_cr(c))
-        {// MacOS EOL.
-            // Nope, Windows EOL.
-            c = is.peek();
-            if (is_lf(c))
-                buffer.push_back(is.get());
-            
-            break;
+        case Type::None   : return "None";
+        case Type::Object : return "Object";
+        case Type::String : return "String";
+        case Type::Int32  : return "Int32";
+        case Type::Float  : return "Float";
+        case Type::Pointer: return "Pointer";
+        case Type::Color  : return "Color";
+        case Type::UInt64 : return "UInt64";
+        case Type::Int64  : return "Int64";
+    }
+    return "unknown";
+}
+
+template<typename T>
+constexpr const char* TargetName() noexcept
+{
+    if constexpr (std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view>)
+        return "a string";
+    else if constexpr (std::is_same_v<T, bool>)
+        return "a bool";
+    else if constexpr (std::is_integral_v<T>)
+        return "an integer";
+    else if constexpr (std::is_floating_point_v<T>)
+        return "a floating point number";
+    else if constexpr (std::is_same_v<T, Color>)
+        return "a Color";
+    else
+        return "a Pointer";
+}
+
+inline bool IsSpace(char c) noexcept
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+}
+
+inline std::string_view Trim(std::string_view s) noexcept
+{
+    while (!s.empty() && IsSpace(s.front()))
+        s.remove_prefix(1);
+    while (!s.empty() && IsSpace(s.back()))
+        s.remove_suffix(1);
+    return s;
+}
+
+inline bool EqualsIgnoreCase(std::string_view l, std::string_view r) noexcept
+{
+    if (l.size() != r.size())
+        return false;
+
+    for (std::size_t i = 0; i < l.size(); ++i)
+    {
+        char a = l[i], b = r[i];
+        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+        if (a != b)
+            return false;
+    }
+    return true;
+}
+
+/// Integer to integer conversion, false when the value does not fit.
+template<typename To, typename From>
+bool IntegerCast(From value, To& out) noexcept
+{
+    if constexpr (std::is_signed_v<From>)
+    {
+        const int64_t v = static_cast<int64_t>(value);
+        if (v < 0)
+        {
+            if constexpr (std::is_signed_v<To>)
+            {
+                if (v < static_cast<int64_t>((std::numeric_limits<To>::min)()))
+                    return false;
+            }
+            else
+            {
+                return false;
+            }
         }
-        else if(is_lf(c))
-        {// Linux EOL.
+        else if (static_cast<uint64_t>(v) > static_cast<uint64_t>((std::numeric_limits<To>::max)()))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        if (static_cast<uint64_t>(value) > static_cast<uint64_t>((std::numeric_limits<To>::max)()))
+            return false;
+    }
+    out = static_cast<To>(value);
+    return true;
+}
+
+/// Parses a whole string as an integer: optional sign, decimal or 0x hexadecimal,
+/// surrounding blanks ignored. False if it is not a number or does not fit in T.
+template<typename T>
+bool ParseInteger(std::string_view s, T& out) noexcept
+{
+    s = Trim(s);
+    bool negative = false;
+    if (!s.empty() && (s.front() == '-' || s.front() == '+'))
+    {
+        negative = s.front() == '-';
+        s.remove_prefix(1);
+    }
+
+    int base = 10;
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+    {
+        base = 16;
+        s.remove_prefix(2);
+    }
+
+    if (s.empty() || s.front() == '-' || s.front() == '+')
+        return false;
+
+    uint64_t magnitude = 0;
+    const char* last = s.data() + s.size();
+    const auto result = std::from_chars(s.data(), last, magnitude, base);
+    if (result.ec != std::errc() || result.ptr != last)
+        return false;
+
+    if (!negative)
+        return IntegerCast(magnitude, out);
+
+    if (magnitude > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()) + 1)
+        return false;
+
+    // Two's complement negation, valid for -2^63 too.
+    return IntegerCast(static_cast<int64_t>(~magnitude + 1), out);
+}
+
+/// Parses a whole string as a floating point number, independently of the global locale.
+inline bool ParseDouble(std::string_view s, double& out)
+{
+    s = Trim(s);
+    if (!s.empty() && s.front() == '+')
+        s.remove_prefix(1);
+    if (s.empty())
+        return false;
+
+#if EASYVDF_HAS_FLOAT_CHARCONV
+    const char* last = s.data() + s.size();
+    const auto result = std::from_chars(s.data(), last, out);
+    return result.ec == std::errc() && result.ptr == last;
+#else
+    std::istringstream is{ std::string(s) };
+    is.imbue(std::locale::classic());
+    is >> out;
+    return !is.fail() && is.peek() == std::istringstream::traits_type::eof();
+#endif
+}
+
+template<typename T>
+void AppendInteger(std::string& out, T value)
+{
+    char buffer[24];
+    const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value);
+    out.append(buffer, result.ptr);
+}
+
+/// Appends the shortest text that parses back to exactly the same float.
+inline void AppendFloat(std::string& out, float value)
+{
+#if EASYVDF_HAS_FLOAT_CHARCONV
+    char buffer[64];
+    const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value);
+    out.append(buffer, result.ptr);
+#else
+    std::string text;
+    for (int precision = 6; precision <= 9; ++precision)
+    {
+        std::ostringstream os;
+        os.imbue(std::locale::classic());
+        os.precision(precision);
+        os << value;
+        text = os.str();
+
+        double parsed = 0;
+        if (ParseDouble(text, parsed) && static_cast<float>(parsed) == value)
             break;
+    }
+    out += text;
+#endif
+}
+
+/// Standard CRC-32 (zlib, polynomial 0xEDB88320), the checksum of VBKV files.
+inline uint32_t Crc32Update(uint32_t crc, const char* data, std::size_t size) noexcept
+{
+    struct Table
+    {
+        std::array<uint32_t, 256> values{};
+
+        constexpr Table() noexcept
+        {
+            for (uint32_t i = 0; i < 256; ++i)
+            {
+                uint32_t c = i;
+                for (int bit = 0; bit < 8; ++bit)
+                    c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                values[i] = c;
+            }
+        }
+    };
+    static constexpr Table table{};
+
+    crc = ~crc;
+    for (std::size_t i = 0; i < size; ++i)
+        crc = table.values[(crc ^ static_cast<unsigned char>(data[i])) & 0xFFu] ^ (crc >> 8);
+    return ~crc;
+}
+
+inline uint32_t Crc32(std::string_view data) noexcept
+{
+    return Crc32Update(0, data.data(), data.size());
+}
+
+} // namespace Details
+
+/////////////////////////////////////////////////////////////////////
+//
+//                              Node
+//
+/////////////////////////////////////////////////////////////////////
+
+/// A value of a KeyValues tree: nothing (Type::None), an object (a list of
+/// key/value children, duplicate keys allowed) or a scalar.
+///
+/// - `node["key"]` goes down the tree. On a const node it never throws: a missing
+///   key gives a node without value, so `doc["a"]["b"].value_or(0)` is always safe.
+///   On a non-const node it prepares the key for writing, like std::map:
+///   `doc["a"]["b"] = 1` creates what is missing. Keys that are only read are
+///   never created: they stay invisible (not iterated, not counted, not written).
+/// - `as<T>()`, `try_as<T>()` and `value_or(default)` convert the value.
+/// - `for (auto& [key, value] : node)` iterates the children of an object.
+/// - References to children stay valid until the child is erased.
+/// - A moved-from Node has no value (Type::None).
+class Node
+{
+public:
+    using iterator = Details::ChildIterator<false>;
+    using const_iterator = Details::ChildIterator<true>;
+
+    /// A node without value.
+    Node() noexcept = default;
+    Node(std::nullptr_t) noexcept {}
+
+    /// A scalar: bool and integers up to 32 bits signed are stored as Int32,
+    /// wider signed integers as Int64, 32 and 64 bits unsigned integers as UInt64,
+    /// float and double as Float, strings as String.
+    template<typename T, std::enable_if_t<Details::IsScalar<T>, int> = 0>
+    Node(T&& value)
+    {
+        Emplace(std::forward<T>(value));
+    }
+
+    /// An object: `Node n = { {"key", "value"}, {"other", 5}, {"sub", { {"k", 1.5f} }} };`
+    Node(std::initializer_list<KeyValue> children);
+
+    Node(Node const& other) = default;
+
+    Node(Node&& other) noexcept :
+        m_Value(std::move(other.m_Value))
+    {
+        other.m_Value.template emplace<std::monostate>();
+    }
+
+    ~Node() = default;
+
+    /// An empty object.
+    static Node object()
+    {
+        Node node;
+        node.m_Value.template emplace<Details::Children>();
+        return node;
+    }
+
+    /// Replaces the value. Strong exception guarantee; other may be a child of *this.
+    Node& operator=(Node const& other)
+    {
+        if (this != &other)
+        {
+            Node copy(other);
+            *this = std::move(copy);
+        }
+        return *this;
+    }
+
+    Node& operator=(Node&& other) noexcept
+    {
+        if (this != &other)
+        {
+            // Detach other's value before releasing ours: other may be one of our children.
+            Details::Value value(std::move(other.m_Value));
+            other.m_Value.template emplace<std::monostate>();
+            m_Value = std::move(value);
+        }
+        return *this;
+    }
+
+    /// Replaces the value with a scalar (see the scalar constructor).
+    template<typename T, std::enable_if_t<Details::IsScalar<T>, int> = 0>
+    Node& operator=(T&& value)
+    {
+        Node node(std::forward<T>(value));
+        m_Value = std::move(node.m_Value);
+        return *this;
+    }
+
+    /// Same as reset().
+    Node& operator=(std::nullptr_t) noexcept
+    {
+        reset();
+        return *this;
+    }
+
+    /// Removes the value: the node becomes Type::None. A child without value is
+    /// invisible in its parent, see erase() to really remove it.
+    void reset() noexcept
+    {
+        m_Value.template emplace<std::monostate>();
+    }
+
+    Type type() const noexcept
+    {
+        return has_value() ? static_cast<Type>(m_Value.index()) : Type::None;
+    }
+
+    /// True unless the node is Type::None.
+    bool has_value() const noexcept;
+
+    /// Same as has_value(): `if (auto& n = doc["key"]) ...`
+    explicit operator bool() const noexcept { return has_value(); }
+
+    bool is_none() const noexcept { return !has_value(); }
+    bool is_object() const noexcept { return type() == Type::Object; }
+    bool is_string() const noexcept { return type() == Type::String; }
+
+    /// Converts the value to T: std::string, std::string_view (String nodes only),
+    /// bool, any integer or floating point type, Color or Pointer.
+    /// Strings are parsed ("42", "0x2A", "1.5", "255 0 0 255"), numbers are range
+    /// checked, any scalar converts to std::string.
+    /// Throws TypeError when there is no value or no lossless conversion.
+    template<typename T>
+    T as() const
+    {
+        T result{};
+        if (!Convert(result))
+        {
+            throw TypeError(has_value()
+                ? std::string("EasyVDF: can't convert a ") + Details::TypeName(type()) + " value to " + Details::TargetName<T>()
+                : std::string("EasyVDF: can't convert a missing value (Type::None) to ") + Details::TargetName<T>());
+        }
+        return result;
+    }
+
+    /// Like as<T>(), but returns std::nullopt instead of throwing.
+    template<typename T>
+    std::optional<T> try_as() const
+    {
+        T result{};
+        if (Convert(result))
+            return result;
+        return std::nullopt;
+    }
+
+    /// Like as<T>() with T deduced from the default value, which is returned when
+    /// there is no value or no conversion. String defaults give a std::string:
+    /// `doc["name"].value_or("unknown")`, `doc["size"].value_or<uint64_t>(0)`.
+    template<typename T>
+    Details::ValueOrResult<T> value_or(T&& default_value) const
+    {
+        Details::ValueOrResult<T> result{};
+        if (Convert(result))
+            return result;
+        return Details::ValueOrResult<T>(std::forward<T>(default_value));
+    }
+
+    /// Number of children (0 if this is not an object). Linear in the number of children.
+    std::size_t size() const noexcept;
+
+    /// True if there is no child.
+    bool empty() const noexcept;
+
+    /// First child with this key, or a node without value if there is none (or if
+    /// this is not an object). Never throws, never modifies the tree.
+    Node const& operator[](std::string_view key) const noexcept;
+
+    /// First child with this key, for reading or writing. A missing key is created
+    /// lazily: it only becomes part of the tree once it is given a value.
+    /// Throws TypeError if this node holds a scalar.
+    Node& operator[](std::string_view key);
+
+    /// First child with this key, nullptr if there is none.
+    KeyValue const* find(std::string_view key) const noexcept;
+    KeyValue* find(std::string_view key) noexcept;
+
+    /// First child with this key, throws KeyError if there is none.
+    Node const& at(std::string_view key) const;
+    Node& at(std::string_view key);
+
+    bool contains(std::string_view key) const noexcept { return find(key) != nullptr; }
+
+    /// Number of children with this key.
+    std::size_t count(std::string_view key) const noexcept;
+
+    /// Every child with this key, in order: `for (auto& value : node.all("key"))`.
+    Details::ChildRange<true> all(std::string_view key) const;
+    Details::ChildRange<false> all(std::string_view key);
+
+    /// Appends a child, even if the key already exists (duplicate keys are legal).
+    /// A node without value becomes an object; throws TypeError on a scalar.
+    KeyValue& add(std::string key, Node value);
+
+    /// Appends an empty object.
+    KeyValue& add(std::string key);
+
+    /// Inserts a child before pos.
+    iterator insert(const_iterator pos, KeyValue child);
+
+    /// Removes the child at pos, returns the iterator to the next one.
+    iterator erase(const_iterator pos);
+
+    /// Removes every child with this key, returns how many were removed.
+    std::size_t erase(std::string_view key);
+
+    /// Removes every child. An object stays an (empty) object.
+    void clear() noexcept;
+
+    /// Stable sort of the children: comp(const KeyValue&, const KeyValue&).
+    template<typename Compare>
+    void sort(Compare comp);
+
+    /// Children of an object, in order; an empty range for anything else.
+    /// The elements are KeyValue: `for (auto& [key, value] : node)`.
+    iterator begin();
+    iterator end() noexcept;
+    const_iterator begin() const noexcept;
+    const_iterator end() const noexcept;
+    const_iterator cbegin() const noexcept;
+    const_iterator cend() const noexcept;
+
+    /// Deep comparison: same type, same value, same children in the same order.
+    friend bool operator==(Node const& l, Node const& r) noexcept;
+    friend bool operator!=(Node const& l, Node const& r) noexcept { return !(l == r); }
+
+private:
+    Details::Value m_Value;
+
+    static Node const& NullNode() noexcept
+    {
+        static const Node null;
+        return null;
+    }
+
+    Details::Children const* ChildrenPtr() const noexcept { return std::get_if<Details::Children>(&m_Value); }
+    Details::Children* ChildrenPtr() noexcept { return std::get_if<Details::Children>(&m_Value); }
+
+    // The children of this node, making it an object if it has no value.
+    Details::Children& MakeChildren();
+
+    // Moves the pending children that were given a value to the end of the items.
+    static void Promote(Details::Children& children);
+
+    template<typename T>
+    void Emplace(T&& value)
+    {
+        using D = std::decay_t<T>;
+        if constexpr (std::is_same_v<D, bool>)
+            m_Value.template emplace<int32_t>(value ? 1 : 0);
+        else if constexpr (std::is_floating_point_v<D>)
+            m_Value.template emplace<float>(static_cast<float>(value));
+        else if constexpr (std::is_integral_v<D> && std::is_signed_v<D>)
+        {
+            if constexpr (sizeof(D) <= sizeof(int32_t))
+                m_Value.template emplace<int32_t>(static_cast<int32_t>(value));
+            else
+                m_Value.template emplace<int64_t>(static_cast<int64_t>(value));
+        }
+        else if constexpr (std::is_integral_v<D>)
+        {
+            if constexpr (sizeof(D) < sizeof(int32_t))
+                m_Value.template emplace<int32_t>(static_cast<int32_t>(value));
+            else
+                m_Value.template emplace<uint64_t>(static_cast<uint64_t>(value));
+        }
+        else if constexpr (std::is_same_v<D, Color> || std::is_same_v<D, Pointer>)
+            m_Value.template emplace<D>(value);
+        else if constexpr (std::is_same_v<D, std::string>)
+            m_Value.template emplace<std::string>(std::forward<T>(value));
+        else
+            m_Value.template emplace<std::string>(std::string_view(value));
+    }
+
+    // Text form of a scalar, false for None and Object.
+    bool ToString(std::string& out) const
+    {
+        switch (type())
+        {
+            case Type::String : out = *std::get_if<std::string>(&m_Value); return true;
+            case Type::Int32  : out.clear(); Details::AppendInteger(out, *std::get_if<int32_t>(&m_Value)); return true;
+            case Type::Int64  : out.clear(); Details::AppendInteger(out, *std::get_if<int64_t>(&m_Value)); return true;
+            case Type::UInt64 : out.clear(); Details::AppendInteger(out, *std::get_if<uint64_t>(&m_Value)); return true;
+            case Type::Pointer: out.clear(); Details::AppendInteger(out, std::get_if<Pointer>(&m_Value)->value); return true;
+            case Type::Float  : out.clear(); Details::AppendFloat(out, *std::get_if<float>(&m_Value)); return true;
+            case Type::Color:
+            {
+                const Color color = *std::get_if<Color>(&m_Value);
+                out.clear();
+                Details::AppendInteger(out, static_cast<unsigned>(color.r)); out += ' ';
+                Details::AppendInteger(out, static_cast<unsigned>(color.g)); out += ' ';
+                Details::AppendInteger(out, static_cast<unsigned>(color.b)); out += ' ';
+                Details::AppendInteger(out, static_cast<unsigned>(color.a));
+                return true;
+            }
+            case Type::None:
+            case Type::Object:
+                break;
+        }
+        return false;
+    }
+
+    template<typename T>
+    bool Convert(T& out) const
+    {
+        static_assert(std::is_same_v<T, std::decay_t<T>>, "EasyVDF: as<T>() needs a value type");
+
+        const Type t = type();
+        if constexpr (std::is_same_v<T, std::string>)
+        {
+            return ToString(out);
+        }
+        else if constexpr (std::is_same_v<T, std::string_view>)
+        {
+            if (t != Type::String)
+                return false;
+            out = *std::get_if<std::string>(&m_Value);
+            return true;
+        }
+        else if constexpr (std::is_same_v<T, bool>)
+        {
+            switch (t)
+            {
+                case Type::Int32 : out = *std::get_if<int32_t>(&m_Value) != 0; return true;
+                case Type::Int64 : out = *std::get_if<int64_t>(&m_Value) != 0; return true;
+                case Type::UInt64: out = *std::get_if<uint64_t>(&m_Value) != 0; return true;
+                case Type::Float : out = *std::get_if<float>(&m_Value) != 0.f; return true;
+                case Type::String:
+                {
+                    const std::string_view s = Details::Trim(*std::get_if<std::string>(&m_Value));
+                    int64_t number = 0;
+                    if (Details::ParseInteger(s, number))
+                    {
+                        out = number != 0;
+                        return true;
+                    }
+                    if (Details::EqualsIgnoreCase(s, "true"))
+                    {
+                        out = true;
+                        return true;
+                    }
+                    if (Details::EqualsIgnoreCase(s, "false"))
+                    {
+                        out = false;
+                        return true;
+                    }
+                    return false;
+                }
+                default: return false;
+            }
+        }
+        else if constexpr (std::is_integral_v<T>)
+        {
+            static_assert(!Details::IsCharacter<T>, "EasyVDF: as<T>() does not support character types, use an integer or a string");
+            switch (t)
+            {
+                case Type::Int32  : return Details::IntegerCast(*std::get_if<int32_t>(&m_Value), out);
+                case Type::Int64  : return Details::IntegerCast(*std::get_if<int64_t>(&m_Value), out);
+                case Type::UInt64 : return Details::IntegerCast(*std::get_if<uint64_t>(&m_Value), out);
+                case Type::Pointer: return Details::IntegerCast(std::get_if<Pointer>(&m_Value)->value, out);
+                case Type::String : return Details::ParseInteger(*std::get_if<std::string>(&m_Value), out);
+                case Type::Float:
+                {
+                    // Only whole numbers convert to an integer.
+                    const float f = *std::get_if<float>(&m_Value);
+                    if (!(f == std::trunc(f)))
+                        return false;
+                    if (f < 0)
+                        return f >= -9223372036854775808.0f && Details::IntegerCast(static_cast<int64_t>(f), out);
+                    return f < 18446744073709551616.0f && Details::IntegerCast(static_cast<uint64_t>(f), out);
+                }
+                default: return false;
+            }
+        }
+        else if constexpr (std::is_floating_point_v<T>)
+        {
+            switch (t)
+            {
+                case Type::Int32 : out = static_cast<T>(*std::get_if<int32_t>(&m_Value)); return true;
+                case Type::Int64 : out = static_cast<T>(*std::get_if<int64_t>(&m_Value)); return true;
+                case Type::UInt64: out = static_cast<T>(*std::get_if<uint64_t>(&m_Value)); return true;
+                case Type::Float : out = static_cast<T>(*std::get_if<float>(&m_Value)); return true;
+                case Type::String:
+                {
+                    double parsed = 0;
+                    if (!Details::ParseDouble(*std::get_if<std::string>(&m_Value), parsed))
+                        return false;
+                    out = static_cast<T>(parsed);
+                    return true;
+                }
+                default: return false;
+            }
+        }
+        else if constexpr (std::is_same_v<T, Color>)
+        {
+            if (t == Type::Color)
+            {
+                out = *std::get_if<Color>(&m_Value);
+                return true;
+            }
+            if (t != Type::String)
+                return false;
+
+            // "r g b" or "r g b a"
+            std::string_view s = Details::Trim(*std::get_if<std::string>(&m_Value));
+            uint8_t channels[4] = { 0, 0, 0, 255 };
+            std::size_t count = 0;
+            while (!s.empty())
+            {
+                std::size_t length = 0;
+                while (length < s.size() && !Details::IsSpace(s[length]))
+                    ++length;
+                if (count == 4 || !Details::ParseInteger(s.substr(0, length), channels[count]))
+                    return false;
+                ++count;
+                s = Details::Trim(s.substr(length));
+            }
+            if (count < 3)
+                return false;
+            out = Color{ channels[0], channels[1], channels[2], channels[3] };
+            return true;
+        }
+        else if constexpr (std::is_same_v<T, Pointer>)
+        {
+            if (t == Type::Pointer)
+            {
+                out = *std::get_if<Pointer>(&m_Value);
+                return true;
+            }
+            return t == Type::String && Details::ParseInteger(*std::get_if<std::string>(&m_Value), out.value);
+        }
+        else
+        {
+            static_assert(std::is_same_v<T, std::string>,
+                "EasyVDF: unsupported type for as<T>() / try_as<T>() / value_or(): use std::string, std::string_view, bool, an integer or floating point type, Color or Pointer");
+            return false;
+        }
+    }
+};
+
+/////////////////////////////////////////////////////////////////////
+//
+//                      Reading and writing options
+//
+/////////////////////////////////////////////////////////////////////
+
+/// A `#include "file"` or `#base "file"` line of a text file.
+struct Directive
+{
+    enum class Kind { Include, Base };
+
+    Kind kind;
+    std::string path;
+};
+
+/// Options of parse() and load(). The defaults read any Steam file.
+struct ReadOptions
+{
+    /// Format::Auto detects the format; Format::Text forces text;
+    /// Format::Binary and Format::Vbkv both read any binary file.
+    Format format = Format::Auto;
+    /// Text: decode escape sequences (\n \t \\ \" ...) in quoted strings.
+    bool escapes = true;
+    /// VBKV: check the CRC32 of the file, throw ParseError on mismatch.
+    bool verify_crc = true;
+    /// Maximum object nesting, the root object counts for 1; deeper input is a
+    /// ParseError. The parsers themselves are not recursive, but writing, copying,
+    /// comparing and destroying a tree use stack space proportional to its depth:
+    /// keep this limit reasonable for untrusted input.
+    std::size_t max_depth = 128;
+    /// Streams are read by blocks of this many bytes.
+    std::size_t chunk_size = 16 * 1024;
+    /// Text: when set, receives the #include / #base directives of the file,
+    /// in order. EasyVDF parses them but never opens the files they name.
+    std::vector<Directive>* directives = nullptr;
+};
+
+/// Options of KeyValue::dump(), write() and save(). A Format converts implicitly:
+/// `doc.save("file.vdf", EasyVDF::Format::Binary)`.
+struct WriteOptions
+{
+    Format format = Format::Text;
+    /// Text: encode `\`, `"`, new lines and tabs as escape sequences.
+    bool escapes = true;
+
+    WriteOptions() = default;
+    WriteOptions(Format f) : format(f) {}
+};
+
+/////////////////////////////////////////////////////////////////////
+//
+//                            KeyValue
+//
+/////////////////////////////////////////////////////////////////////
+
+/// A Node with its key: the element type of an object, and the type of a whole
+/// document (the root key and its object).
+///
+/// Copying or moving a KeyValue transfers the key with the value. Assigning a
+/// Node or a scalar to it only replaces the value: `doc["a"] = doc["b"]` never
+/// renames "a". A moved-from KeyValue has an empty key and no value.
+class KeyValue : public Node
+{
+    std::string m_Key;
+    std::unique_ptr<std::string> m_Condition;
+
+public:
+    /// Empty key, no value.
+    KeyValue() noexcept = default;
+
+    /// An empty object: `KeyValue doc("AppState"); doc["appid"] = 440;`
+    explicit KeyValue(std::string key) :
+        Node(Node::object()), m_Key(std::move(key))
+    {}
+
+    /// `KeyValue("appid", 440)`, `KeyValue("UserConfig", { {"language", "english"} })`
+    KeyValue(std::string key, Node value) :
+        Node(std::move(value)), m_Key(std::move(key))
+    {}
+
+    KeyValue(KeyValue const& other) :
+        Node(other), m_Key(other.m_Key),
+        m_Condition(other.m_Condition ? std::make_unique<std::string>(*other.m_Condition) : nullptr)
+    {}
+
+    KeyValue(KeyValue&& other) noexcept :
+        Node(std::move(static_cast<Node&>(other))), m_Key(std::move(other.m_Key)), m_Condition(std::move(other.m_Condition))
+    {
+        other.m_Key.clear();
+    }
+
+    KeyValue& operator=(KeyValue const& other)
+    {
+        if (this != &other)
+        {
+            KeyValue copy(other);
+            *this = std::move(copy);
+        }
+        return *this;
+    }
+
+    KeyValue& operator=(KeyValue&& other) noexcept
+    {
+        if (this != &other)
+        {
+            // other may be one of our children: take everything out of it
+            // before our current value (and other with it) is released.
+            std::string key(std::move(other.m_Key));
+            other.m_Key.clear();
+            std::unique_ptr<std::string> condition(std::move(other.m_Condition));
+            Node::operator=(std::move(static_cast<Node&>(other)));
+            m_Key = std::move(key);
+            m_Condition = std::move(condition);
+        }
+        return *this;
+    }
+
+    /// Assigning a value keeps the key: `kv = 5;`, `kv = "text";`, `kv = other_node;`
+    using Node::operator=;
+
+    std::string const& key() const noexcept { return m_Key; }
+    void set_key(std::string key) noexcept { m_Key = std::move(key); }
+
+    /// The conditional of a text entry, without brackets: "$WIN32" for
+    /// `"key" "value" [$WIN32]`, empty if there is none. Conditionals are kept and
+    /// written back in text, never evaluated, and dropped by the binary formats.
+    std::string_view condition() const noexcept { return m_Condition ? std::string_view(*m_Condition) : std::string_view(); }
+
+    void set_condition(std::string_view condition)
+    {
+        if (condition.empty())
+            m_Condition.reset();
+        else
+            m_Condition = std::make_unique<std::string>(condition);
+    }
+
+    /// Serializes the document. The value must be an object, else WriteError is thrown.
+    std::string dump(WriteOptions const& options = {}) const;
+
+    /// dump() as text.
+    std::string to_text() const { return dump(Format::Text); }
+
+    /// dump() as binary: Format::Binary or Format::Vbkv.
+    std::string to_binary(Format format = Format::Binary) const { return dump(format); }
+
+    /// Writes dump() to a stream (open it in binary mode).
+    void write(std::ostream& os, WriteOptions const& options = {}) const;
+
+    /// Writes dump() to a file. Throws IoError if the file can't be written.
+    void save(std::filesystem::path const& path, WriteOptions const& options = {}) const;
+
+    /// Structured bindings: `auto& [key, value] = kv;` (key is const, value is the Node).
+    template<std::size_t I>
+    auto& get() & noexcept
+    {
+        if constexpr (I == 0)
+            return std::as_const(m_Key);
+        else
+            return static_cast<Node&>(*this);
+    }
+
+    template<std::size_t I>
+    auto& get() const& noexcept
+    {
+        if constexpr (I == 0)
+            return m_Key;
+        else
+            return static_cast<Node const&>(*this);
+    }
+
+    template<std::size_t I>
+    auto&& get() && noexcept
+    {
+        if constexpr (I == 0)
+            return std::move(std::as_const(m_Key));
+        else
+            return static_cast<Node&&>(*this);
+    }
+
+    /// Same key, same condition and same value (deep).
+    friend bool operator==(KeyValue const& l, KeyValue const& r) noexcept
+    {
+        return l.m_Key == r.m_Key && l.condition() == r.condition() && static_cast<Node const&>(l) == static_cast<Node const&>(r);
+    }
+
+    friend bool operator!=(KeyValue const& l, KeyValue const& r) noexcept { return !(l == r); }
+};
+
+/// Parses a document held in memory (text or binary, see ReadOptions::format).
+/// Throws ParseError.
+KeyValue parse(std::string_view data, ReadOptions const& options = {});
+
+/// Parses a document from a stream, read sequentially to its end: pipes and
+/// std::cin work. Open files in binary mode. Throws ParseError.
+KeyValue parse(std::istream& is, ReadOptions const& options = {});
+
+/// Parses a file. Throws IoError if it can't be opened, ParseError if it is malformed.
+KeyValue load(std::filesystem::path const& path, ReadOptions const& options = {});
+
+/// Prints a value: the text of a scalar (`std::cout << doc["name"]`), the
+/// `{ ... }` block of an object, nothing for a node without value.
+std::ostream& operator<<(std::ostream& os, Node const& node);
+
+/// Prints an entry as text: a whole document, or `"key"  "value"` for a scalar.
+std::ostream& operator<<(std::ostream& os, KeyValue const& entry);
+
+/////////////////////////////////////////////////////////////////////
+//
+//                       Iterators and ranges
+//
+/////////////////////////////////////////////////////////////////////
+namespace Details {
+
+inline Children::Children() noexcept = default;
+inline Children::Children(Children&&) noexcept = default;
+inline Children& Children::operator=(Children&&) noexcept = default;
+inline Children::~Children() = default;
+
+inline Children::Children(Children const& other) :
+    implicit(other.implicit)
+{
+    // Children without value are not part of the tree: they are not copied.
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < other.slots(); ++i)
+        count += other.slot(i)->has_value() ? 1 : 0;
+
+    items.reserve(count);
+    for (std::size_t i = 0; i < other.slots(); ++i)
+    {
+        if (other.slot(i)->has_value())
+            items.push_back(std::make_unique<KeyValue>(*other.slot(i)));
+    }
+}
+
+inline Children& Children::operator=(Children const& other)
+{
+    if (this != &other)
+    {
+        Children copy(other);
+        *this = std::move(copy);
+    }
+    return *this;
+}
+
+inline KeyValue* Children::slot(std::size_t i) const noexcept
+{
+    return i < items.size() ? items[i].get() : pending[i - items.size()].get();
+}
+
+/// Forward iterator over the children of an object that have a value,
+/// optionally restricted to one key. Stays valid when children are appended.
+template<bool Const>
+class ChildIterator
+{
+    static constexpr std::size_t End = static_cast<std::size_t>(-1);
+
+    Children const* m_Children = nullptr;
+    std::size_t m_Index = End;
+    std::string const* m_Key = nullptr;
+
+    friend class ::EasyVDF::Node;
+    template<bool> friend class ChildIterator;
+    template<bool> friend class ChildRange;
+
+    ChildIterator(Children const* children, std::size_t index, std::string const* key) noexcept :
+        m_Children(children), m_Index(index), m_Key(key)
+    {
+        Settle();
+    }
+
+    // Moves forward to the first visible child at or after m_Index.
+    void Settle() noexcept
+    {
+        if (m_Children == nullptr)
+        {
+            m_Index = End;
+            return;
+        }
+        for (; m_Index != End; ++m_Index)
+        {
+            if (m_Index >= m_Children->slots())
+            {
+                m_Index = End;
+                return;
+            }
+            KeyValue const* child = m_Children->slot(m_Index);
+            if (child->has_value() && (m_Key == nullptr || child->key() == *m_Key))
+                return;
         }
     }
 
-    // Like std::getline: reaching EOF after extracting at least one character
-    // is a success, the last line is valid even without a trailing EOL.
-    if (!buffer.empty() && is.eof() && !is.bad())
-        is.clear(std::ios_base::eofbit);
+public:
+    using iterator_category = std::forward_iterator_tag;
+    using value_type = KeyValue;
+    using difference_type = std::ptrdiff_t;
+    using reference = std::conditional_t<Const, KeyValue const&, KeyValue&>;
+    using pointer = std::conditional_t<Const, KeyValue const*, KeyValue*>;
 
-    return is;
-}
+    ChildIterator() noexcept = default;
 
-inline void SkipSpaces(const char*& s, const char*& e)
-{
-    while (s != e)
+    /// iterator converts to const_iterator.
+    template<bool OtherConst, std::enable_if_t<Const && !OtherConst, int> = 0>
+    ChildIterator(ChildIterator<OtherConst> const& other) noexcept :
+        m_Children(other.m_Children), m_Index(other.m_Index), m_Key(other.m_Key)
+    {}
+
+    reference operator*() const noexcept { return *m_Children->slot(m_Index); }
+    pointer operator->() const noexcept { return m_Children->slot(m_Index); }
+
+    ChildIterator& operator++() noexcept
     {
-        char c = *s;
-        if (c != ' ' && c != '\t')
-            break;
-
-        ++s;
+        ++m_Index;
+        Settle();
+        return *this;
     }
-    // Trim the EOL and any trailing spaces/tabs. Stops when the range is empty
-    // (never reads before s), so a line made only of blanks becomes empty.
-    while (e != s)
+
+    ChildIterator operator++(int) noexcept
     {
-        char c = *(e-1);
-        if (c != '\n' && c != '\r' && c != ' ' && c != '\t')
-            break;
+        ChildIterator previous(*this);
+        ++*this;
+        return previous;
+    }
 
-        --e;
+    friend bool operator==(ChildIterator const& l, ChildIterator const& r) noexcept { return l.m_Index == r.m_Index; }
+    friend bool operator!=(ChildIterator const& l, ChildIterator const& r) noexcept { return l.m_Index != r.m_Index; }
+};
+
+/// The children of an object that share a key, see Node::all().
+template<bool Const>
+class ChildRange
+{
+    Children const* m_Children;
+    std::string m_Key;
+
+    friend class ::EasyVDF::Node;
+
+    ChildRange(Children const* children, std::string_view key) :
+        m_Children(children), m_Key(key)
+    {}
+
+public:
+    using iterator = ChildIterator<Const>;
+
+    iterator begin() const noexcept { return iterator(m_Children, 0, &m_Key); }
+    iterator end() const noexcept { return iterator(); }
+    bool empty() const noexcept { return begin() == end(); }
+    std::size_t size() const noexcept { return static_cast<std::size_t>(std::distance(begin(), end())); }
+
+    /// The first element; the range must not be empty.
+    typename iterator::reference front() const noexcept { return *begin(); }
+};
+
+} // namespace Details
+
+/////////////////////////////////////////////////////////////////////
+//
+//                      Node implementation
+//
+/////////////////////////////////////////////////////////////////////
+
+inline Node::Node(std::initializer_list<KeyValue> children)
+{
+    Details::Children& c = m_Value.template emplace<Details::Children>();
+    c.items.reserve(children.size());
+    for (KeyValue const& child : children)
+        c.items.push_back(std::make_unique<KeyValue>(child));
+}
+
+inline bool Node::has_value() const noexcept
+{
+    switch (m_Value.index())
+    {
+        case 0:
+            return false;
+
+        case 1:
+        {
+            Details::Children const& c = *ChildrenPtr();
+            if (!c.implicit)
+                return true;
+
+            for (std::size_t i = 0; i < c.slots(); ++i)
+            {
+                if (c.slot(i)->has_value())
+                    return true;
+            }
+            return false;
+        }
+
+        default:
+            return true;
     }
 }
 
-/// <summary>
-/// Appends bytes from [b, e) to buffer until buffer holds max_size bytes or [b, e) is consumed.
-/// </summary>
-inline void ReadBinaryBytes(const char*& b, const char* e, std::string& buffer, size_t max_size)
+inline std::size_t Node::size() const noexcept
 {
-    const size_t missing = max_size > buffer.length() ? max_size - buffer.length() : 0;
-    const size_t available = static_cast<size_t>(e - b);
-    const size_t left_count = missing < available ? missing : available;
-    buffer.append(b, left_count);
-    b += left_count;
+    return static_cast<std::size_t>(std::distance(begin(), end()));
 }
 
-// Binary VDF values are little-endian, decode them byte by byte (no aliasing, no alignment requirement, host endianness independent).
-inline uint32_t LoadLittleEndian32(const char* p)
+inline bool Node::empty() const noexcept
+{
+    return begin() == end();
+}
+
+inline KeyValue const* Node::find(std::string_view key) const noexcept
+{
+    if (Details::Children const* c = ChildrenPtr())
+    {
+        for (std::size_t i = 0; i < c->slots(); ++i)
+        {
+            KeyValue const* child = c->slot(i);
+            if (child->key() == key && child->has_value())
+                return child;
+        }
+    }
+    return nullptr;
+}
+
+inline KeyValue* Node::find(std::string_view key) noexcept
+{
+    return const_cast<KeyValue*>(std::as_const(*this).find(key));
+}
+
+inline Node const& Node::operator[](std::string_view key) const noexcept
+{
+    KeyValue const* child = find(key);
+    return child != nullptr ? static_cast<Node const&>(*child) : NullNode();
+}
+
+inline Details::Children& Node::MakeChildren()
+{
+    if (m_Value.index() == 0)
+    {
+        Details::Children& c = m_Value.template emplace<Details::Children>();
+        c.implicit = true;
+        return c;
+    }
+    if (Details::Children* c = ChildrenPtr())
+        return *c;
+
+    throw TypeError(std::string("EasyVDF: a ") + Details::TypeName(type()) + " value has no children");
+}
+
+inline void Node::Promote(Details::Children& children)
+{
+    for (auto it = children.pending.begin(); it != children.pending.end();)
+    {
+        if ((*it)->has_value())
+        {
+            children.items.push_back(std::move(*it));
+            it = children.pending.erase(it);
+            children.implicit = false;
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+inline Node& Node::operator[](std::string_view key)
+{
+    Details::Children& c = MakeChildren();
+    Promote(c);
+
+    for (std::size_t i = 0; i < c.slots(); ++i)
+    {
+        KeyValue* child = c.slot(i);
+        if (child->key() == key)
+            return *child;
+    }
+
+    // Not there: keep a child without value aside. It joins the tree when it is given one.
+    auto child = std::make_unique<KeyValue>();
+    child->set_key(std::string(key));
+    c.pending.push_back(std::move(child));
+    return *c.pending.back();
+}
+
+inline Node const& Node::at(std::string_view key) const
+{
+    if (KeyValue const* child = find(key))
+        return *child;
+
+    throw KeyError("EasyVDF: key \"" + std::string(key) + "\" not found");
+}
+
+inline Node& Node::at(std::string_view key)
+{
+    return const_cast<Node&>(std::as_const(*this).at(key));
+}
+
+inline std::size_t Node::count(std::string_view key) const noexcept
+{
+    std::size_t result = 0;
+    if (Details::Children const* c = ChildrenPtr())
+    {
+        for (std::size_t i = 0; i < c->slots(); ++i)
+        {
+            KeyValue const* child = c->slot(i);
+            result += (child->key() == key && child->has_value()) ? 1 : 0;
+        }
+    }
+    return result;
+}
+
+inline Details::ChildRange<true> Node::all(std::string_view key) const
+{
+    return Details::ChildRange<true>(ChildrenPtr(), key);
+}
+
+inline Details::ChildRange<false> Node::all(std::string_view key)
+{
+    if (Details::Children* c = ChildrenPtr())
+        Promote(*c);
+    return Details::ChildRange<false>(ChildrenPtr(), key);
+}
+
+inline KeyValue& Node::add(std::string key, Node value)
+{
+    auto child = std::make_unique<KeyValue>(std::move(key), std::move(value));
+    Details::Children& c = MakeChildren();
+    Promote(c);
+    c.items.push_back(std::move(child));
+    c.implicit = false;
+    return *c.items.back();
+}
+
+inline KeyValue& Node::add(std::string key)
+{
+    return add(std::move(key), Node::object());
+}
+
+inline Node::iterator Node::insert(const_iterator pos, KeyValue child)
+{
+    auto owned = std::make_unique<KeyValue>(std::move(child));
+    Details::Children& c = MakeChildren();
+    Promote(c);
+    const std::size_t index = (std::min)(pos.m_Index, c.items.size());
+    c.items.insert(c.items.begin() + static_cast<std::ptrdiff_t>(index), std::move(owned));
+    c.implicit = false;
+    return iterator(&c, index, nullptr);
+}
+
+inline Node::iterator Node::erase(const_iterator pos)
+{
+    Details::Children* c = ChildrenPtr();
+    if (c == nullptr || pos.m_Index >= c->slots())
+        return end();
+
+    if (pos.m_Index < c->items.size())
+        c->items.erase(c->items.begin() + static_cast<std::ptrdiff_t>(pos.m_Index));
+    else
+        c->pending.erase(c->pending.begin() + static_cast<std::ptrdiff_t>(pos.m_Index - c->items.size()));
+
+    return iterator(c, pos.m_Index, pos.m_Key);
+}
+
+inline std::size_t Node::erase(std::string_view key)
+{
+    std::size_t erased = 0;
+    if (Details::Children* c = ChildrenPtr())
+    {
+        // key may point into a child that is about to be destroyed.
+        const std::string owned_key(key);
+        auto matches = [&](std::unique_ptr<KeyValue> const& child)
+        {
+            if (child->key() != owned_key)
+                return false;
+            erased += child->has_value() ? 1 : 0;
+            return true;
+        };
+        c->items.erase(std::remove_if(c->items.begin(), c->items.end(), matches), c->items.end());
+        c->pending.erase(std::remove_if(c->pending.begin(), c->pending.end(), matches), c->pending.end());
+    }
+    return erased;
+}
+
+inline void Node::clear() noexcept
+{
+    if (Details::Children* c = ChildrenPtr())
+    {
+        c->items.clear();
+        c->pending.clear();
+    }
+}
+
+template<typename Compare>
+void Node::sort(Compare comp)
+{
+    if (Details::Children* c = ChildrenPtr())
+    {
+        Promote(*c);
+        std::stable_sort(c->items.begin(), c->items.end(),
+            [&comp](std::unique_ptr<KeyValue> const& l, std::unique_ptr<KeyValue> const& r)
+            {
+                return comp(std::as_const(*l), std::as_const(*r));
+            });
+    }
+}
+
+inline Node::iterator Node::begin()
+{
+    if (Details::Children* c = ChildrenPtr())
+        Promote(*c);
+    return iterator(ChildrenPtr(), 0, nullptr);
+}
+
+inline Node::iterator Node::end() noexcept { return iterator(); }
+inline Node::const_iterator Node::begin() const noexcept { return const_iterator(ChildrenPtr(), 0, nullptr); }
+inline Node::const_iterator Node::end() const noexcept { return const_iterator(); }
+inline Node::const_iterator Node::cbegin() const noexcept { return begin(); }
+inline Node::const_iterator Node::cend() const noexcept { return end(); }
+
+inline bool operator==(Node const& l, Node const& r) noexcept
+{
+    const Type type = l.type();
+    if (type != r.type())
+        return false;
+
+    switch (type)
+    {
+        case Type::None:
+            return true;
+
+        case Type::Object:
+        {
+            auto li = l.begin(), le = l.end();
+            auto ri = r.begin(), re = r.end();
+            for (; li != le && ri != re; ++li, ++ri)
+            {
+                if (!(*li == *ri))
+                    return false;
+            }
+            return li == le && ri == re;
+        }
+
+        case Type::String : return *std::get_if<std::string>(&l.m_Value) == *std::get_if<std::string>(&r.m_Value);
+        case Type::Int32  : return *std::get_if<int32_t>(&l.m_Value) == *std::get_if<int32_t>(&r.m_Value);
+        case Type::Float  : return *std::get_if<float>(&l.m_Value) == *std::get_if<float>(&r.m_Value);
+        case Type::Pointer: return *std::get_if<Pointer>(&l.m_Value) == *std::get_if<Pointer>(&r.m_Value);
+        case Type::Color  : return *std::get_if<Color>(&l.m_Value) == *std::get_if<Color>(&r.m_Value);
+        case Type::UInt64 : return *std::get_if<uint64_t>(&l.m_Value) == *std::get_if<uint64_t>(&r.m_Value);
+        case Type::Int64  : return *std::get_if<int64_t>(&l.m_Value) == *std::get_if<int64_t>(&r.m_Value);
+    }
+    return false;
+}
+
+/////////////////////////////////////////////////////////////////////
+//
+//                         Parsers, writers
+//
+/////////////////////////////////////////////////////////////////////
+namespace Details {
+
+static constexpr char VbkvMagic[4] = { 'V', 'B', 'K', 'V' };
+
+enum BinaryNodeType : unsigned char
+{
+    BinaryObject       = 0,
+    BinaryString       = 1,
+    BinaryInt32        = 2,
+    BinaryFloat        = 3,
+    BinaryPointer      = 4,
+    BinaryWideString   = 5,
+    BinaryColor        = 6,
+    BinaryUInt64       = 7,
+    BinaryEnd          = 8,
+    BinaryBlob         = 9,
+    BinaryInt64        = 10,
+    BinaryAlternateEnd = 11,
+};
+
+/// Sequential byte source over a memory range or a stream read by chunks.
+/// Never seeks, so it works on pipes.
+class Reader
+{
+    std::istream* m_Stream = nullptr;
+    std::string m_Buffer;
+    const char* m_Current = nullptr;
+    const char* m_End = nullptr;
+
+    // Bytes given back with Unread(), served before the rest of the input.
+    std::string m_Pushback;
+    const char* m_SavedCurrent = nullptr;
+    const char* m_SavedEnd = nullptr;
+    bool m_InPushback = false;
+
+    bool m_CrcEnabled = false;
+    uint32_t m_Crc = 0;
+    const char* m_CrcMark = nullptr;
+
+    bool Fill()
+    {
+        if (m_InPushback)
+        {
+            m_InPushback = false;
+            m_Current = m_SavedCurrent;
+            m_End = m_SavedEnd;
+            if (m_Current != m_End)
+                return true;
+        }
+
+        if (m_Stream == nullptr)
+            return false;
+
+        if (m_CrcEnabled)
+            m_Crc = Crc32Update(m_Crc, m_CrcMark, static_cast<std::size_t>(m_Current - m_CrcMark));
+
+        m_Stream->read(&m_Buffer[0], static_cast<std::streamsize>(m_Buffer.size()));
+        m_Current = m_Buffer.data();
+        m_End = m_Current + m_Stream->gcount();
+        m_CrcMark = m_Current;
+        return m_Current != m_End;
+    }
+
+public:
+    explicit Reader(std::string_view data) noexcept :
+        m_Current(data.data()), m_End(data.data() + data.size())
+    {}
+
+    Reader(std::istream& is, std::size_t chunk_size) :
+        m_Stream(&is), m_Buffer((std::max)(chunk_size, std::size_t(1)), '\0')
+    {
+        m_Current = m_End = m_Buffer.data();
+    }
+
+    Reader(Reader const&) = delete;
+    Reader& operator=(Reader const&) = delete;
+
+    /// Next byte without consuming it, -1 at the end of the input.
+    int Peek()
+    {
+        if (m_Current == m_End && !Fill())
+            return -1;
+        return static_cast<unsigned char>(*m_Current);
+    }
+
+    /// Next byte, -1 at the end of the input.
+    int Get()
+    {
+        const int c = Peek();
+        if (c >= 0)
+            ++m_Current;
+        return c;
+    }
+
+    /// Bytes available without reading more; call Peek() first to refill.
+    const char* Data() const noexcept { return m_Current; }
+    std::size_t Available() const noexcept { return static_cast<std::size_t>(m_End - m_Current); }
+    void Advance(std::size_t count) noexcept { m_Current += count; }
+
+    /// Gives back bytes that were consumed: they are the next ones read.
+    void Unread(std::string_view bytes)
+    {
+        if (bytes.empty())
+            return;
+
+        m_Pushback.assign(bytes);
+        m_SavedCurrent = m_Current;
+        m_SavedEnd = m_End;
+        m_Current = m_Pushback.data();
+        m_End = m_Current + m_Pushback.size();
+        m_InPushback = true;
+    }
+
+    /// Starts computing the CRC32 of every byte consumed from now on.
+    void StartCrc() noexcept
+    {
+        m_CrcEnabled = true;
+        m_Crc = 0;
+        m_CrcMark = m_Current;
+    }
+
+    uint32_t Crc() const noexcept
+    {
+        return Crc32Update(m_Crc, m_CrcMark, static_cast<std::size_t>(m_Current - m_CrcMark));
+    }
+};
+
+inline uint32_t LoadLittleEndian32(const char* p) noexcept
 {
     const unsigned char* u = reinterpret_cast<const unsigned char*>(p);
     return static_cast<uint32_t>(u[0])
@@ -154,1732 +1665,893 @@ inline uint32_t LoadLittleEndian32(const char* p)
          | (static_cast<uint32_t>(u[3]) << 24);
 }
 
-inline uint64_t LoadLittleEndian64(const char* p)
+inline uint64_t LoadLittleEndian64(const char* p) noexcept
 {
     return static_cast<uint64_t>(LoadLittleEndian32(p)) | (static_cast<uint64_t>(LoadLittleEndian32(p + 4)) << 32);
 }
 
-template<typename T, typename U>
-inline T BitCast(U value)
+inline void AppendLittleEndian32(std::string& out, uint32_t value)
 {
-    static_assert(sizeof(T) == sizeof(U), "BitCast requires types of the same size");
-    T result;
-    std::memcpy(&result, &value, sizeof(T));
+    const char bytes[4] = {
+        static_cast<char>(value & 0xFFu), static_cast<char>((value >> 8) & 0xFFu),
+        static_cast<char>((value >> 16) & 0xFFu), static_cast<char>((value >> 24) & 0xFFu),
+    };
+    out.append(bytes, sizeof(bytes));
+}
+
+inline void AppendLittleEndian64(std::string& out, uint64_t value)
+{
+    AppendLittleEndian32(out, static_cast<uint32_t>(value & 0xFFFFFFFFu));
+    AppendLittleEndian32(out, static_cast<uint32_t>(value >> 32));
+}
+
+template<typename To, typename From>
+To BitCast(From value) noexcept
+{
+    static_assert(sizeof(To) == sizeof(From), "BitCast requires types of the same size");
+    To result;
+    std::memcpy(&result, &value, sizeof(To));
     return result;
 }
 
-/// <summary>
-/// Appends the bytes in [b, e) up to the null terminator to str.
-/// A binary string is an opaque byte sequence ended by '\0' (UTF-8 is not
-/// validated, a null byte can never appear inside a multi-byte UTF-8 sequence),
-/// so a string split across several chunks is rebuilt by calling this function
-/// again with the next chunk and the same str.
-/// Returns  0 when the string is read to its end (b points past the null char)
-/// Returns -1 when the string was partially read (b == e, all bytes were appended)
-/// Returns -2 is reserved for invalid codepoints and is never returned.
-/// </summary>
-inline int ParseBinaryString(const char*& b, const char* e, std::string& str)
+inline std::string Hex32(uint32_t value)
 {
-    if (b == e)
-        return -1;
-
-    const char* string_end = static_cast<const char*>(std::memchr(b, '\0', static_cast<size_t>(e - b)));
-    if (string_end == nullptr)
-    {
-        str.append(b, e);
-        b = e;
-        return -1;
-    }
-
-    str.append(b, string_end);
-    b = string_end + 1;
-    return 0;
+    static const char digits[] = "0123456789abcdef";
+    std::string text = "0x";
+    for (int shift = 28; shift >= 0; shift -= 4)
+        text += digits[(value >> shift) & 0xFu];
+    return text;
 }
 
-/// <summary>
-/// Makes sure [b, e) is not empty: when it is, reads the next chunk of is into buffer
-/// (buffer must not be empty). Returns false on end of stream.
-/// </summary>
-inline bool FillBinaryBuffer(std::istream& is, std::string& buffer, const char*& b, const char*& e)
+/////////////////////////////////////////////////////////////////////
+// Binary parser
+/////////////////////////////////////////////////////////////////////
+class BinaryParser
 {
-    if (b != e)
+    Reader& m_Reader;
+    ReadOptions const& m_Options;
+    std::string m_Scratch;
+
+    // Reads a null terminated string; a binary string is an opaque byte sequence.
+    bool ReadString(std::string& out)
+    {
+        out.clear();
+        while (m_Reader.Peek() >= 0)
+        {
+            const char* data = m_Reader.Data();
+            const std::size_t available = m_Reader.Available();
+            const char* terminator = static_cast<const char*>(std::memchr(data, '\0', available));
+            if (terminator != nullptr)
+            {
+                out.append(data, terminator);
+                m_Reader.Advance(static_cast<std::size_t>(terminator - data) + 1);
+                return true;
+            }
+            out.append(data, available);
+            m_Reader.Advance(available);
+        }
+        return false;
+    }
+
+    bool ReadBytes(char* out, std::size_t count)
+    {
+        while (count > 0)
+        {
+            if (m_Reader.Peek() < 0)
+                return false;
+
+            const std::size_t n = (std::min)(count, m_Reader.Available());
+            std::memcpy(out, m_Reader.Data(), n);
+            m_Reader.Advance(n);
+            out += n;
+            count -= n;
+        }
         return true;
-
-    is.read(&buffer[0], static_cast<std::streamsize>(buffer.length()));
-    b = buffer.data();
-    e = b + is.gcount();
-    return b != e;
-}
-
-/// <summary>
-/// Reads a whole null terminated binary string into str, reading more chunks as needed.
-/// Returns false if the stream ended before the null terminator.
-/// </summary>
-inline bool ReadFullBinaryString(std::istream& is, std::string& buffer, const char*& b, const char*& e, std::string& str)
-{
-    str.clear();
-    while (FillBinaryBuffer(is, buffer, b, e))
-    {
-        if (ParseBinaryString(b, e, str) == 0)
-            return true;
     }
-    return false;
-}
 
-/// <summary>
-/// Reads exactly count bytes into out, reading more chunks as needed.
-/// Returns false if the stream ended before count bytes were read.
-/// </summary>
-inline bool ReadFullBinaryBytes(std::istream& is, std::string& buffer, const char*& b, const char*& e, std::string& out, size_t count)
-{
-    out.clear();
-    while (out.length() < count)
+    // Parses the children of root, down to the end marker of root. Not recursive:
+    // the objects being parsed are kept in a stack, nested input can't overflow ours.
+    void ParseObjects(KeyValue& root)
     {
-        if (!FillBinaryBuffer(is, buffer, b, e))
-            return false;
+        std::vector<KeyValue*> open{ &root };
+        std::string key;
+        while (!open.empty())
+        {
+            KeyValue& object = *open.back();
+            std::string const& name = object.key();
 
-        ReadBinaryBytes(b, e, out, count);
-    }
-    return true;
-}
+            const int type = m_Reader.Get();
+            if (type < 0)
+                throw ParseError("Premature end of file: missing end marker of binary object \"" + name + "\"");
 
-/// <summary>
-/// Parses a double quoted text string.
-/// Returns  0 when the string was read up to its closing quote
-/// Returns -1 when no opening quote was found
-/// Returns -2 when no closing quote was found
-/// Returns -3 is reserved for invalid codepoints, it is never returned since
-///            strings are not UTF-8 validated (see below).
-/// </summary>
-inline int ParseString(const char*& b, const char* e, std::string& str)
-{
-    bool has_escape = false;
-    const char* string_start = nullptr;
-    while (b != e)
-    {
-        char c = *b++;
-        if (has_escape)
-        {
-            has_escape = false;
-        }
-        else if (c == '\\')
-        {
-            has_escape = true;
-        }
-        else if (c == '"')
-        {
-            string_start = b;
-            break;
-        }
-    }
-    // Strings are opaque byte sequences: UTF-8 is not validated. Only the ASCII
-    // bytes '"' and '\\' are significant, and they can never appear inside a
-    // multi-byte UTF-8 sequence, so scanning byte by byte is always safe.
-    while (b != e)
-    {
-        char c = *b++;
-        if (has_escape)
-        {// Escaped char, including an escaped '\\'
-            has_escape = false;
-            continue;
-        }
-        if (c == '\\')
-        {
-            has_escape = true;
-            continue;
-        }
-        if (c == '"')
-        {
-            str.assign(string_start, b - 1);
-            return 0;
+            switch (type)
+            {
+                case BinaryEnd:
+                case BinaryAlternateEnd:
+                    // Steam writes 0x08 and Source 2 writes 0x0B; neither is a
+                    // node type of the other, so both always end an object.
+                    open.pop_back();
+                    continue;
+
+                case BinaryObject:
+                case BinaryString:
+                case BinaryInt32:
+                case BinaryFloat:
+                case BinaryPointer:
+                case BinaryColor:
+                case BinaryUInt64:
+                case BinaryInt64:
+                    break;
+
+                case BinaryWideString:
+                case BinaryBlob:
+                    // The known implementations disagree on the encoding of these
+                    // two types and Valve's public code does not read them.
+                    throw ParseError("Unsupported binary VDF node type " + std::to_string(type)
+                        + (type == BinaryWideString ? " (WideString)" : " (binary blob)") + " in binary object \"" + name + "\"");
+
+                default:
+                    throw ParseError("Unknown binary VDF node type " + std::to_string(type) + " in binary object \"" + name + "\"");
+            }
+
+            if (!ReadString(key))
+                throw ParseError("Premature end of file while parsing a key of binary object \"" + name + "\"");
+
+            char raw[8];
+            switch (type)
+            {
+                case BinaryObject:
+                    if (open.size() >= m_Options.max_depth)
+                        throw ParseError("Binary object \"" + key + "\" is nested deeper than the limit of " + std::to_string(m_Options.max_depth) + " levels");
+
+                    open.push_back(&object.add(std::move(key)));
+                    break;
+
+                case BinaryString:
+                    if (!ReadString(m_Scratch))
+                        throw ParseError("Premature end of file while parsing the value of key \"" + key + "\"");
+
+                    object.add(std::move(key), Node(m_Scratch));
+                    break;
+
+                default:
+                {
+                    const std::size_t size = (type == BinaryInt64 || type == BinaryUInt64) ? 8 : 4;
+                    if (!ReadBytes(raw, size))
+                        throw ParseError("Premature end of file while parsing the value of key \"" + key + "\"");
+
+                    switch (type)
+                    {
+                        case BinaryInt32  : object.add(std::move(key), Node(BitCast<int32_t>(LoadLittleEndian32(raw)))); break;
+                        case BinaryFloat  : object.add(std::move(key), Node(BitCast<float>(LoadLittleEndian32(raw)))); break;
+                        case BinaryPointer: object.add(std::move(key), Node(Pointer{ LoadLittleEndian32(raw) })); break;
+                        case BinaryColor:
+                            object.add(std::move(key), Node(Color{ static_cast<uint8_t>(raw[0]), static_cast<uint8_t>(raw[1]), static_cast<uint8_t>(raw[2]), static_cast<uint8_t>(raw[3]) }));
+                            break;
+                        case BinaryInt64  : object.add(std::move(key), Node(BitCast<int64_t>(LoadLittleEndian64(raw)))); break;
+                        default           : object.add(std::move(key), Node(LoadLittleEndian64(raw))); break;
+                    }
+                }
+            }
         }
     }
-    if (string_start == nullptr)
-        return -1;
 
-    return -2;
-}
-
-}
-
-class ParserException : public std::exception
-{
-    std::string _Msg;
 public:
-    ParserException(std::string msg) :
-        _Msg(std::move(msg))
+    BinaryParser(Reader& reader, ReadOptions const& options) :
+        m_Reader(reader), m_Options(options)
     {}
 
-    virtual char const* what() const noexcept
+    /// vbkv: the "VBKV" magic was already consumed.
+    KeyValue Parse(bool vbkv)
     {
-        return _Msg.c_str();
+        uint32_t stored_crc = 0;
+        if (vbkv)
+        {
+            char raw[4];
+            if (!ReadBytes(raw, 4))
+                throw ParseError("Premature end of file while reading the VBKV header");
+
+            stored_crc = LoadLittleEndian32(raw);
+            m_Reader.StartCrc();
+        }
+
+        const int root_type = m_Reader.Get();
+        if (root_type < 0)
+            throw ParseError("Premature end of file while parsing root binary object");
+        if (root_type != BinaryObject)
+            throw ParseError("Binary root item type is not an object");
+
+        std::string name;
+        if (!ReadString(name))
+            throw ParseError("Premature end of file while parsing root binary object name");
+
+        KeyValue root(std::move(name));
+        ParseObjects(root);
+
+        // Only one root object is allowed. Valve binary files commonly end with one
+        // extra end marker after the root object end: accept a single one.
+        const int root_end = vbkv ? BinaryAlternateEnd : BinaryEnd;
+        const int trailing = m_Reader.Get();
+        if (trailing >= 0 && ((trailing != BinaryEnd && trailing != root_end) || m_Reader.Peek() >= 0))
+            throw ParseError("Unexpected data after the binary root object");
+
+        if (vbkv && m_Options.verify_crc)
+        {
+            const uint32_t computed_crc = m_Reader.Crc();
+            if (computed_crc != stored_crc)
+                throw ParseError("VBKV checksum mismatch: the header says " + Hex32(stored_crc) + ", the data gives " + Hex32(computed_crc));
+        }
+
+        return root;
     }
 };
 
-class SerializeException : public std::exception
+/////////////////////////////////////////////////////////////////////
+// Text parser
+/////////////////////////////////////////////////////////////////////
+class TextParser
 {
-    const char* _Msg;
-public:
-    SerializeException(const char* msg):
-        _Msg(msg)
-    {}
+    enum class TokenKind { End, Open, Close, String, Condition };
 
-    virtual char const* what() const noexcept
+    struct Token
     {
-        return _Msg;
-    }
-};
-
-template<typename T>
-class ValveDataObjectRefWrapper
-{
-    T* _Obj;
-
-public:
-    ValveDataObjectRefWrapper(T*);
-
-    ValveDataObjectRefWrapper(ValveDataObjectRefWrapper<T> const& o);
-
-    inline std::string const& Name() const;
-
-    inline ObjectType Type() const;
-
-    inline bool Empty() const;
-
-    inline std::string& String();
-
-    inline std::string const& String() const;
-
-    inline ValveCollection& Collection();
-
-    inline ValveCollection const& Collection() const;
-
-    inline bool operator==(std::nullptr_t) const;
-
-    // A ValveDataObjectRefWrapper is a reference to an element of a collection.
-    // Assigning through it replaces the VALUE of the referenced element and keeps
-    // its key (name): `o["x"][0] = other;` leaves an element named "x" holding a
-    // copy of other's value. It never rebinds the wrapper to another element.
-    inline ValveDataObjectRefWrapper& operator=(ValveDataObjectRefWrapper const&);
-
-    inline ValveDataObjectRefWrapper& operator=(ValveDataObjectRefWrapper &&);
-
-    inline ValveDataObjectRefWrapper& operator=(T const&);
-
-    inline ValveDataObjectRefWrapper& operator=(T&&);
-
-    inline ValveDataObjectRefWrapper& operator=(std::nullptr_t);
-
-    inline ValveDataObjectRefWrapper& operator=(std::string const& value);
-
-    inline ValveDataObjectRefWrapper& operator=(std::string&& value);
-
-    inline ValveDataObjectRefWrapper& operator=(int32_t value);
-
-    inline ValveDataObjectRefWrapper& operator=(pointer_t value);
-
-    inline ValveDataObjectRefWrapper& operator=(color_t value);
-
-    inline ValveDataObjectRefWrapper& operator=(float value);
-
-    inline ValveDataObjectRefWrapper& operator=(int64_t value);
-
-    inline ValveDataObjectRefWrapper& operator=(uint64_t value);
-
-    inline int32_t Int32() const;
-
-    inline float Float() const;
-
-    inline pointer_t Pointer() const;
-
-    inline color_t Color() const;
-
-    inline int64_t Int64() const;
-
-    inline uint64_t UInt64() const;
-
-    inline ValveCollectionRef operator[](const char* key);
-
-    inline ValveCollectionRef operator[](std::string const& key);
-
-    inline ValveCollectionConstRef operator[](const char* key) const;
-
-    inline ValveCollectionConstRef operator[](std::string const& key) const;
-
-    inline std::string SerializeAsText() const;
-
-    inline std::string SerializeAsBinary(int version = 0) const;
-
-    inline void SerializeAsText(std::ostream& os) const;
-
-    inline void SerializeAsBinary(std::ostream& os, int version = 0) const;
-};
-
-class ValveDataObject
-{
-private:
-    enum class BinaryNodeType : int8_t
-    {
-        Object         = 0,
-        String         = 1,
-        Int32          = 2,
-        Float          = 3,
-        Pointer        = 4,
-        WideString     = 5,
-        Color          = 6,
-        UInt64         = 7,
-        ObjectEnd      = 8,
-        Binary         = 9,
-        Int64          = 10,
-        AlternativeEnd = 11,
+        TokenKind kind = TokenKind::End;
+        std::string text;
+        std::size_t line = 0;
+        std::size_t column = 0;
     };
 
-    class Data_t
-    {
-        friend class ValveDataObject;
+    Reader& m_Reader;
+    ReadOptions const& m_Options;
+    std::size_t m_Line = 1;
+    std::size_t m_Column = 1;
+    bool m_LastWasCr = false;
+    Token m_Ahead;
+    bool m_HasAhead = false;
 
-        std::string _Name;
-        size_t _NameHash;
-        union
+    // Consumes one byte and tracks the position. LF, CRLF and CR all end a line.
+    int Get()
+    {
+        const int c = m_Reader.Get();
+        if (c == '\n')
         {
-            std::string* _String;
-            ValveCollection* _Collection;
-            int32_t _Int32;
-            float _Float;
-            pointer_t _Pointer;
-            color_t _Color;
-            int64_t _Int64;
-            uint64_t _UInt64;
-        } _U;
-        ObjectType _Type;
-
-    public:
-        Data_t() :
-            _Name(),
-            _NameHash(std::hash<std::string>()(_Name)),
-            _Type(ObjectType::None)
-        {}
-
-        explicit Data_t(std::string const& name) :
-            _Name(name),
-            _NameHash(std::hash<std::string>()(_Name)),
-            _Type(ObjectType::None)
-        {}
-
-        Data_t(std::string const& name, size_t name_hash) :
-            _Name(name),
-            _NameHash(name_hash),
-            _Type(ObjectType::None)
-        {}
-    };
-
-    // Owned data. nullptr is the empty state left by a move: the object then
-    // behaves as an object with an empty name and no value (ObjectType::None).
-    // Every member function and the destructor accept it; mutators allocate
-    // the Data_t on demand (_Data()).
-    Data_t *_Obj;
-
-    template<typename T>
-    friend class ValveDataObjectRefWrapper;
-
-    struct _Adopt_t {};
-
-    // Takes ownership of data (may be nullptr). Every other constructor
-    // delegates to this one, so as soon as it returns the object is fully
-    // constructed: if the rest of a constructor throws, the destructor runs
-    // and releases what was already allocated.
-    ValveDataObject(_Adopt_t, Data_t* data) noexcept;
-
-    // Returns the data, allocating it if the object is in the moved-from state.
-    Data_t& _Data();
-
-    static std::string const& _EmptyName();
-
-    void _ResetValue();
-
-    // Replace the value of this object, keep its name (ValveDataObjectRefWrapper::operator= semantics).
-    void _AssignValue(ValveDataObject const& other);
-
-    void _AssignValue(ValveDataObject&& other);
-
-    static void _ParseTextObject(std::istream& is, std::string& name, std::string& buffer, uint32_t& line_num, ValveDataObject& o);
-
-    static void _ParseBinaryObject(std::istream& is, std::string& name, BinaryNodeType object_end, std::string& buffer, const char*& buffer_start, const char*& buffer_end, ValveDataObject& o);
-
-    // Throws SerializeException for the types that have no serialized form.
-    static void _CheckSerializable(ObjectType type);
-
-    void _SerializeAsText(std::ostream& os, size_t depth) const;
-
-    void _SerializeAsBinary(std::ostream& os, BinaryNodeType object_end, uint32_t crc) const;
-
-public:
-    ValveDataObject();
-
-    ValveDataObject(ValveDataObject const& other);
-
-    // Never allocates. other is left empty: Name() == "", Type() == ObjectType::None.
-    // It can be assigned to, renamed or destroyed like any other object.
-    ValveDataObject(ValveDataObject&& other) noexcept;
-    
-    ValveDataObject(std::string const& key);
-    
-    ValveDataObject(std::string const& key, ValveDataObject const& other);
-
-    ValveDataObject(std::string const& key, ValveDataObject&& other);
-
-    ValveDataObject(std::string const& key, std::string const& value);
-
-    ValveDataObject(std::string const& key, std::string&& value);
-
-    ValveDataObject(std::string const& key, int32_t value);
-
-    ValveDataObject(std::string const& key, float value);
-
-    ValveDataObject(std::string const& key, pointer_t value);
-
-    ValveDataObject(std::string const& key, color_t value);
-
-    ValveDataObject(std::string const& key, int64_t value);
-
-    ValveDataObject(std::string const& key, uint64_t value);
-
-    ~ValveDataObject();
-
-    inline void Name(std::string const& value);
-
-    inline void Name(std::string && value);
-
-    inline std::string const& Name() const;
-
-    inline ObjectType Type() const;
-
-    inline bool Empty() const;
-
-    std::string& String();
-
-    std::string const& String() const;
-
-    ValveCollection& Collection();
-
-    ValveCollection const& Collection() const;
-
-    inline bool operator==(std::nullptr_t) const;
-
-    // ValveDataObject is a regular value type: copy/move construction and
-    // copy/move assignment transfer the name (key) together with the value, so
-    // std::vector<ValveDataObject> algorithms (erase, insert, swap, sort, ...)
-    // keep every key paired with its value.
-    // To replace only the value of an element and keep its key, assign through
-    // a reference wrapper: `o["x"][0] = other;`.
-    ValveDataObject& operator=(ValveDataObject const& other);
-
-    // Never allocates. other is left empty (see the move constructor).
-    ValveDataObject& operator=(ValveDataObject&& other) noexcept;
-
-    ValveDataObject& operator=(std::nullptr_t);
-
-    ValveDataObject& operator=(std::string const& value);
-
-    ValveDataObject& operator=(std::string&& value);
-
-    ValveDataObject& operator=(int32_t value);
-
-    ValveDataObject& operator=(pointer_t value);
-
-    ValveDataObject& operator=(color_t value);
-
-    ValveDataObject& operator=(float value);
-
-    ValveDataObject& operator=(int64_t value);
-
-    ValveDataObject& operator=(uint64_t value);
-
-    int32_t Int32() const;
-
-    float Float() const;
-
-    pointer_t Pointer() const;
-
-    color_t Color() const;
-
-    int64_t Int64() const;
-
-    uint64_t UInt64() const;
-
-    ValveCollectionRef operator[](const char* key);
-    
-    ValveCollectionRef operator[](std::string const& key);
-    
-    ValveCollectionConstRef operator[](const char* key) const;
-
-    ValveCollectionConstRef operator[](std::string const& key) const;
-
-    inline std::string SerializeAsText() const;
-
-    inline std::string SerializeAsBinary(int version = 0) const;
-
-    inline void SerializeAsText(std::ostream& os) const;
-
-    inline void SerializeAsBinary(std::ostream& os, int version = 0) const;
-
-    static ValveDataObject ParseObject(std::istream& is, size_t chunk_size = 10 * 1024);
-};
-
-
-/////////////////////////////////////////////////////////////////////
-// 
-//                        ValveDataObjectRef
-// 
-/////////////////////////////////////////////////////////////////////
-
-template<typename T>
-ValveDataObjectRefWrapper<T>::ValveDataObjectRefWrapper(T* obj):
-    _Obj(obj)
-{}
-
-template<typename T>
-ValveDataObjectRefWrapper<T>::ValveDataObjectRefWrapper(ValveDataObjectRefWrapper<T> const& o):
-    _Obj(o._Obj)
-{}
-
-template<typename T>
-inline std::string const& ValveDataObjectRefWrapper<T>::Name() const
-{
-    return _Obj->Name();
-}
-
-template<typename T>
-inline ObjectType ValveDataObjectRefWrapper<T>::Type() const
-{
-    return _Obj->Type();
-}
-
-template<typename T>
-inline bool ValveDataObjectRefWrapper<T>::Empty() const
-{
-    return _Obj->Empty();
-}
-
-template<typename T>
-inline std::string& ValveDataObjectRefWrapper<T>::String()
-{
-    return _Obj->String();
-}
-
-template<typename T>
-inline std::string const& ValveDataObjectRefWrapper<T>::String() const
-{
-    return _Obj->String();
-}
-
-template<typename T>
-inline ValveCollection& ValveDataObjectRefWrapper<T>::Collection()
-{
-    return _Obj->Collection();
-}
-
-template<typename T>
-inline ValveCollection const& ValveDataObjectRefWrapper<T>::Collection() const
-{
-    return _Obj->Collection();
-}
-
-template<typename T>
-inline bool ValveDataObjectRefWrapper<T>::operator==(std::nullptr_t) const
-{
-    return (*_Obj) == nullptr;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(ValveDataObjectRefWrapper<T> const& value)
-{
-    _Obj->_AssignValue(*value._Obj);
-    return *this;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(ValveDataObjectRefWrapper<T>&& value)
-{
-    _Obj->_AssignValue(std::move(*value._Obj));
-    return *this;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(T const& value)
-{
-    _Obj->_AssignValue(value);
-    return *this;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(T&& value)
-{
-    _Obj->_AssignValue(std::move(value));
-    return *this;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(std::nullptr_t)
-{
-    (*_Obj) = nullptr;
-    return *this;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(std::string const& value)
-{
-    (*_Obj) = value;
-    return *this;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(std::string&& value)
-{
-    (*_Obj) = std::move(value);
-    return *this;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(int32_t value)
-{
-    (*_Obj) = value;
-    return *this;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(pointer_t value)
-{
-    (*_Obj) = value;
-    return *this;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(color_t value)
-{
-    (*_Obj) = value;
-    return *this;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(float value)
-{
-    (*_Obj) = value;
-    return *this;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(int64_t value)
-{
-    (*_Obj) = value;
-    return *this;
-}
-
-template<typename T>
-inline ValveDataObjectRefWrapper<T>& ValveDataObjectRefWrapper<T>::operator=(uint64_t value)
-{
-    (*_Obj) = value;
-    return *this;
-}
-
-template<typename T>
-inline int32_t ValveDataObjectRefWrapper<T>::Int32() const
-{
-    return _Obj->Int32();
-}
-
-template<typename T>
-inline float ValveDataObjectRefWrapper<T>::Float() const
-{
-    return _Obj->Float();
-}
-
-template<typename T>
-inline pointer_t ValveDataObjectRefWrapper<T>::Pointer() const
-{
-    return _Obj->Pointer();
-}
-
-template<typename T>
-inline color_t ValveDataObjectRefWrapper<T>::Color() const
-{
-    return _Obj->Color();
-}
-
-template<typename T>
-inline int64_t ValveDataObjectRefWrapper<T>::Int64() const
-{
-    return _Obj->Int64();
-}
-
-template<typename T>
-inline uint64_t ValveDataObjectRefWrapper<T>::UInt64() const
-{
-    return _Obj->UInt64();
-}
-
-template<typename T>
-inline ValveCollectionRef ValveDataObjectRefWrapper<T>::operator[](const char* key)
-{
-    return (*_Obj)[key];
-}
-
-template<typename T>
-inline ValveCollectionRef ValveDataObjectRefWrapper<T>::operator[](std::string const& key)
-{
-    return (*_Obj)[key];
-}
-
-template<typename T>
-inline ValveCollectionConstRef ValveDataObjectRefWrapper<T>::operator[](const char* key) const
-{
-    return static_cast<const ValveDataObject&>(*_Obj)[key];
-}
-
-template<typename T>
-inline ValveCollectionConstRef ValveDataObjectRefWrapper<T>::operator[](std::string const& key) const
-{
-    return static_cast<const ValveDataObject&>(*_Obj)[key];
-}
-
-template<typename T>
-inline std::string ValveDataObjectRefWrapper<T>::SerializeAsText() const
-{
-    return _Obj->SerializeAsText();
-}
-
-template<typename T>
-inline std::string ValveDataObjectRefWrapper<T>::SerializeAsBinary(int version) const
-{
-    return _Obj->SerializeAsBinary(version);
-}
-
-template<typename T>
-inline void ValveDataObjectRefWrapper<T>::SerializeAsText(std::ostream& os) const
-{
-    return _Obj->SerializeAsText(os);
-}
-
-template<typename T>
-inline void ValveDataObjectRefWrapper<T>::SerializeAsBinary(std::ostream& os, int version) const
-{
-    return _Obj->SerializeAsBinary(os, version);
-}
-
-/////////////////////////////////////////////////////////////////////
-// 
-//                        ValveDataObject
-// 
-/////////////////////////////////////////////////////////////////////
-inline ValveDataObject::ValveDataObject(_Adopt_t, Data_t* data) noexcept :
-    _Obj(data)
-{}
-
-inline ValveDataObject::ValveDataObject() :
-    ValveDataObject(_Adopt_t(), new Data_t())
-{}
-
-inline ValveDataObject::ValveDataObject(ValveDataObject const& other):
-    ValveDataObject(_Adopt_t(), other._Obj == nullptr ? nullptr : new Data_t(other._Obj->_Name, other._Obj->_NameHash))
-{
-    if (_Obj == nullptr)
-        return;
-
-    switch (other._Obj->_Type)
-    {   // Copy pointers content
-        case ObjectType::String: _Obj->_U._String = new std::string(*other._Obj->_U._String); break;
-        case ObjectType::Object: _Obj->_U._Collection = new ValveCollection(*other._Obj->_U._Collection); break;
-        // Copy biggest possible value
-        default: _Obj->_U = other._Obj->_U;
-    }
-    // Type set last: if a copy above throws, the destructor sees None and only frees the Data_t.
-    _Obj->_Type = other._Obj->_Type;
-}
-
-inline ValveDataObject::ValveDataObject(ValveDataObject && other) noexcept :
-    _Obj(other._Obj)
-{
-    other._Obj = nullptr;
-}
-
-inline ValveDataObject::ValveDataObject(std::string const& key) :
-    ValveDataObject(_Adopt_t(), new Data_t(key))
-{
-    _Obj->_U._Collection = new ValveCollection();
-    _Obj->_Type = ObjectType::Object;
-}
-
-inline ValveDataObject::ValveDataObject(std::string const& key, ValveDataObject const& other) :
-    ValveDataObject(key)
-{
-    _Obj->_U._Collection->emplace_back(other);
-}
-
-inline ValveDataObject::ValveDataObject(std::string const& key, ValveDataObject&& other) :
-    ValveDataObject(key)
-{
-    _Obj->_U._Collection->emplace_back(std::move(other));
-}
-
-inline ValveDataObject::ValveDataObject(std::string const& key, std::string const& value) :
-    ValveDataObject(_Adopt_t(), new Data_t(key))
-{
-    _Obj->_U._String = new std::string(value);
-    _Obj->_Type = ObjectType::String;
-}
-
-inline ValveDataObject::ValveDataObject(std::string const& key, std::string && value) :
-    ValveDataObject(_Adopt_t(), new Data_t(key))
-{
-    _Obj->_U._String = new std::string(std::move(value));
-    _Obj->_Type = ObjectType::String;
-}
-
-inline ValveDataObject::ValveDataObject(std::string const& key, int32_t value) :
-    ValveDataObject(_Adopt_t(), new Data_t(key))
-{
-    _Obj->_U._Int32 = value;
-    _Obj->_Type = ObjectType::Int32;
-}
-
-inline ValveDataObject::ValveDataObject(std::string const& key, float value) :
-    ValveDataObject(_Adopt_t(), new Data_t(key))
-{
-    _Obj->_U._Float = value;
-    _Obj->_Type = ObjectType::Float;
-}
-
-inline ValveDataObject::ValveDataObject(std::string const& key, pointer_t value) :
-    ValveDataObject(_Adopt_t(), new Data_t(key))
-{
-    _Obj->_U._Pointer = value;
-    _Obj->_Type = ObjectType::Pointer;
-}
-
-inline ValveDataObject::ValveDataObject(std::string const& key, color_t value) :
-    ValveDataObject(_Adopt_t(), new Data_t(key))
-{
-    _Obj->_U._Color = value;
-    _Obj->_Type = ObjectType::Color;
-}
-
-inline ValveDataObject::ValveDataObject(std::string const& key, int64_t value) :
-    ValveDataObject(_Adopt_t(), new Data_t(key))
-{
-    _Obj->_U._Int64 = value;
-    _Obj->_Type = ObjectType::Int64;
-}
-
-inline ValveDataObject::ValveDataObject(std::string const& key, uint64_t value) :
-    ValveDataObject(_Adopt_t(), new Data_t(key))
-{
-    _Obj->_U._UInt64 = value;
-    _Obj->_Type = ObjectType::UInt64;
-}
-
-inline ValveDataObject::~ValveDataObject()
-{
-    _ResetValue();
-    delete _Obj;
-}
-
-inline ValveDataObject::Data_t& ValveDataObject::_Data()
-{
-    if (_Obj == nullptr)
-        _Obj = new Data_t();
-
-    return *_Obj;
-}
-
-inline std::string const& ValveDataObject::_EmptyName()
-{
-    static const std::string empty_name;
-    return empty_name;
-}
-
-inline void ValveDataObject::Name(std::string const& value)
-{
-    Data_t& data = _Data();
-    data._Name = value;
-    data._NameHash = std::hash<std::string>()(data._Name);
-}
-
-inline void ValveDataObject::Name(std::string&& value)
-{
-    Data_t& data = _Data();
-    data._NameHash = std::hash<std::string>()(value);
-    data._Name = std::move(value);
-}
-
-inline std::string const& ValveDataObject::Name() const
-{
-    return _Obj == nullptr ? _EmptyName() : _Obj->_Name;
-}
-
-inline ObjectType ValveDataObject::Type() const
-{
-    return _Obj == nullptr ? ObjectType::None : _Obj->_Type;
-}
-
-inline bool ValveDataObject::Empty() const
-{
-    return Type() == ObjectType::None;
-}
-
-inline std::string& ValveDataObject::String()
-{
-    if (Type() != ObjectType::String)
-    {
-        throw std::invalid_argument("Attempted to read a String from a non String type.");
-    }
-
-    return *_Obj->_U._String;
-}
-
-inline std::string const& ValveDataObject::String() const
-{
-    if (Type() != ObjectType::String)
-    {
-        throw std::invalid_argument("Attempted to read a String from a non String type.");
-    }
-    
-    return *_Obj->_U._String;
-}
-
-inline ValveCollection& ValveDataObject::Collection()
-{
-    if (Type() != ObjectType::Object)
-    {
-        throw std::invalid_argument("Attempted to get a Collection from non Collection type.");
-    }
-
-    return *_Obj->_U._Collection;
-}
-
-inline ValveCollection const& ValveDataObject::Collection() const
-{
-    if (Type() != ObjectType::Object)
-    {
-        throw std::invalid_argument("Attempted to get a Collection from non Collection type.");
-    }
-
-    return *_Obj->_U._Collection;
-}
-
-inline bool ValveDataObject::operator==(std::nullptr_t) const
-{
-    return Empty();
-}
-
-inline ValveDataObject& ValveDataObject::operator=(ValveDataObject const& value)
-{
-    // Copy first: strong exception guarantee, and safe when value lives inside *this.
-    ValveDataObject tmp(value);
-    std::swap(_Obj, tmp._Obj);
-    return *this;
-}
-
-inline ValveDataObject& ValveDataObject::operator=(ValveDataObject&& value) noexcept
-{
-    if (this != &value)
-    {
-        // Name and value travel together. Our previous data is released when
-        // old goes out of scope, after value's data was taken: value may live
-        // inside our collection.
-        ValveDataObject old(std::move(*this));
-        std::swap(_Obj, value._Obj);
-    }
-    return *this;
-}
-
-inline ValveDataObject& ValveDataObject::operator=(std::nullptr_t)
-{
-    _ResetValue();
-    return *this;
-}
-
-inline ValveDataObject& ValveDataObject::operator=(std::string const& value)
-{
-    Data_t& data = _Data();
-    std::string* v = new std::string(value);
-    _ResetValue();
-    data._U._String = v;
-    data._Type = ObjectType::String;
-
-    return *this;
-}
-
-inline ValveDataObject& ValveDataObject::operator=(std::string&& value)
-{
-    Data_t& data = _Data();
-    std::string* v = new std::string(std::move(value));
-    _ResetValue();
-    data._U._String = v;
-    data._Type = ObjectType::String;
-
-    return *this;
-}
-
-inline ValveDataObject& ValveDataObject::operator=(int32_t value)
-{
-    Data_t& data = _Data();
-    _ResetValue();
-    data._U._Int32 = value;
-    data._Type = ObjectType::Int32;
-
-    return *this;
-}
-
-inline ValveDataObject& ValveDataObject::operator=(pointer_t value)
-{
-    Data_t& data = _Data();
-    _ResetValue();
-    data._U._Pointer = value;
-    data._Type = ObjectType::Pointer;
-
-    return *this;
-}
-
-inline ValveDataObject& ValveDataObject::operator=(color_t value)
-{
-    Data_t& data = _Data();
-    _ResetValue();
-    data._U._Color = value;
-    data._Type = ObjectType::Color;
-
-    return *this;
-}
-
-inline ValveDataObject& ValveDataObject::operator=(float value)
-{
-    Data_t& data = _Data();
-    _ResetValue();
-    data._U._Float = value;
-    data._Type = ObjectType::Float;
-
-    return *this;
-}
-
-inline ValveDataObject& ValveDataObject::operator=(int64_t value)
-{
-    Data_t& data = _Data();
-    _ResetValue();
-    data._U._Int64 = value;
-    data._Type = ObjectType::Int64;
-
-    return *this;
-}
-
-inline ValveDataObject& ValveDataObject::operator=(uint64_t value)
-{
-    Data_t& data = _Data();
-    _ResetValue();
-    data._U._UInt64 = value;
-    data._Type = ObjectType::UInt64;
-
-    return *this;
-}
-
-inline int32_t ValveDataObject::Int32() const
-{
-    if (Type() != ObjectType::Int32)
-    {
-        throw std::invalid_argument("Attempted to get an Int32 from non Int32 type.");
-    }
-
-    return _Obj->_U._Int32;
-}
-
-inline float ValveDataObject::Float() const
-{
-    if (Type() != ObjectType::Float)
-    {
-        throw std::invalid_argument("Attempted to get a Float from non Float type.");
-    }
-
-    return _Obj->_U._Float;
-}
-
-inline pointer_t ValveDataObject::Pointer() const
-{
-    if (Type() != ObjectType::Pointer)
-    {
-        throw std::invalid_argument("Attempted to get a Pointer from non Pointer type.");
-    }
-
-    return _Obj->_U._Pointer;
-}
-
-inline color_t ValveDataObject::Color() const
-{
-    if (Type() != ObjectType::Color)
-    {
-        throw std::invalid_argument("Attempted to get a Color from non Color type.");
-    }
-
-    return _Obj->_U._Color;
-}
-
-inline int64_t ValveDataObject::Int64() const
-{
-    if (Type() != ObjectType::Int64)
-    {
-        throw std::invalid_argument("Attempted to get an Int64 from non Int64 type.");
-    }
-
-    return _Obj->_U._Int64;
-}
-
-inline uint64_t ValveDataObject::UInt64() const
-{
-    if (Type() != ObjectType::UInt64)
-    {
-        throw std::invalid_argument("Attempted to get an UInt64 from non UInt64 type.");
-    }
-
-    return _Obj->_U._UInt64;
-}
-
-inline ValveCollectionRef ValveDataObject::operator[](const char* key)
-{
-    return (*this)[std::string(key)];
-}
-
-inline ValveCollectionRef ValveDataObject::operator[](std::string const& key)
-{
-    auto& c = Collection();
-
-    ValveCollectionRef r;
-    size_t key_hash = std::hash<std::string>()(key);
-
-    for (auto& item : c)
-    {
-        // The hash is only a fast reject: compare the key itself, two
-        // different keys can share a hash. A moved-from item has an empty name.
-        if (item._Obj == nullptr ? key.empty() : (item._Obj->_NameHash == key_hash && item._Obj->_Name == key))
-            r.emplace_back(ValveDataObjectRef(&item));
-    }
-
-    return r;
-}
-
-inline ValveCollectionConstRef ValveDataObject::operator[](const char* key) const
-{
-    return (*this)[std::string(key)];
-}
-
-inline ValveCollectionConstRef ValveDataObject::operator[](std::string const& key) const
-{
-    auto& c = Collection();
-
-    ValveCollectionConstRef r;
-    size_t key_hash = std::hash<std::string>()(key);
-
-    for (auto& item : c)
-    {
-        // The hash is only a fast reject: compare the key itself, two
-        // different keys can share a hash. A moved-from item has an empty name.
-        if (item._Obj == nullptr ? key.empty() : (item._Obj->_NameHash == key_hash && item._Obj->_Name == key))
-            r.emplace_back(ValveDataObjectConstRef(&item));
-    }
-
-    return r;
-}
-
-inline void ValveDataObject::_AssignValue(ValveDataObject const& other)
-{
-    if (this == &other)
-        return;
-
-    // Copy first: strong exception guarantee, and safe when other lives inside *this.
-    ValveDataObject tmp(other);
-    _AssignValue(std::move(tmp));
-}
-
-inline void ValveDataObject::_AssignValue(ValveDataObject&& other)
-{
-    if (this == &other)
-        return;
-
-    if (other._Obj == nullptr)
-    {// Moved-from source: no value.
-        _ResetValue();
-        return;
-    }
-
-    // Allocate first (moved-from destination): nothing is modified if it throws.
-    Data_t& data = _Data();
-
-    // Detach other's value before releasing ours: other may live inside our collection.
-    auto type = other._Obj->_Type;
-    auto value = other._Obj->_U;
-    other._Obj->_Type = ObjectType::None;
-
-    _ResetValue();
-    data._U = value;
-    data._Type = type;
-}
-
-inline void ValveDataObject::_ResetValue()
-{
-    if (_Obj == nullptr)
-        return;
-
-    switch (_Obj->_Type)
-    {
-        case ObjectType::String: delete _Obj->_U._String; break;
-        case ObjectType::Object: delete _Obj->_U._Collection; break;
-        default: break; // Warning fix.
-    }
-    _Obj->_Type = ObjectType::None;
-}
-
-inline void ValveDataObject::_ParseTextObject(std::istream& is, std::string& name, std::string& buffer, uint32_t& line_num, ValveDataObject& o)
-{
-    const char* line_start;
-    const char* line_end;
-
-    std::string object_name;
-    std::string tmp;
-    int error;
-    bool is_object = false;
-    bool is_closed = false;
-
-    // Release any previous value so it can't leak.
-    o._ResetValue();
-    o._Obj->_NameHash = std::hash<std::string>()(name);
-    o._Obj->_Name = std::move(name);
-    o._Obj->_U._Collection = new ValveCollection();
-    o._Obj->_Type = ObjectType::Object;
-
-    while (EasyVDF::Details::getline(is, buffer))
-    {
-        ++line_num;
-        line_start = &buffer[0];
-        line_end = line_start + buffer.length();
-        Details::SkipSpaces(line_start, line_end);
-            
-        // Skip empty line
-        if (line_start == line_end)
-            continue;
-            
-        if (*line_start == '}')
-        {
-            if (is_object)
+            if (!m_LastWasCr)
             {
-                throw ParserException("Expected object start at line " + std::to_string(line_num));
+                ++m_Line;
+                m_Column = 1;
             }
-            ++line_start;
-            Details::SkipSpaces(line_start, line_end);
-            if (line_start != line_end)
-            {
-                throw ParserException("Got datas after object end at line " + std::to_string(line_num));
-            }
-            is_closed = true;
-            break;
+            m_LastWasCr = false;
         }
-
-        if (!is_object)
+        else if (c == '\r')
         {
-            error = Details::ParseString(line_start, line_end, object_name);
-            if (error == -1)
-            {
-                throw ParserException("Expected item key start at line " + std::to_string(line_num));
-            }
-            if (error == -2)
-            {
-                throw ParserException("Expected item key end at line " + std::to_string(line_num));
-            }
-            if (error == -3)
-            {
-                throw ParserException("Invalid codepoint at line " + std::to_string(line_num));
-            }
-            Details::SkipSpaces(line_start, line_end);
-
-            if (line_start != line_end && *line_start == '"')
-            {// Parsing item value
-                error = Details::ParseString(line_start, line_end, tmp);
-                if (error == -1)
-                {
-                    throw ParserException("Expected item value start at line " + std::to_string(line_num));
-                }
-                if (error == -2)
-                {
-                    throw ParserException("Expected item value end at line " + std::to_string(line_num));
-                }
-                if (error == -3)
-                {
-                    throw ParserException("Invalid codepoint at line " + std::to_string(line_num));
-                }
-                Details::SkipSpaces(line_start, line_end);
-                if (line_start != line_end)
-                {
-                    throw ParserException("Got datas after item value at line " + std::to_string(line_num));
-                }
-
-                o._Obj->_U._Collection->emplace_back(std::move(object_name), tmp);
-            }
-            else if (line_start != line_end)
-            {
-                throw ParserException("Got datas after item key at line " + std::to_string(line_num));
-            }
-            else
-            {
-                is_object = true;
-            }
+            ++m_Line;
+            m_Column = 1;
+            m_LastWasCr = true;
         }
-        else
+        else if (c >= 0)
         {
-            if (*line_start++ != '{')
-            {
-                throw ParserException("Expected object start at line " + std::to_string(line_num));
-            }
-            Details::SkipSpaces(line_start, line_end);
-            if (line_start != line_end)
-            {
-                throw ParserException("Got datas after object start at line " + std::to_string(line_num));
-            }
-
-            o._Obj->_U._Collection->emplace_back();
-            _ParseTextObject(is, object_name, buffer, line_num, *o._Obj->_U._Collection->rbegin());
-            is_object = false;
+            ++m_Column;
+            m_LastWasCr = false;
         }
+        return c;
     }
 
-    if (!is_closed)
+    [[noreturn]] void Fail(std::string const& message, std::size_t line, std::size_t column) const
     {
-        throw ParserException("Unexpected end of file, expected object end at line " + std::to_string(line_num));
+        throw ParseError(message + " at line " + std::to_string(line) + ", column " + std::to_string(column), line, column);
     }
-}
-    
 
-inline void ValveDataObject::_ParseBinaryObject(std::istream& is, std::string& name, BinaryNodeType object_end, std::string& buffer, const char*& buffer_start, const char*& buffer_end, ValveDataObject& o)
-{
-    // Release any previous value first, so parsing into an existing object can never leak.
-    o._ResetValue();
-    o._Obj->_NameHash = std::hash<std::string>()(name);
-    o._Obj->_Name = std::move(name);
-    o._Obj->_U._Collection = new ValveCollection();
-    o._Obj->_Type = ObjectType::Object;
-
-    // Items are parsed into the collection owned by o: if an exception is thrown,
-    // everything parsed so far is released with o.
-    ValveCollection& collection = *o._Obj->_U._Collection;
-    std::string tmp1, item_key;
-
-    for (;;)
+    [[noreturn]] void Fail(std::string const& message, Token const& token) const
     {
-        if (!Details::FillBinaryBuffer(is, buffer, buffer_start, buffer_end))
-            throw ParserException("Premature end of file: missing end marker of binary object \"" + o._Obj->_Name + "\"");
+        Fail(message, token.line, token.column);
+    }
 
-        BinaryNodeType state = static_cast<BinaryNodeType>(*buffer_start++);
-        switch (state)
+    // The end of file is reported on the last line that holds at least one character.
+    [[noreturn]] void FailAtEnd(std::string const& message) const
+    {
+        const std::size_t line = (m_Column == 1 && m_Line > 1) ? m_Line - 1 : m_Line;
+        throw ParseError("Unexpected end of file, " + message + " at line " + std::to_string(line), line, 0);
+    }
+
+    static bool EndsUnquoted(int c) noexcept
+    {
+        return c < 0 || c == '"' || c == '{' || c == '}' || IsSpace(static_cast<char>(c));
+    }
+
+    void ReadQuoted(Token& token)
+    {
+        for (;;)
         {
-            case BinaryNodeType::ObjectEnd:
-            case BinaryNodeType::AlternativeEnd:
-                // Both end markers are accepted whatever object_end is, as before.
+            int c = Get();
+            if (c < 0)
+                Fail("Unexpected end of file in the quoted string started", token);
+
+            if (c == '"')
                 return;
 
-            case BinaryNodeType::Object:
-            case BinaryNodeType::String:
-            case BinaryNodeType::Int32:
-            case BinaryNodeType::Float:
-            case BinaryNodeType::Pointer:
-            case BinaryNodeType::Color:
-            case BinaryNodeType::UInt64:
-            case BinaryNodeType::Int64:
-                break;
-
-            default:
-                throw ParserException("Unhandled binary VDF node type " + std::to_string(static_cast<unsigned int>(static_cast<uint8_t>(state))) + " in binary object \"" + o._Obj->_Name + "\"");
-        }
-
-        if (!Details::ReadFullBinaryString(is, buffer, buffer_start, buffer_end, item_key))
-            throw ParserException("Premature end of file while parsing a key of binary object \"" + o._Obj->_Name + "\"");
-
-        switch (state)
-        {
-            case BinaryNodeType::Object:
-                collection.emplace_back();
-                _ParseBinaryObject(is, item_key, object_end, buffer, buffer_start, buffer_end, collection.back());
-                break;
-
-            case BinaryNodeType::String:
-                if (!Details::ReadFullBinaryString(is, buffer, buffer_start, buffer_end, tmp1))
-                    throw ParserException("Premature end of file while parsing the value of key \"" + item_key + "\"");
-
-                collection.emplace_back(std::move(item_key), std::move(tmp1));
-                break;
-
-            default:
+            if (c == '\\' && m_Options.escapes)
             {
-                const size_t value_size = (state == BinaryNodeType::Int64 || state == BinaryNodeType::UInt64) ? 8 : 4;
-                if (!Details::ReadFullBinaryBytes(is, buffer, buffer_start, buffer_end, tmp1, value_size))
-                    throw ParserException("Premature end of file while parsing the value of key \"" + item_key + "\"");
+                c = Get();
+                if (c < 0)
+                    Fail("Unexpected end of file in the quoted string started", token);
 
-                const char* value = tmp1.data();
-                switch (state)
+                switch (c)
                 {
-                    case BinaryNodeType::Int32  : collection.emplace_back(std::move(item_key), Details::BitCast<int32_t>(Details::LoadLittleEndian32(value))); break;
-                    case BinaryNodeType::Float  : collection.emplace_back(std::move(item_key), Details::BitCast<float>(Details::LoadLittleEndian32(value))); break;
-                    case BinaryNodeType::Pointer: collection.emplace_back(std::move(item_key), pointer_t{ Details::LoadLittleEndian32(value) }); break;
-                    case BinaryNodeType::Color  : collection.emplace_back(std::move(item_key), color_t{ Details::LoadLittleEndian32(value) }); break;
-                    case BinaryNodeType::Int64  : collection.emplace_back(std::move(item_key), Details::BitCast<int64_t>(Details::LoadLittleEndian64(value))); break;
-                    case BinaryNodeType::UInt64 : collection.emplace_back(std::move(item_key), Details::LoadLittleEndian64(value)); break;
-                    default: break; // Not reachable, filtered above.
+                    case 'n' : token.text += '\n'; break;
+                    case 't' : token.text += '\t'; break;
+                    case 'v' : token.text += '\v'; break;
+                    case 'b' : token.text += '\b'; break;
+                    case 'r' : token.text += '\r'; break;
+                    case 'f' : token.text += '\f'; break;
+                    case 'a' : token.text += '\a'; break;
+                    case '\\': token.text += '\\'; break;
+                    case '?' : token.text += '?'; break;
+                    case '\'': token.text += '\''; break;
+                    case '"' : token.text += '"'; break;
+                    default:
+                        // Not an escape sequence (unescaped Windows path, ...): keep it verbatim.
+                        token.text += '\\';
+                        token.text += static_cast<char>(c);
+                        break;
                 }
-            }
-        }
-    }
-}
-
-inline void ValveDataObject::_CheckSerializable(ObjectType type)
-{
-    switch (type)
-    {
-        case ObjectType::Object:
-        case ObjectType::String:
-        case ObjectType::Int32:
-        case ObjectType::Float:
-        case ObjectType::Pointer:
-        case ObjectType::Color:
-        case ObjectType::UInt64:
-        case ObjectType::Int64:
-            return;
-
-        // VDF has no representation for a key without a value: refuse rather
-        // than silently dropping the key or writing an unreadable file.
-        case ObjectType::None:
-            throw SerializeException("Can't serialize a ValveDataObject without value (ObjectType::None).");
-
-        case ObjectType::WideString:
-            throw SerializeException("Can't serialize a ValveDataObject of type WideString: not supported.");
-
-        case ObjectType::Binary:
-            throw SerializeException("Can't serialize a ValveDataObject of type Binary: not supported.");
-    }
-    throw SerializeException("Can't serialize a ValveDataObject of unknown type.");
-}
-
-inline void ValveDataObject::_SerializeAsText(std::ostream& os, size_t depth) const
-{
-    ObjectType type = Type();
-    _CheckSerializable(type);
-
-    std::string indent(depth, '\t');
-
-    os << indent << '"' << Name() << '"';
-    switch (type)
-    {
-        case ObjectType::Object:
-            os << '\n' << indent << "{\n";
-            for (auto const& item : *_Obj->_U._Collection)
-            {
-                item._SerializeAsText(os, depth + 1);
-            }
-            os << indent << "}\n";
-            break;
-
-        case ObjectType::Pointer: os << "\t\t\"" << _Obj->_U._Pointer.value << "\"\n"; break;
-        case ObjectType::Color  : os << "\t\t\"" << _Obj->_U._Color.value   << "\"\n"; break;
-        case ObjectType::Float  : os << "\t\t\"" << _Obj->_U._Float         << "\"\n"; break;
-        case ObjectType::Int32  : os << "\t\t\"" << _Obj->_U._Int32         << "\"\n"; break;
-        case ObjectType::Int64  : os << "\t\t\"" << _Obj->_U._Int64         << "\"\n"; break;
-        case ObjectType::UInt64 : os << "\t\t\"" << _Obj->_U._UInt64        << "\"\n"; break;
-        case ObjectType::String : os << "\t\t\"" << *_Obj->_U._String       << "\"\n"; break;
-
-        // Rejected by _CheckSerializable.
-        case ObjectType::WideString:
-        case ObjectType::Binary:
-        case ObjectType::None:
-            break;
-    }
-}
-
-inline void ValveDataObject::_SerializeAsBinary(std::ostream& os, BinaryNodeType object_end, uint32_t crc) const
-{
-    ObjectType type = Type();
-    _CheckSerializable(type);
-
-    os.write((const char*)&type, 1);
-    os.write(Name().c_str(), Name().length() + 1);
-
-    switch (type)
-    {
-        case ObjectType::Object:
-            for (auto const& item : *_Obj->_U._Collection)
-            {
-                item._SerializeAsBinary(os, object_end, crc);
-            }
-            os.write((const char*)&object_end, 1);
-            break;
-    
-        case ObjectType::Pointer: os.write((const char*)&_Obj->_U._Pointer, 4); break;
-        case ObjectType::Color  : os.write((const char*)&_Obj->_U._Color, 4); break;
-        case ObjectType::Float  : os.write((const char*)&_Obj->_U._Float, 4); break;
-        case ObjectType::Int32  : os.write((const char*)&_Obj->_U._Int32, 4); break;
-        case ObjectType::Int64  : os.write((const char*)&_Obj->_U._Int64, 8); break;
-        case ObjectType::UInt64 : os.write((const char*)&_Obj->_U._UInt64, 8); break;
-        case ObjectType::String : os.write(_Obj->_U._String->c_str(), _Obj->_U._String->length() + 1); break;
-
-        // Rejected by _CheckSerializable.
-        case ObjectType::WideString:
-        case ObjectType::Binary:
-        case ObjectType::None:
-            break;
-    }
-}
-
-inline std::string ValveDataObject::SerializeAsBinary(int version) const
-{
-    std::stringstream sstr;
-    SerializeAsBinary(sstr, version);
-    return sstr.str();
-}
-
-inline void ValveDataObject::SerializeAsBinary(std::ostream& os, int version) const
-{
-    if (Type() != ObjectType::Object)
-        throw SerializeException("Can't serialize ValveDataObject, it needs to be an Object type.");
-
-    uint32_t crc = 0x00000000;
-    //size_t spos = os.tellp();
-
-    BinaryNodeType object_end = version <= 1 ? BinaryNodeType::ObjectEnd : BinaryNodeType::AlternativeEnd;
-    if (version > 1)
-    {
-        os.write((const char*)&BinaryVDFMagic, 4);
-        os.write((const char*)&crc, 4);
-    }
-
-    _SerializeAsBinary(os, object_end, crc);
-
-    if (version > 1)
-    {// TODO: Update crc
-        //os.seekp(spos + 4, std::ios::beg);
-        //os.write((const char*)&crc, sizeof(crc));
-        //os.seekp(spos, std::ios::beg);
-    }
-}
-
-inline std::string ValveDataObject::SerializeAsText() const
-{
-    std::stringstream sstr;
-    SerializeAsText(sstr);
-    return sstr.str();
-}
-
-inline void ValveDataObject::SerializeAsText(std::ostream& os) const
-{
-    if (Type() != ObjectType::Object)
-        throw SerializeException("Can't serialize ValveDataObject, it needs to be an Object type.");
-
-    _SerializeAsText(os, 0);
-}
-
-inline ValveDataObject ValveDataObject::ParseObject(std::istream& is, size_t chunk_size)
-{
-    uint32_t line_num = 0;
-
-    bool as_binary = false;
-    const char* buffer_start, *buffer_end;
-
-    ValveDataObject parsed_object;
-
-    std::string buffer(chunk_size, '\0');
-    std::string object_name;
-    int error;
-    bool has_root_key = false;
-    bool has_root_object = false;
-    BinaryNodeType binary_root_end = BinaryNodeType::ObjectEnd;
-
-    char header[4];
-    is.read(header, 4);
-    if (!is)
-        throw ParserException("Failed to read stream.");
-
-    if (Details::LoadLittleEndian32(header) == BinaryVDFMagic)
-    {
-        as_binary = true;
-        binary_root_end = BinaryNodeType::AlternativeEnd;
-        // Skip crc
-        is.seekg(4, std::ios::cur);
-    }
-    else
-    {
-        if (header[0] == '\0')
-        {// Likely, This is the root object as binary
-            as_binary = true;
-        }
-
-        is.seekg(0, std::ios::beg);
-    }
-
-    if (!as_binary)
-    {// Parse as text VDF
-        while (EasyVDF::Details::getline(is, buffer))
-        {
-            ++line_num;
-            buffer_start = &buffer[0];
-            buffer_end = buffer_start + buffer.length();
-            Details::SkipSpaces(buffer_start, buffer_end);
-
-            // Skip empty line
-            if (buffer_start == buffer_end)
                 continue;
-
-            if (has_root_object)
-            {// Only blank lines may follow the root object.
-                throw ParserException("Got datas after root object at line " + std::to_string(line_num));
             }
 
-            if (!has_root_key)
-            {
-                error = Details::ParseString(buffer_start, buffer_end, object_name);
-                if (error == -1)
-                {
-                    throw ParserException("Expected object key start at line " + std::to_string(line_num));
-                }
-                if (error == -2)
-                {
-                    throw ParserException("Expected object key end at line " + std::to_string(line_num));
-                }
-                if (error == -3)
-                {
-                    throw ParserException("Invalid codepoint at line " + std::to_string(line_num));
-                }
-                Details::SkipSpaces(buffer_start, buffer_end);
-                if (buffer_start != buffer_end)
-                {
-                    throw ParserException("Got datas after object key at line " + std::to_string(line_num));
-                }
-                has_root_key = true;
-            }
-            else
-            {
-                if (*buffer_start++ != '{')
-                {
-                    throw ParserException("Expected object start at line " + std::to_string(line_num));
-                }
-                Details::SkipSpaces(buffer_start, buffer_end);
-                if (buffer_start != buffer_end)
-                {
-                    throw ParserException("Got datas after object start at line " + std::to_string(line_num));
-                }
-
-                _ParseTextObject(is, object_name, buffer, line_num, parsed_object);
-                has_root_key = false;
-                has_root_object = true;
-            }
+            // Strings are opaque bytes: UTF-8 is not validated, new lines are kept.
+            token.text += static_cast<char>(c);
         }
+    }
 
-        if (has_root_key)
+    void Next(Token& token)
+    {
+        if (m_HasAhead)
         {
-            throw ParserException("Unexpected end of file, expected object start at line " + std::to_string(line_num));
+            token = std::move(m_Ahead);
+            m_HasAhead = false;
+            return;
         }
+
+        token.text.clear();
+        for (;;)
+        {
+            int c = m_Reader.Peek();
+            if (c >= 0 && IsSpace(static_cast<char>(c)))
+            {
+                Get();
+                continue;
+            }
+
+            token.line = m_Line;
+            token.column = m_Column;
+
+            if (c < 0)
+            {
+                token.kind = TokenKind::End;
+                return;
+            }
+
+            Get();
+            switch (c)
+            {
+                case '{': token.kind = TokenKind::Open; return;
+                case '}': token.kind = TokenKind::Close; return;
+
+                case '"':
+                    token.kind = TokenKind::String;
+                    ReadQuoted(token);
+                    return;
+
+                case '[':
+                    token.kind = TokenKind::Condition;
+                    for (;;)
+                    {
+                        c = m_Reader.Peek();
+                        if (c < 0 || c == '\n' || c == '\r')
+                            Fail("Unterminated conditional, expected ']' on the same line as the '['", token);
+
+                        Get();
+                        if (c == ']')
+                            return;
+                        token.text += static_cast<char>(c);
+                    }
+
+                case '/':
+                    if (m_Reader.Peek() == '/')
+                    {// Comment: skip to the end of the line.
+                        for (c = m_Reader.Peek(); c >= 0 && c != '\n' && c != '\r'; c = m_Reader.Peek())
+                            Get();
+                        continue;
+                    }
+                    break;
+
+                default:
+                    break;
+            }
+
+            // Unquoted token: ends at a blank, a quote or a brace. No escape sequences.
+            token.kind = TokenKind::String;
+            token.text += static_cast<char>(c);
+            while (!EndsUnquoted(m_Reader.Peek()))
+                token.text += static_cast<char>(Get());
+            return;
+        }
+    }
+
+    void PutBack(Token&& token)
+    {
+        m_Ahead = std::move(token);
+        m_HasAhead = true;
+    }
+
+    // Parses the members of root, down to its closing brace. Not recursive: the
+    // objects being parsed are kept in a stack, nested input can't overflow ours.
+    void ParseMembers(KeyValue& root)
+    {
+        std::vector<KeyValue*> open{ &root };
+        Token key, value;
+        while (!open.empty())
+        {
+            KeyValue& object = *open.back();
+
+            Next(key);
+            if (key.kind == TokenKind::End)
+                FailAtEnd("expected object end ('}')");
+            if (key.kind == TokenKind::Close)
+            {
+                open.pop_back();
+                continue;
+            }
+            if (key.kind != TokenKind::String)
+                Fail("Expected a key or an object end ('}')", key);
+
+            Next(value);
+            std::string condition;
+            const bool has_condition = value.kind == TokenKind::Condition;
+            if (has_condition)
+            {// "key" [$COND] { ... }
+                condition = std::move(value.text);
+                Next(value);
+            }
+
+            switch (value.kind)
+            {
+                case TokenKind::Open:
+                {
+                    if (open.size() >= m_Options.max_depth)
+                        Fail("Objects are nested deeper than the limit of " + std::to_string(m_Options.max_depth) + " levels", value);
+
+                    KeyValue& child = object.add(std::move(key.text));
+                    child.set_condition(condition);
+                    open.push_back(&child);
+                    break;
+                }
+
+                case TokenKind::String:
+                {
+                    KeyValue& child = object.add(std::move(key.text), Node(std::move(value.text)));
+                    if (has_condition)
+                    {
+                        child.set_condition(condition);
+                    }
+                    else
+                    {// "key" "value" [$COND]
+                        Next(value);
+                        if (value.kind == TokenKind::Condition)
+                            child.set_condition(value.text);
+                        else
+                            PutBack(std::move(value));
+                    }
+                    break;
+                }
+
+                case TokenKind::End:
+                    FailAtEnd("expected a value or an object start ('{') after key \"" + key.text + "\"");
+
+                default:
+                    Fail("Expected a value or an object start ('{') after key \"" + key.text + "\"", value);
+            }
+        }
+    }
+
+    static bool IsDirective(Token const& token, Directive::Kind& kind) noexcept
+    {
+        if (token.kind != TokenKind::String)
+            return false;
+        if (EqualsIgnoreCase(token.text, "#include"))
+        {
+            kind = Directive::Kind::Include;
+            return true;
+        }
+        if (EqualsIgnoreCase(token.text, "#base"))
+        {
+            kind = Directive::Kind::Base;
+            return true;
+        }
+        return false;
+    }
+
+public:
+    TextParser(Reader& reader, ReadOptions const& options) :
+        m_Reader(reader), m_Options(options)
+    {}
+
+    KeyValue Parse()
+    {
+        KeyValue root;
+        bool has_root = false;
+        Token token, next;
+
+        for (;;)
+        {
+            Next(token);
+            if (token.kind == TokenKind::End)
+                break;
+
+            Next(next);
+
+            // #include "file" / #base "file": only meaningful next to the root object.
+            Directive::Kind directive_kind;
+            if (IsDirective(token, directive_kind) && next.kind == TokenKind::String)
+            {
+                if (m_Options.directives != nullptr)
+                    m_Options.directives->push_back(Directive{ directive_kind, std::move(next.text) });
+                continue;
+            }
+
+            if (has_root)
+                Fail("Unexpected data after root object", token);
+            if (token.kind != TokenKind::String)
+                Fail("Expected the root key", token);
+
+            root = KeyValue(std::move(token.text));
+            if (next.kind == TokenKind::Condition)
+            {
+                root.set_condition(next.text);
+                Next(next);
+            }
+            if (next.kind == TokenKind::End)
+                FailAtEnd("expected object start ('{') after the root key");
+            if (next.kind != TokenKind::Open)
+                Fail("Expected object start ('{') after the root key", next);
+
+            ParseMembers(root);
+            has_root = true;
+        }
+
+        if (!has_root)
+            FailAtEnd("expected the root key (the input holds no object)");
+
+        return root;
+    }
+};
+
+inline KeyValue ParseDocument(Reader& reader, ReadOptions const& options)
+{
+    const int first = reader.Peek();
+    if (first < 0)
+        throw ParseError("Empty input: expected a text or binary VDF document");
+
+    if (options.format != Format::Text)
+    {
+        // "VBKV" header? The bytes read while checking are given back if it is not.
+        std::string seen;
+        while (seen.size() < sizeof(VbkvMagic) && reader.Peek() == static_cast<unsigned char>(VbkvMagic[seen.size()]))
+            seen += static_cast<char>(reader.Get());
+
+        if (seen.size() == sizeof(VbkvMagic))
+            return BinaryParser(reader, options).Parse(true);
+
+        reader.Unread(seen);
+        // A binary document starts with the type of its root: an object (0x00).
+        if (first == BinaryObject || options.format != Format::Auto)
+            return BinaryParser(reader, options).Parse(false);
+    }
+
+    // Text: skip an UTF-8 byte order mark, reject UTF-16.
+    if (first == 0xEF)
+    {
+        static constexpr unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
+        std::string seen;
+        while (seen.size() < sizeof(bom) && reader.Peek() == bom[seen.size()])
+            seen += static_cast<char>(reader.Get());
+
+        if (seen.size() != sizeof(bom))
+            reader.Unread(seen);
+    }
+    else if (first == 0xFF || first == 0xFE)
+    {
+        const int a = reader.Get();
+        const int b = reader.Peek();
+        if ((a == 0xFF && b == 0xFE) || (a == 0xFE && b == 0xFF))
+            throw ParseError("UTF-16 text is not supported, convert the file to UTF-8", 1, 1);
+
+        reader.Unread(std::string(1, static_cast<char>(a)));
+    }
+
+    return TextParser(reader, options).Parse();
+}
+
+/////////////////////////////////////////////////////////////////////
+// Writers
+/////////////////////////////////////////////////////////////////////
+inline void AppendQuoted(std::string& out, std::string_view text, bool escapes)
+{
+    out += '"';
+    if (!escapes)
+    {
+        if (text.find('"') != std::string_view::npos)
+            throw WriteError("EasyVDF: can't write a string containing '\"' with escape sequences disabled");
+        out += text;
     }
     else
-    {// Parse as binary VDF
-        if (buffer.empty())
-            buffer.resize(1);
-
-        buffer_start = buffer_end = buffer.data();
-        if (!Details::FillBinaryBuffer(is, buffer, buffer_start, buffer_end))
+    {
+        for (char c : text)
         {
-            throw ParserException("Premature end of file while parsing root binary object");
-        }
-        if (*buffer_start++ != static_cast<char>(BinaryNodeType::Object))
-        {
-            throw ParserException("Binary root item type is not an object");
-        }
-        if (!Details::ReadFullBinaryString(is, buffer, buffer_start, buffer_end, object_name))
-        {
-            throw ParserException("Premature end of file while parsing root binary object name");
-        }
-
-        _ParseBinaryObject(is, object_name, binary_root_end, buffer, buffer_start, buffer_end, parsed_object);
-
-        // Only one root object is allowed. Valve binary files commonly end with one extra
-        // end marker after the root object end (0x08, or the root end marker itself):
-        // accept a single one, reject anything else.
-        if (Details::FillBinaryBuffer(is, buffer, buffer_start, buffer_end))
-        {
-            const char trailing = *buffer_start++;
-            if ((trailing != static_cast<char>(BinaryNodeType::ObjectEnd) && trailing != static_cast<char>(binary_root_end)) ||
-                Details::FillBinaryBuffer(is, buffer, buffer_start, buffer_end))
+            switch (c)
             {
-                throw ParserException("Unexpected data after the binary root object");
+                case '\\': out += "\\\\"; break;
+                case '"' : out += "\\\""; break;
+                case '\n': out += "\\n"; break;
+                case '\t': out += "\\t"; break;
+                default  : out += c; break;
             }
         }
     }
-
-    return parsed_object;
+    out += '"';
 }
 
-}
+inline void WriteText(std::string& out, KeyValue const& item, std::size_t depth, bool escapes);
 
-namespace EasyVDF {
-
-// Comparison operators, found by argument-dependent lookup.
-
-inline bool operator==(pointer_t v1, pointer_t v2)
+inline void WriteTextBlock(std::string& out, Node const& object, std::size_t depth, bool escapes)
 {
-    return v1.value == v2.value;
+    out.append(depth, '\t');
+    out += "{\n";
+    for (KeyValue const& child : object)
+        WriteText(out, child, depth + 1, escapes);
+    out.append(depth, '\t');
+    out += "}\n";
 }
 
-inline bool operator!=(pointer_t v1, pointer_t v2)
+inline void WriteText(std::string& out, KeyValue const& item, std::size_t depth, bool escapes)
 {
-    return v1.value != v2.value;
+    out.append(depth, '\t');
+    AppendQuoted(out, item.key(), escapes);
+
+    if (item.is_object())
+    {
+        if (!item.condition().empty())
+        {
+            out += "\t\t[";
+            out += item.condition();
+            out += ']';
+        }
+        out += '\n';
+        WriteTextBlock(out, item, depth, escapes);
+        return;
+    }
+
+    out += "\t\t";
+    AppendQuoted(out, item.as<std::string>(), escapes);
+    if (!item.condition().empty())
+    {
+        out += "\t\t[";
+        out += item.condition();
+        out += ']';
+    }
+    out += '\n';
 }
 
-inline bool operator<(pointer_t v1, pointer_t v2)
+inline void AppendBinaryString(std::string& out, std::string_view text)
 {
-    return v1.value < v2.value;
+    if (text.find('\0') != std::string_view::npos)
+        throw WriteError("EasyVDF: can't write a key or a string containing a null character in binary");
+
+    out += text;
+    out += '\0';
 }
 
-inline bool operator<=(pointer_t v1, pointer_t v2)
+inline void WriteBinary(std::string& out, KeyValue const& item, char object_end)
 {
-    return v1.value <= v2.value;
+    switch (item.type())
+    {
+        case Type::Object:
+            out += static_cast<char>(BinaryObject);
+            AppendBinaryString(out, item.key());
+            for (KeyValue const& child : item)
+                WriteBinary(out, child, object_end);
+            out += object_end;
+            break;
+
+        case Type::String:
+            out += static_cast<char>(BinaryString);
+            AppendBinaryString(out, item.key());
+            AppendBinaryString(out, item.as<std::string_view>());
+            break;
+
+        case Type::Int32:
+            out += static_cast<char>(BinaryInt32);
+            AppendBinaryString(out, item.key());
+            AppendLittleEndian32(out, BitCast<uint32_t>(item.as<int32_t>()));
+            break;
+
+        case Type::Float:
+            out += static_cast<char>(BinaryFloat);
+            AppendBinaryString(out, item.key());
+            AppendLittleEndian32(out, BitCast<uint32_t>(item.as<float>()));
+            break;
+
+        case Type::Pointer:
+            out += static_cast<char>(BinaryPointer);
+            AppendBinaryString(out, item.key());
+            AppendLittleEndian32(out, item.as<Pointer>().value);
+            break;
+
+        case Type::Color:
+        {
+            const Color color = item.as<Color>();
+            out += static_cast<char>(BinaryColor);
+            AppendBinaryString(out, item.key());
+            out += static_cast<char>(color.r);
+            out += static_cast<char>(color.g);
+            out += static_cast<char>(color.b);
+            out += static_cast<char>(color.a);
+            break;
+        }
+
+        case Type::UInt64:
+            out += static_cast<char>(BinaryUInt64);
+            AppendBinaryString(out, item.key());
+            AppendLittleEndian64(out, item.as<uint64_t>());
+            break;
+
+        case Type::Int64:
+            out += static_cast<char>(BinaryInt64);
+            AppendBinaryString(out, item.key());
+            AppendLittleEndian64(out, BitCast<uint64_t>(item.as<int64_t>()));
+            break;
+
+        case Type::None:
+            // Children without value are never iterated; only a root can get here.
+            break;
+    }
 }
 
-inline bool operator>(pointer_t v1, pointer_t v2)
+} // namespace Details
+
+/////////////////////////////////////////////////////////////////////
+//
+//                    KeyValue and free functions
+//
+/////////////////////////////////////////////////////////////////////
+
+namespace Details {
+
+/// A path for an error message. Never throws for a path that the narrow
+/// character set can't represent (Windows).
+inline std::string PathText(std::filesystem::path const& path)
 {
-    return v1.value > v2.value;
+    try
+    {
+        return path.string();
+    }
+    catch (std::exception const&)
+    {
+        return "<path>";
+    }
 }
 
-inline bool operator>=(pointer_t v1, pointer_t v2)
+} // namespace Details
+
+inline std::string KeyValue::dump(WriteOptions const& options) const
 {
-    return v1.value >= v2.value;
+    // VDF has no representation for a key without a value, and a document is an object.
+    if (!has_value())
+        throw WriteError("EasyVDF: can't write a document without value (Type::None)");
+    if (!is_object())
+        throw WriteError(std::string("EasyVDF: can't write a document whose root is a ") + Details::TypeName(type()) + ", it must be an object");
+
+    std::string out;
+    switch (options.format)
+    {
+        case Format::Auto:
+        case Format::Text:
+            Details::WriteText(out, *this, 0, options.escapes);
+            break;
+
+        case Format::Binary:
+            Details::WriteBinary(out, *this, static_cast<char>(Details::BinaryEnd));
+            break;
+
+        case Format::Vbkv:
+        {
+            out.append(Details::VbkvMagic, sizeof(Details::VbkvMagic));
+            out.append(4, '\0');
+            Details::WriteBinary(out, *this, static_cast<char>(Details::BinaryAlternateEnd));
+
+            // CRC32 of everything after the 8 bytes header, little-endian.
+            std::string crc;
+            Details::AppendLittleEndian32(crc, Details::Crc32(std::string_view(out).substr(8)));
+            out.replace(4, 4, crc);
+            break;
+        }
+    }
+    return out;
 }
 
-inline bool operator==(color_t v1, color_t v2)
+inline void KeyValue::write(std::ostream& os, WriteOptions const& options) const
 {
-    return v1.value == v2.value;
+    const std::string data = dump(options);
+    os.write(data.data(), static_cast<std::streamsize>(data.size()));
 }
 
-inline bool operator!=(color_t v1, color_t v2)
+inline void KeyValue::save(std::filesystem::path const& path, WriteOptions const& options) const
 {
-    return v1.value != v2.value;
+    // Serialize first: nothing is created or truncated if the tree can't be written.
+    const std::string data = dump(options);
+
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file)
+        throw IoError("EasyVDF: can't open \"" + Details::PathText(path) + "\" for writing");
+
+    file.write(data.data(), static_cast<std::streamsize>(data.size()));
+    file.close();
+    if (!file)
+        throw IoError("EasyVDF: failed to write \"" + Details::PathText(path) + "\"");
 }
 
-inline bool operator<(color_t v1, color_t v2)
+inline KeyValue parse(std::string_view data, ReadOptions const& options)
 {
-    return v1.value < v2.value;
+    Details::Reader reader(data);
+    return Details::ParseDocument(reader, options);
 }
 
-inline bool operator<=(color_t v1, color_t v2)
+inline KeyValue parse(std::istream& is, ReadOptions const& options)
 {
-    return v1.value <= v2.value;
+    Details::Reader reader(is, options.chunk_size);
+    return Details::ParseDocument(reader, options);
 }
 
-inline bool operator>(color_t v1, color_t v2)
+inline KeyValue load(std::filesystem::path const& path, ReadOptions const& options)
 {
-    return v1.value > v2.value;
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        throw IoError("EasyVDF: can't open \"" + Details::PathText(path) + "\" for reading");
+
+    return parse(file, options);
 }
 
-inline bool operator>=(color_t v1, color_t v2)
+inline std::ostream& operator<<(std::ostream& os, Node const& node)
 {
-    return v1.value >= v2.value;
+    std::string text;
+    if (node.is_object())
+        Details::WriteTextBlock(text, node, 0, true);
+    else if (node.has_value())
+        text = node.as<std::string>();
+
+    return os.write(text.data(), static_cast<std::streamsize>(text.size()));
 }
 
+inline std::ostream& operator<<(std::ostream& os, KeyValue const& entry)
+{
+    std::string text;
+    if (entry.has_value())
+        Details::WriteText(text, entry, 0, true);
+
+    return os.write(text.data(), static_cast<std::streamsize>(text.size()));
 }
+
+} // namespace EasyVDF
+
+/// Structured bindings support: `auto& [key, value] = key_value;`
+namespace std {
+
+template<>
+struct tuple_size<::EasyVDF::KeyValue> : std::integral_constant<std::size_t, 2> {};
+
+template<>
+struct tuple_element<0, ::EasyVDF::KeyValue> { using type = const std::string; };
+
+template<>
+struct tuple_element<1, ::EasyVDF::KeyValue> { using type = ::EasyVDF::Node; };
+
+} // namespace std
