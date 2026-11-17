@@ -1,19 +1,48 @@
-project(EasyVDF)
 cmake_minimum_required(VERSION 3.15)
 
-set(CMAKE_CXX_STANDARD 14)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+project(EasyVDF LANGUAGES CXX)
 
-add_executable(easyvdf_tests
-    tests/tests.cpp
-    tests/test_object_model.cpp
-    tests/test_text_parser.cpp
-    tests/test_binary_parser.cpp
-)
+# Header-only library: link against EasyVDF::EasyVDF to get the include path and C++14.
+add_library(EasyVDF INTERFACE)
+add_library(EasyVDF::EasyVDF ALIAS EasyVDF)
+target_include_directories(EasyVDF INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+target_compile_features(EasyVDF INTERFACE cxx_std_14)
 
-set_target_properties(easyvdf_tests PROPERTIES
-    C_VISIBILITY_PRESET hidden
-    CXX_VISIBILITY_PRESET hidden
-    VISIBILITY_INLINES_HIDDEN ON
-)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(EASYVDF_IS_TOP_LEVEL ON)
+else()
+    set(EASYVDF_IS_TOP_LEVEL OFF)
+endif()
+
+option(EASYVDF_BUILD_TESTS "Build the EasyVDF tests" ${EASYVDF_IS_TOP_LEVEL})
+
+if(EASYVDF_BUILD_TESTS)
+    enable_testing()
+
+    set(CMAKE_CXX_EXTENSIONS OFF)
+
+    # Catch2 main, compiled once and shared by every test executable.
+    add_library(easyvdf_catch_main STATIC tests/catch_main.cpp)
+    target_compile_features(easyvdf_catch_main PUBLIC cxx_std_14)
+
+    # One executable and one CTest test per tests/test_<name>.cpp file.
+    set(EASYVDF_TESTS
+        files
+        text_parser
+        binary_parser
+        object_model
+    )
+
+    foreach(name IN LISTS EASYVDF_TESTS)
+        add_executable(easyvdf_test_${name} tests/test_${name}.cpp)
+        target_link_libraries(easyvdf_test_${name} PRIVATE EasyVDF::EasyVDF easyvdf_catch_main)
+        target_compile_options(easyvdf_test_${name} PRIVATE
+            $<IF:$<CXX_COMPILER_ID:MSVC>,/W4 /utf-8,-Wall -Wextra>
+        )
+        add_test(NAME ${name} COMMAND easyvdf_test_${name})
+        # Tests open their data files (*.vdf) by relative path.
+        set_tests_properties(${name} PROPERTIES
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests/data
+        )
+    endforeach()
+endif()
