@@ -15,6 +15,20 @@ else()
 endif()
 
 option(EASYVDF_BUILD_TESTS "Build the EasyVDF tests" ${EASYVDF_IS_TOP_LEVEL})
+option(EASYVDF_BUILD_EXAMPLES "Build the EasyVDF examples" ${EASYVDF_IS_TOP_LEVEL})
+
+if(EASYVDF_BUILD_EXAMPLES)
+    foreach(name IN ITEMS quick_tour achievements vdf_convert)
+        add_executable(easyvdf_example_${name} examples/${name}.cpp)
+        target_link_libraries(easyvdf_example_${name} PRIVATE EasyVDF::EasyVDF)
+        set_target_properties(easyvdf_example_${name} PROPERTIES OUTPUT_NAME ${name} CXX_EXTENSIONS OFF)
+        if(MSVC)
+            target_compile_options(easyvdf_example_${name} PRIVATE /W4 /utf-8)
+        else()
+            target_compile_options(easyvdf_example_${name} PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+    endforeach()
+endif()
 
 if(EASYVDF_BUILD_TESTS)
     enable_testing()
@@ -59,4 +73,17 @@ if(EASYVDF_BUILD_TESTS)
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests/data
         )
     endforeach()
+
+    # The examples must keep compiling and running: smoke test them.
+    if(EASYVDF_BUILD_EXAMPLES)
+        set(EASYVDF_DATA ${CMAKE_CURRENT_SOURCE_DIR}/tests/data)
+        add_test(NAME example_quick_tour COMMAND easyvdf_example_quick_tour)
+        add_test(NAME example_achievements COMMAND easyvdf_example_achievements ${EASYVDF_DATA}/stats_schema.vdf french)
+        add_test(NAME example_vdf_convert_to_text COMMAND easyvdf_example_vdf_convert ${EASYVDF_DATA}/binary.vdf binary_vdf.txt)
+        add_test(NAME example_vdf_convert_to_vbkv COMMAND easyvdf_example_vdf_convert binary_vdf.txt binary_vdf.vbkv vbkv)
+        set_tests_properties(example_vdf_convert_to_vbkv PROPERTIES DEPENDS example_vdf_convert_to_text)
+        set_tests_properties(example_quick_tour example_achievements example_vdf_convert_to_text example_vdf_convert_to_vbkv
+            PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+        set_tests_properties(example_achievements PROPERTIES PASS_REGULAR_EXPRESSION "Vainqueur.*ACH_SECRET \\(hidden\\).*NumGames")
+    endif()
 endif()

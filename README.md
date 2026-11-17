@@ -341,6 +341,22 @@ write_options.escapes = true;
   (`as<T>()` gives the values back).
 - Requires C++17 (`std::string_view`, `std::optional`, `std::variant`, structured bindings, `<charconv>`, `<filesystem>`).
 
+## Examples
+
+Complete programs in [`examples/`](examples), built with the tests (`-DEASYVDF_BUILD_EXAMPLES=ON` to force them):
+
+| Example | What it shows |
+|---|---|
+| [`quick_tour.cpp`](examples/quick_tour.cpp) | Build a document, read typed values with defaults, iterate, duplicate keys, modify, save as text and VBKV, reload, handle errors. |
+| [`achievements.cpp`](examples/achievements.cpp) | List the achievements and stats of a Steam stats schema (binary `UserGameStatsSchema_<appid>.bin`), in a given language. |
+| [`vdf_convert.cpp`](examples/vdf_convert.cpp) | Convert any VDF file between text, binary and VBKV. |
+
+```sh
+achievements UserGameStatsSchema_480.bin french
+vdf_convert shortcuts.vdf shortcuts.txt          # binary -> text
+vdf_convert shortcuts.txt shortcuts.vdf binary   # text -> binary
+```
+
 ## Tests
 
 ```sh
