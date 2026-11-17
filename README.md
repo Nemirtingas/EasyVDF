@@ -74,6 +74,16 @@ EasyVDF::KeyValue a = EasyVDF::parse(R"("root" { "key" "value" })");
 EasyVDF::KeyValue b = EasyVDF::parse(std::cin);
 ```
 
+A document is one root key and its object. Some Steam files hold several of them, like the signed
+`installscript.vdf` whose `"InstallScript"` object is followed by a `"kvsignatures"` one: `load()` refuses
+them (it would have to drop data), `load_all()` / `parse_all()` return every root object.
+
+```cpp
+std::vector<EasyVDF::KeyValue> roots = EasyVDF::load_all("installscript.vdf");
+for (auto& root : roots)
+    std::cout << root.key() << '\n';          // InstallScript, kvsignatures
+```
+
 ### Getting values
 
 ```cpp

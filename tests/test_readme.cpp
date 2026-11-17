@@ -2,6 +2,7 @@
 #include "../EasyVDF.h"
 
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -104,6 +105,19 @@ TEST_CASE("README: reading", "[readme]")
     std::istringstream input(R"("root" { "key" "value" })");
     EasyVDF::KeyValue b = EasyVDF::parse(input);
     CHECK(a == b);
+
+    TempFile file("readme_installscript.vdf");
+    {
+        std::ofstream out(file.path, std::ios::binary);
+        out << "\"InstallScript\"\n{\n\t\"Run Process\"\n\t{\n\t}\n}\n\"kvsignatures\"\n{\n\t\"InstallScript\"\t\t\"4284ab2e\"\n}\n";
+    }
+    CHECK_THROWS_AS(EasyVDF::load(file.path), EasyVDF::ParseError);
+
+    std::ostringstream out;
+    std::vector<EasyVDF::KeyValue> roots = EasyVDF::load_all(file.path);
+    for (auto& root : roots)
+        out << root.key() << '\n';
+    CHECK(out.str() == "InstallScript\nkvsignatures\n");
 }
 
 TEST_CASE("README: getting values", "[readme]")

@@ -687,3 +687,84 @@ TEST_CASE("Text values convert to numbers", "[text_parser][conversions]")
     CHECK_FALSE(o["text"].try_as<int>().has_value());
     CHECK(o["int"].try_as<int>() == 42);
 }
+
+TEST_CASE("parse_all reads the files that hold several root objects", "[text_parser][parse_all]")
+{
+    // The layout of a signed Steam file (installscript.vdf, ...).
+    const std::string text =
+        "\"InstallScript\"\n"
+        "{\n"
+        "\t\"Run Process\"\n"
+        "\t{\n"
+        "\t\t\"process 1\"\t\t\"setup.exe\"\n"
+        "\t}\n"
+        "}\n"
+        "\"kvsignatures\"\n"
+        "{\n"
+        "\t\"InstallScript\"\t\t\"4284ab2eaacb3706\"\n"
+        "}\n";
+
+    // One document is one root object: parse() keeps refusing the rest, and says what to use.
+    CHECK_THROWS_WITH(ParseText(text), Contains("after root object at line 8, column 1") && Contains("parse_all"));
+
+    EasyVDF::ReadOptions options;
+    std::vector<KeyValue> roots = EasyVDF::parse_all(text, options);
+    REQUIRE(roots.size() == 2);
+    CHECK(roots[0].key() == "InstallScript");
+    CHECK(roots[0]["Run Process"]["process 1"].as<std::string>() == "setup.exe");
+    CHECK(roots[1].key() == "kvsignatures");
+    CHECK(roots[1]["InstallScript"].as<std::string>() == "4284ab2eaacb3706");
+
+    // Writing them one after the other gives the file back.
+    CHECK(roots[0].to_text() + roots[1].to_text() == text);
+
+    SECTION("from a stream, whatever the chunk size")
+    {
+        for (std::size_t chunk_size : { std::size_t(1), std::size_t(2), std::size_t(7), std::size_t(4096) })
+        {
+            std::istringstream is(text);
+            options.chunk_size = chunk_size;
+            CHECK(EasyVDF::parse_all(is, options) == roots);
+        }
+    }
+
+    SECTION("a single root, directives, comments")
+    {
+        std::vector<EasyVDF::Directive> directives;
+        options.directives = &directives;
+        auto single = EasyVDF::parse_all("#base \"a.vdf\"\nroot { k v } // end\n#include b.vdf\n", options);
+        REQUIRE(single.size() == 1);
+        CHECK(single[0] == EasyVDF::parse("root { k v }"));
+        CHECK(directives.size() == 2);
+
+        auto three = EasyVDF::parse_all("a{} b { k v } \"a\" { }");
+        REQUIRE(three.size() == 3);
+        CHECK(three[0].key() == "a");
+        CHECK(three[1]["k"].as<std::string>() == "v");
+        CHECK(three[2].key() == "a");
+    }
+
+    SECTION("errors are the same as parse()")
+    {
+        CHECK_THROWS_AS(EasyVDF::parse_all(""), ParseError);
+        CHECK_THROWS_AS(EasyVDF::parse_all("  \n"), ParseError);
+        CHECK_THROWS_AS(EasyVDF::parse_all("a { } b"), ParseError);
+        CHECK_THROWS_AS(EasyVDF::parse_all("a { } b {"), ParseError);
+        CHECK_THROWS_AS(EasyVDF::parse_all("a { } }"), ParseError);
+        CHECK_THROWS_WITH(EasyVDF::parse_all("a { }\nb c\n"), Contains("line 2, column 3"));
+        // Stray data that is not another root object is reported without the hint.
+        CHECK_THROWS_WITH(EasyVDF::parse("a { } }"), Contains("after root object") && !Contains("parse_all"));
+    }
+
+    SECTION("binary documents hold exactly one root")
+    {
+        KeyValue doc("root", { {"k", 5} });
+        for (EasyVDF::Format format : { EasyVDF::Format::Binary, EasyVDF::Format::Vbkv })
+        {
+            auto binary_roots = EasyVDF::parse_all(doc.to_binary(format));
+            REQUIRE(binary_roots.size() == 1);
+            CHECK(binary_roots[0] == doc);
+            CHECK_THROWS_AS(EasyVDF::parse_all(doc.to_binary(format) + doc.to_binary(format)), ParseError);
+        }
+    }
+}

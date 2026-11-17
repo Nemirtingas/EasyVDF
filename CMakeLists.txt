@@ -21,6 +21,12 @@ if(EASYVDF_BUILD_TESTS)
 
     set(CMAKE_CXX_EXTENSIONS OFF)
 
+    include(CheckCXXCompilerFlag)
+    if(NOT MSVC)
+        # Checked with the positive form: unknown -Wno-* options are silently accepted by GCC.
+        check_cxx_compiler_flag(-Wc2y-extensions EASYVDF_HAS_WNO_C2Y_EXTENSIONS)
+    endif()
+
     # Catch2 main, compiled once and shared by every test executable.
     add_library(easyvdf_catch_main STATIC tests/catch_main.cpp)
     target_compile_features(easyvdf_catch_main PUBLIC cxx_std_17)
@@ -42,6 +48,10 @@ if(EASYVDF_BUILD_TESTS)
             target_compile_options(easyvdf_test_${name} PRIVATE /W4 /utf-8)
         else()
             target_compile_options(easyvdf_test_${name} PRIVATE -Wall -Wextra -Wpedantic)
+            if(EASYVDF_HAS_WNO_C2Y_EXTENSIONS)
+                # Catch2 v2 uses __COUNTER__, which recent clang versions report with -Wpedantic.
+                target_compile_options(easyvdf_test_${name} PRIVATE -Wno-c2y-extensions)
+            endif()
         endif()
         add_test(NAME ${name} COMMAND easyvdf_test_${name})
         # Tests open their data files (*.vdf) by relative path.

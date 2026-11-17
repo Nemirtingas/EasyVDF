@@ -1065,7 +1065,8 @@ public:
 };
 
 /// Parses a document held in memory (text or binary, see ReadOptions::format).
-/// Throws ParseError.
+/// A document is one root key and its object: anything after it is an error,
+/// see parse_all() for the files that hold several. Throws ParseError.
 KeyValue parse(std::string_view data, ReadOptions const& options = {});
 
 /// Parses a document from a stream, read sequentially to its end: pipes and
@@ -1074,6 +1075,14 @@ KeyValue parse(std::istream& is, ReadOptions const& options = {});
 
 /// Parses a file. Throws IoError if it can't be opened, ParseError if it is malformed.
 KeyValue load(std::filesystem::path const& path, ReadOptions const& options = {});
+
+/// Like parse() and load() for text files that hold several root objects one
+/// after the other, such as the signed Steam files (installscript.vdf: the
+/// "InstallScript" object is followed by a "kvsignatures" one). Returns every
+/// root object, in order, at least one.
+std::vector<KeyValue> parse_all(std::string_view data, ReadOptions const& options = {});
+std::vector<KeyValue> parse_all(std::istream& is, ReadOptions const& options = {});
+std::vector<KeyValue> load_all(std::filesystem::path const& path, ReadOptions const& options = {});
 
 /// Prints a value: the text of a scalar (`std::cout << doc["name"]`), the
 /// `{ ... }` block of an object, nothing for a node without value.
@@ -2175,10 +2184,10 @@ public:
         m_Reader(reader), m_Options(options)
     {}
 
-    KeyValue Parse()
+    /// Returns the root objects: exactly one, or one and more when multiple is set.
+    std::vector<KeyValue> Parse(bool multiple)
     {
-        KeyValue root;
-        bool has_root = false;
+        std::vector<KeyValue> roots;
         Token token, next;
 
         for (;;)
@@ -2198,12 +2207,17 @@ public:
                 continue;
             }
 
-            if (has_root)
-                Fail("Unexpected data after root object", token);
+            if (!roots.empty() && !multiple)
+            {
+                throw ParseError("Unexpected data after root object at line " + std::to_string(token.line) + ", column " + std::to_string(token.column)
+                    + (token.kind == TokenKind::String && next.kind == TokenKind::Open ? ": the input holds several root objects, parse_all() / load_all() read them" : ""),
+                    token.line, token.column);
+            }
             if (token.kind != TokenKind::String)
                 Fail("Expected the root key", token);
 
-            root = KeyValue(std::move(token.text));
+            roots.emplace_back(std::move(token.text));
+            KeyValue& root = roots.back();
             if (next.kind == TokenKind::Condition)
             {
                 root.set_condition(next.text);
@@ -2215,18 +2229,26 @@ public:
                 Fail("Expected object start ('{') after the root key", next);
 
             ParseMembers(root);
-            has_root = true;
         }
 
-        if (!has_root)
+        if (roots.empty())
             FailAtEnd("expected the root key (the input holds no object)");
 
-        return root;
+        return roots;
     }
 };
 
-inline KeyValue ParseDocument(Reader& reader, ReadOptions const& options)
+/// Detects the format and parses the input. multiple: accept several root
+/// objects (text only, a binary document always holds one).
+inline std::vector<KeyValue> ParseDocument(Reader& reader, ReadOptions const& options, bool multiple)
 {
+    auto single = [](KeyValue&& root)
+    {
+        std::vector<KeyValue> roots;
+        roots.push_back(std::move(root));
+        return roots;
+    };
+
     const int first = reader.Peek();
     if (first < 0)
         throw ParseError("Empty input: expected a text or binary VDF document");
@@ -2239,12 +2261,12 @@ inline KeyValue ParseDocument(Reader& reader, ReadOptions const& options)
             seen += static_cast<char>(reader.Get());
 
         if (seen.size() == sizeof(VbkvMagic))
-            return BinaryParser(reader, options).Parse(true);
+            return single(BinaryParser(reader, options).Parse(true));
 
         reader.Unread(seen);
         // A binary document starts with the type of its root: an object (0x00).
         if (first == BinaryObject || options.format != Format::Auto)
-            return BinaryParser(reader, options).Parse(false);
+            return single(BinaryParser(reader, options).Parse(false));
     }
 
     // Text: skip an UTF-8 byte order mark, reject UTF-16.
@@ -2268,7 +2290,7 @@ inline KeyValue ParseDocument(Reader& reader, ReadOptions const& options)
         reader.Unread(std::string(1, static_cast<char>(a)));
     }
 
-    return TextParser(reader, options).Parse();
+    return TextParser(reader, options).Parse(multiple);
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -2502,13 +2524,13 @@ inline void KeyValue::save(std::filesystem::path const& path, WriteOptions const
 inline KeyValue parse(std::string_view data, ReadOptions const& options)
 {
     Details::Reader reader(data);
-    return Details::ParseDocument(reader, options);
+    return std::move(Details::ParseDocument(reader, options, false).front());
 }
 
 inline KeyValue parse(std::istream& is, ReadOptions const& options)
 {
     Details::Reader reader(is, options.chunk_size);
-    return Details::ParseDocument(reader, options);
+    return std::move(Details::ParseDocument(reader, options, false).front());
 }
 
 inline KeyValue load(std::filesystem::path const& path, ReadOptions const& options)
@@ -2518,6 +2540,27 @@ inline KeyValue load(std::filesystem::path const& path, ReadOptions const& optio
         throw IoError("EasyVDF: can't open \"" + Details::PathText(path) + "\" for reading");
 
     return parse(file, options);
+}
+
+inline std::vector<KeyValue> parse_all(std::string_view data, ReadOptions const& options)
+{
+    Details::Reader reader(data);
+    return Details::ParseDocument(reader, options, true);
+}
+
+inline std::vector<KeyValue> parse_all(std::istream& is, ReadOptions const& options)
+{
+    Details::Reader reader(is, options.chunk_size);
+    return Details::ParseDocument(reader, options, true);
+}
+
+inline std::vector<KeyValue> load_all(std::filesystem::path const& path, ReadOptions const& options)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        throw IoError("EasyVDF: can't open \"" + Details::PathText(path) + "\" for reading");
+
+    return parse_all(file, options);
 }
 
 inline std::ostream& operator<<(std::ostream& os, Node const& node)
